@@ -20,12 +20,7 @@ include(FetchContent)
 # The patch step and check_green_names.py both need the interpreter.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
-# Abseil at a pinned hash.
-FetchContent_Declare(
-  absl
-  URL https://github.com/abseil/abseil-cpp/archive/2d5a8e38e7443d0aef7c5fe4a3590fbaa44e8978.tar.gz)
-set(ABSL_ENABLE_INSTALL OFF)
-FetchContent_MakeAvailable(absl)
+find_package(absl REQUIRED)
 
 # magic_enum at a pinned version (0.9.5).
 FetchContent_Declare(
