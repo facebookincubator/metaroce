@@ -82,43 +82,22 @@ folly::IPAddress Sender::getAddressFromSocketId(const uint16_t socketId) {
 }
 
 uint16_t Sender::getAlternateSocket(const uint16_t socketId) {
-  auto assignment = socketAssignment_.lock();
-  CHECK_LT(socketId, assignment->socketCount)
-      << "getAlternateSocket: socket id out of range";
-  // if there's just the one known, need a new one
-  if (assignment->socketCount < 2) {
-    // Only UDP has a source port to vary. A raw socket (Ethernet) has
-    // none, so return the original socket unchanged.
-    if (sockets_[socketId].data->getSocket() == nullptr) {
-      return socketId;
-    }
-    if (!hasRoomForSocket(assignment)) {
-      return socketId;
-    }
-    return createSocketWithLocalAddr(
-        assignment,
-        getAddressFromSocketIdLocked(assignment, socketId),
-        ibv_gid_entry{});
-  }
-  // otherwise, round-robin to a different socket: a shared rotor spreads
-  // successive repaths across all sockets and stays correct under parallel
-  // senders.
-  uint16_t nsockid = static_cast<uint16_t>(
-      altSocketRotor_.fetch_add(1, std::memory_order_relaxed) %
-      assignment->socketCount);
-  if (socketId == nsockid) {
-    // avoid returning the current socket
-    nsockid = (nsockid + 1) % assignment->socketCount;
-  }
-  return nsockid;
+  return getAlternateSocketImpl(socketId, EgressPacket::Kind::Data);
 }
 
 uint16_t Sender::getAlternateAckSocket(const uint16_t socketId) {
+  return getAlternateSocketImpl(socketId, EgressPacket::Kind::Ack);
+}
+
+uint16_t Sender::getAlternateSocketImpl(
+    const uint16_t socketId,
+    EgressPacket::Kind kind) {
   auto assignment = socketAssignment_.lock();
-  CHECK_LT(socketId, assignment->socketCount)
-      << "getAlternateAckSocket: socket id out of range";
+  CHECK_LT(socketId, assignment->socketCount) << "socket id out of range";
+  // Socket creation populates both per-CoS entries or throws.
+  auto& socket = *CHECK_NOTNULL(socketForKind(sockets_[socketId], kind));
   // A raw transport has no UDP source port to vary.
-  if (sockets_[socketId].ack->getSocket() == nullptr) {
+  if (socket.getSocket() == nullptr) {
     return socketId;
   }
   const folly::IPAddress& localAddr =

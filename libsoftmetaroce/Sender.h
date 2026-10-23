@@ -110,12 +110,7 @@ class Sender : public folly::NonCopyableNonMovable {
    */
   folly::IPAddress getAddressFromSocketId(const uint16_t socketId);
 
-  /*
-   * Method to find an alternative socket
-   * to the one provided and create a new one if necessary.
-   * A different source port hashes to a different network path, which is
-   * what repathing a flow needs.
-   */
+  // Return a same-address alternative, creating one if allowed, or socketId.
   [[nodiscard]] uint16_t getAlternateSocket(const uint16_t socketId);
 
   /*
@@ -143,6 +138,11 @@ class Sender : public folly::NonCopyableNonMovable {
     // Socket creation populates both per-CoS entries or throws.
     return CHECK_NOTNULL(socketForKind(sockets_[socketId], kind))->getSocket();
   }
+
+ private:
+  [[nodiscard]] uint16_t getAlternateSocketImpl(
+      uint16_t socketId,
+      EgressPacket::Kind kind);
 
  protected:
   // Called under socketAssignment_, so an override must not lock; the result is
@@ -333,7 +333,6 @@ class Sender : public folly::NonCopyableNonMovable {
   const uint16_t sendToPort_;
 
   // Runtime state.
-  std::atomic<uint32_t> altSocketRotor_{0};
   // One dedicated executor per parallel send loop (empty in single-send mode).
   // Outlives the send loops, which ~Sender joins before these are destroyed.
   std::vector<std::unique_ptr<folly::CPUThreadPoolExecutor>> sendExecutors_;

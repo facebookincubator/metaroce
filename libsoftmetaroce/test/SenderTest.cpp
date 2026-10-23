@@ -240,6 +240,140 @@ TEST_F(SenderTest, RepathAtTheSocketLimitKeepsItsSocket) {
          "those a new assignment creates";
 }
 
+TEST_F(SenderTest, RepathStaysOnItsLocalAddress) {
+  auto sender = createUnlimitedTestSender();
+  const folly::IPAddress otherAddr{"fc00::2"};
+  std::set<uint16_t> localSockets;
+  for (int i = 0; i < 3; ++i) {
+    localSockets.insert(sender->getSocketIdFromAddress(localAddr));
+    std::ignore = sender->getSocketIdFromAddress(otherAddr);
+  }
+  const uint16_t first = *localSockets.begin();
+  uint16_t current = first;
+  std::set<uint16_t> visited{first};
+  for (size_t i = 0; i < 3 * localSockets.size(); ++i) {
+    const uint16_t next = sender->getAlternateSocket(current);
+    EXPECT_NE(next, current)
+        << "an available alternative must change the flow's source-port entropy";
+    EXPECT_EQ(sender->getAddressFromSocketId(next), localAddr)
+        << "changing the local address would leave the configured port pair";
+    visited.insert(next);
+    current = next;
+  }
+  EXPECT_EQ(visited, localSockets)
+      << "repathing must use every socket on its address without crossing to "
+         "another address";
+  EXPECT_EQ(current, first)
+      << "each complete cycle must reuse the first source port only after "
+         "trying the other ports on the address";
+}
+
+TEST_F(SenderTest, RepathCreatesOnItsAddressWhenAlone) {
+  auto sender = createUnlimitedTestSender();
+  const uint16_t only = sender->getSocketIdFromAddress(localAddr);
+  const folly::IPAddress otherAddr{"fc00::2"};
+  const std::set<uint16_t> existing{
+      only,
+      sender->getSocketIdFromAddress(otherAddr),
+      sender->getSocketIdFromAddress(otherAddr)};
+
+  const uint16_t created = sender->getAlternateSocket(only);
+  EXPECT_FALSE(existing.contains(created))
+      << "a lone socket needs a new source port on its own address to repath";
+  EXPECT_EQ(sender->getAddressFromSocketId(created), localAddr)
+      << "a socket on another address would form an unconfigured port pair";
+}
+
+TEST_F(SenderTest, RepathAtLimitKeepsItsLocalAddress) {
+  auto sender = createUnlimitedTestSender();
+  sender->setLimitNumSockets(3);
+  const uint16_t only = sender->getSocketIdFromAddress(localAddr);
+  const folly::IPAddress otherAddr{"fc00::2"};
+  std::ignore = sender->getSocketIdFromAddress(otherAddr);
+  std::ignore = sender->getSocketIdFromAddress(otherAddr);
+
+  EXPECT_EQ(sender->getAlternateSocket(only), only)
+      << "when no same-address alternative can be created, the flow must keep "
+         "its configured port pair";
+}
+
+TEST_F(SenderTest, RtoRepathKeepsTheFlowsPortPair) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_slow_receiver = false;
+  FLAGS_libsoftmetaroce_rtos_before_repath = 1;
+  qp->setRemoteQpNum(102);
+  qp->addPortPair(folly::IPAddress{"fc00::2"}, folly::IPAddress{"fc00::102"});
+  qp->configureWatchdogInterval(std::chrono::hours(1));
+  std::vector<char> payload(qp->getMtu());
+  std::mutex mutex;
+  std::condition_variable written;
+  std::vector<std::pair<folly::IPAddress, folly::IPAddress>> transmissions;
+  std::set<uint16_t> sourcePorts;
+  auto socketMaker = [&](folly::EventBase* evb) {
+    auto socket = std::make_unique<NiceMock<MockUDPSocket>>(evb);
+    auto boundAddress = std::make_shared<folly::SocketAddress>();
+    ON_CALL(*socket, bindImpl(_))
+        .WillByDefault([boundAddress](const folly::SocketAddress& address) {
+          *boundAddress = address;
+        });
+    ON_CALL(*socket, write(_, _))
+        .WillByDefault([&, boundAddress](
+                           const folly::SocketAddress& destination,
+                           const std::unique_ptr<folly::IOBuf>& buf) {
+          std::lock_guard<std::mutex> lock(mutex);
+          transmissions.emplace_back(
+              boundAddress->getIPAddress(), destination.getIPAddress());
+          sourcePorts.insert(boundAddress->getPort());
+          written.notify_one();
+          return buf->computeChainDataLength();
+        });
+    return std::make_pair(std::move(socket), nullptr);
+  };
+  auto sender = std::make_unique<LimitedTestSender>(
+      arbiter,
+      socketMaker,
+      kMetaRoceSendToPort,
+      LimitedTestSender::kEnableSendLoop);
+  sender->setLimitNumSockets(LimitedTestSender::kMaxSocketsNoLimit);
+  SCOPE_EXIT {
+    qp = nullptr;
+    sender = nullptr;
+  };
+  qp->setupFlows(2, 2, sender.get());
+  std::ignore = sender->getSocketIdFromAddress(localAddr);
+  auto* flow = qp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_EQ(flow->getLocalPortIdx(), 0)
+      << "precondition: the flow must start on the first configured pair";
+  ASSERT_EQ(sender->getAddressFromSocketId(flow->getSocketId()), localAddr)
+      << "precondition: the initial socket must match the pair's local address";
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(0))
+      .WillByDefault(Return(1));
+  ASSERT_TRUE(qp->postWqe(
+      kMetaRoceInitialTag,
+      std::make_unique<SendWqe>(
+          0, oneSge(payload.data(), payload.size()), qp->getMtu())))
+      << "precondition: an outstanding frame is needed to drive RTO repathing";
+  qp->startProcessingWqes();
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    ASSERT_TRUE(written.wait_for(lock, std::chrono::seconds(30), [&] {
+      return transmissions.size() >= 9;
+    })) << "the unanswered frame must keep retransmitting through repeated RTOs";
+  }
+  qp = nullptr;
+  sender = nullptr;
+
+  for (const auto& [source, destination] : transmissions) {
+    EXPECT_EQ(source, localAddr)
+        << "RTO repathing must not send from a different plane's local address";
+    EXPECT_EQ(destination, remoteAddr)
+        << "the retransmission must stay within the configured port pair";
+  }
+  EXPECT_GT(sourcePorts.size(), 1u)
+      << "the test must observe source-port changes rather than a pinned flow";
+}
+
 TEST_F(SenderTest, AckSocketCyclesThroughSameAddressSockets) {
   auto sender = createUnlimitedTestSender();
   const uint16_t first = sender->getSocketIdFromAddress(localAddr);
