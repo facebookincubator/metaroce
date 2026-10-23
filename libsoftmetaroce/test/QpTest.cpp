@@ -10512,6 +10512,58 @@ TEST_F(QpTest, FailoverOnlyChoosesConfiguredPortPairs) {
   EXPECT_EQ(flowOnRemote0->getRemoteAddr(), remote1);
 }
 
+TEST_F(QpTest, FailoverSocketAcquisitionFailurePreservesRoute) {
+  gflags::FlagSaver flagSaver;
+  ScopedSuppressedTxTimers suppressTimers;
+  const auto local0 = folly::IPAddress("fc00::1");
+  const auto local1 = folly::IPAddress("fc00::2");
+  const auto remote0 = folly::IPAddress("fc00::101");
+  const auto remote1 = folly::IPAddress("fc00::102");
+
+  for (const bool singleOwner : {false, true}) {
+    SCOPED_TRACE(singleOwner);
+    FLAGS_libsoftmetaroce_single_owner_tx = singleOwner;
+    LimitedTestSender sender(arbiter, mockUDPSocketMaker);
+    sender.setLimitNumSockets(1);
+    Qp multiQp{8, retxTimer, arbiter, mrs, &cq, ibvQp};
+    multiQp.setMtu(mtu);
+    createAlwaysSendingMockCongestionController(multiQp);
+    const auto entry = makeUdpEntry();
+    multiQp.addPortPair(0, local0, entry, 0, remote0);
+    multiQp.addPortPair(1, local1, entry, 1, remote1);
+    multiQp.setupFlows(1, 0, &sender);
+    auto* flow = multiQp.getTxFlowById(0);
+    ASSERT_NE(flow, nullptr);
+    ASSERT_EQ(flow->getRemoteAddr(), remote0)
+        << "precondition: the sole flow starts on the pair whose remote is down";
+    ASSERT_EQ(multiQp.usesSingleOwnerRxRing(), singleOwner)
+        << "precondition: packet building uses the requested ACK ownership mode";
+    const auto originalSocket = flow->getSocketId();
+
+    multiQp.updateRemoteActivePortSet(0x2);
+    EXPECT_NO_THROW((void)multiQp.getNextPacketToSend())
+        << "failed APS socket acquisition must not escape the packet builder";
+    EXPECT_EQ(flow->getSocketId(), originalSocket)
+        << "failed APS acquisition must retain the bound socket";
+    EXPECT_EQ(
+        std::make_pair(
+            sender.getAddressFromSocketId(flow->getSocketId()),
+            flow->getRemoteAddr()),
+        std::make_pair(local0, remote0))
+        << "failed APS acquisition must preserve both configured endpoints";
+
+    sender.setLimitNumSockets(LimitedTestSender::kMaxSocketsNoLimit);
+    EXPECT_NO_THROW((void)multiQp.getNextPacketToSend())
+        << "a later APS visit must retry after socket capacity becomes available";
+    EXPECT_EQ(
+        std::make_pair(
+            sender.getAddressFromSocketId(flow->getSocketId()),
+            flow->getRemoteAddr()),
+        std::make_pair(local1, remote1))
+        << "a successful APS retry must move the complete configured pair";
+  }
+}
+
 TEST_F(QpTest, FailoverScanIsOffsetByQpRotation) {
   ScopedSuppressedTxTimers suppressTimers;
   const auto local = folly::IPAddress("fc00::1");

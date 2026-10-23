@@ -1602,8 +1602,15 @@ void TxFlow::maybeFailoverRemotePort() {
   const auto& newPair = qp_.portPairs_.at(newPairIdx);
   if (newPair.localPortIdx != pair.localPortIdx) {
     const auto& newLocalPort = qp_.localPorts_.at(newPair.localPortIdx);
-    socketId_ = qp_.getSender().getSocketIdFromAddress(
-        newLocalPort.addr, newLocalPort.gid);
+    try {
+      socketId_ = qp_.getSender().getSocketIdFromAddress(
+          newLocalPort.addr, newLocalPort.gid);
+    } catch (const std::exception& ex) {
+      VLOG(2) << "QP " << qp_.getLocalQpNum() << " flow " << flowId_
+              << ": unable to acquire socket for APS failover to pair "
+              << newPairIdx << ": " << ex.what();
+      return;
+    }
   }
   portPairIdx_ = newPairIdx;
   LOG(INFO) << "QP " << qp_.getLocalQpNum() << " flow " << flowId_
