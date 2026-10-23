@@ -22,7 +22,6 @@
 
 #include <libsoftmetaroce/Constants.h>
 #include <libsoftmetaroce/Cqe.h>
-#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -81,8 +80,6 @@ class CompletionQueue {
   [[nodiscard]] bool hasUnackedCompletionEvents() const;
 
  private:
-  void raiseCompletionEventIfArmed();
-
   // Injected dependencies.
   const std::function<void()> reportOverflow_;
   const std::function<void()> raiseCompletionEvent_;
@@ -94,7 +91,9 @@ class CompletionQueue {
 
   // Runtime state.
   // Covers the size check and the placement together, so two queue pairs
-  // sharing this queue cannot both take the last entry.
+  // sharing this queue cannot both take the last entry. It also covers the
+  // notification arm, so a re-arm cannot land between a completion's
+  // placement and the consume that reports it.
   std::mutex admission_;
   static constexpr size_t kLgEntriesPerSegment = 5;
   folly::coro::UnboundedQueue<Cqe, false, false, false, kLgEntriesPerSegment>
@@ -109,7 +108,9 @@ class CompletionQueue {
   };
   folly::Synchronized<References, std::mutex> references_;
   std::condition_variable allEventsAcked_;
-  std::atomic<bool> armed_{false};
+  // Set by requestNotification, consumed by the next accepted completion.
+  // Guarded by admission_.
+  bool armed_{false};
 };
 
 } // namespace libsoftmetaroce

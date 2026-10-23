@@ -40,40 +40,43 @@ folly::coro::Task<Cqe> CompletionQueue::pollCq() {
 
 bool CompletionQueue::tryEnqueue(Cqe cqe) {
   bool refused = false;
+  bool raise = false;
   {
     const std::lock_guard<std::mutex> guard{admission_};
     refused = completionQueue_.size() >= depth_;
     if (!refused) {
       completionQueue_.enqueue(std::move(cqe));
+      // Consumed under the same lock as the enqueue, so a re-arm cannot land
+      // between this enqueue and the consume below.
+      raise = armed_;
+      armed_ = false;
     }
   }
   if (refused && reportOverflow_ != nullptr) {
     reportOverflow_();
   }
-  if (!refused) {
-    raiseCompletionEventIfArmed();
+  if (raise && raiseCompletionEvent_ != nullptr) {
+    raiseCompletionEvent_();
   }
   return !refused;
 }
 
 void CompletionQueue::enqueue(Cqe cqe) {
+  bool raise = false;
   {
     const std::lock_guard<std::mutex> guard{admission_};
     completionQueue_.enqueue(std::move(cqe));
+    raise = armed_;
+    armed_ = false;
   }
-  raiseCompletionEventIfArmed();
-}
-
-void CompletionQueue::raiseCompletionEventIfArmed() {
-  if (armed_.load(std::memory_order_acquire) &&
-      armed_.exchange(false, std::memory_order_acq_rel) &&
-      raiseCompletionEvent_ != nullptr) {
+  if (raise && raiseCompletionEvent_ != nullptr) {
     raiseCompletionEvent_();
   }
 }
 
 void CompletionQueue::requestNotification() {
-  armed_.store(true, std::memory_order_release);
+  const std::lock_guard<std::mutex> guard{admission_};
+  armed_ = true;
 }
 
 void CompletionQueue::takeRetrievedCompletionEvent() {
