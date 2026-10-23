@@ -224,6 +224,9 @@ class TxFlow : public Flow {
   // Body of retxTimerCallback_, so it runs on the timer thread.
   void onRetransmissionTimeout();
 
+  [[nodiscard]] uint16_t findAlternatePortPair(
+      uint16_t activePortSet,
+      bool sameLocalOnly) const;
   void maybeFailoverRemotePort();
 
   void disableAndNotifyCongestionControl();

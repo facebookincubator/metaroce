@@ -1537,6 +1537,33 @@ void TxFlow::disableAndNotifyCongestionControl() {
   }
 }
 
+uint16_t TxFlow::findAlternatePortPair(
+    uint16_t activePortSet,
+    bool sameLocalOnly) const {
+  const auto pairIdx = portPairIdx_;
+  const auto& pair = qp_.portPairs_.at(pairIdx);
+  const auto numPairs = qp_.portPairs_.size();
+  // Stagger the scan start by QP and flow so failover traffic spreads across
+  // active alternatives instead of all flows picking the same first pair.
+  const auto start =
+      (pairIdx + qp_.getPortPairRotation() + flowId_ + 1) % numPairs;
+  for (size_t offset = 0; offset < numPairs; offset++) {
+    const auto candidateIdx =
+        static_cast<uint16_t>((start + offset) % numPairs);
+    if (candidateIdx == pairIdx) {
+      continue;
+    }
+    const auto& candidate = qp_.portPairs_.at(candidateIdx);
+    if (sameLocalOnly && candidate.localPortIdx != pair.localPortIdx) {
+      continue;
+    }
+    if (qp_.isRemotePortActive(candidate.remotePortIdx, activePortSet)) {
+      return candidateIdx;
+    }
+  }
+  return std::numeric_limits<uint16_t>::max();
+}
+
 void TxFlow::maybeFailoverRemotePort() {
   const auto aps = qp_.getRemoteActivePortSet();
   if (aps == 0) {
@@ -1568,32 +1595,9 @@ void TxFlow::maybeFailoverRemotePort() {
   // Choose another configured pair only. Prefer preserving the current local
   // port; if that has no active remote, allow failover to another configured
   // local/remote pair and update the bound socket.
-  const auto pickConfiguredPair = [&](bool sameLocalOnly) -> uint16_t {
-    const auto numPairs = qp_.portPairs_.size();
-    // Stagger the scan start by QP and flow so failover traffic spreads across
-    // active alternatives instead of all flows picking the same first pair.
-    const auto start =
-        (pairIdx + qp_.getPortPairRotation() + flowId_ + 1) % numPairs;
-    for (size_t offset = 0; offset < numPairs; offset++) {
-      const auto candidateIdx =
-          static_cast<uint16_t>((start + offset) % numPairs);
-      if (candidateIdx == pairIdx) {
-        continue;
-      }
-      const auto& candidate = qp_.portPairs_.at(candidateIdx);
-      if (sameLocalOnly && candidate.localPortIdx != pair.localPortIdx) {
-        continue;
-      }
-      if (qp_.isRemotePortActive(candidate.remotePortIdx, aps)) {
-        return candidateIdx;
-      }
-    }
-    return std::numeric_limits<uint16_t>::max();
-  };
-
-  auto newPairIdx = pickConfiguredPair(/*sameLocalOnly=*/true);
+  auto newPairIdx = findAlternatePortPair(aps, /*sameLocalOnly=*/true);
   if (newPairIdx == std::numeric_limits<uint16_t>::max()) {
-    newPairIdx = pickConfiguredPair(/*sameLocalOnly=*/false);
+    newPairIdx = findAlternatePortPair(aps, /*sameLocalOnly=*/false);
   }
   if (newPairIdx == std::numeric_limits<uint16_t>::max()) {
     return;
