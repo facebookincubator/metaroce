@@ -355,9 +355,6 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetRetransmissionPacket() {
 std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
   Wqe* FOLLY_NULLABLE wqe = nullptr;
   std::unique_ptr<struct EgressPacket> packet;
-  // Record the pending wakeup, then signal after releasing the guards, since
-  // signaling can block on consumers waiting on sndCur and Tag semaphores.
-  SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
   {
     // Acquire sndCur before findNextWqe (which acquires the Tag semaphore) so
     // the send path takes locks in sndCur->Tag order, matching the retransmit
@@ -368,7 +365,6 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
       auto tag = maybeWqeAndTag->second;
       const auto tagNum = tag->getTagNum();
       CHECK_NOTNULL(wqe); // for lint(facebook-hte-NullableDereference)
-      bool tagStillHeld = true;
       if (!tag->isInErrorState()) {
         try {
           if (auto built = getNextPacketToSendFromWqe(*wqe, tagNum)) {
@@ -382,21 +378,28 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
             VLOG(2)
                 << "TxFlow::tryGetNewPacketFromWqe() find next WQE+tag didn't find a packet";
           }
-          // Only the throw below leaves the tag still ours.
-          tagStillHeld = false;
         } catch (const OversizeWqeException& ex) {
           LOG(ERROR) << "Oversize WQE error: " << ex.what();
-          auto retirementGuard = tag->lockForWqeRetirement();
-          // Handling this one work request here does not prove the tag has no
-          // other pending work, so the sweep still has to run.
-          tagErrorWake = qp_.enterTagErrorWithTagHeld(*tag);
-          // Not one packet of this message was sent, so it is accounted for in
-          // full here. sndCur and the Tag are both already held, in that order.
-          uint32_t abandonedCount = wqe->markFailing(kLocalLenErr);
-          abandonedCount += tag->markPendingWqesFailing(kWrFlushErr);
-          qp_.subtractUnsentPosns(abandonedCount);
-          tag->flushPendingReceiveWqesInError();
-          tag->completeSettledFailedWqes();
+          SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
+          {
+            auto retirementGuard = tag->lockForWqeRetirement();
+            // Handling this one work request here does not prove the tag has
+            // no other pending work, so the sweep still has to run.
+            tagErrorWake = qp_.enterTagErrorWithTagHeld(*tag);
+            // Not one packet of this message was sent, so it is accounted for
+            // in full here. sndCur and the Tag are both already held, in that
+            // order.
+            uint32_t abandonedCount = wqe->markFailing(kLocalLenErr);
+            abandonedCount += tag->markPendingWqesFailing(kWrFlushErr);
+            qp_.subtractUnsentPosns(abandonedCount);
+            tag->flushPendingReceiveWqesInError();
+            tag->completeSettledFailedWqes();
+          }
+          tag->markFree();
+          lockedSndCur.unlock();
+          // Waking the sender can block, so drop locks first.
+          qp_.wakeSenderAfterTagError(tagErrorWake);
+          return nullptr;
         }
       } else {
         // The WQEs live on until the tracker entries holding their frames
@@ -404,8 +407,6 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
         qp_.subtractUnsentPosns(tag->failPendingWqesIfInErrorWithTagHeld());
         VLOG(2)
             << "TxFlow::tryGetNewPacketFromWqe() error state - no packet returned";
-      }
-      if (tagStillHeld) {
         tag->markFree();
       }
     } else {
@@ -417,7 +418,6 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
       }
     }
   }
-  qp_.wakeSenderAfterTagError(tagErrorWake);
   return packet;
 }
 
