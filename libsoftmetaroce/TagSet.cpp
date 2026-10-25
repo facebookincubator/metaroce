@@ -415,7 +415,7 @@ std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>> TagSet::findNextWqe(
   // mutex_. Two callers may snapshot the same starting Tag, which costs
   // fairness, not safety: the Tag semaphore serializes WQE access.
   for (const auto& [tagNum, tag] : tags) {
-    if (auto* wqe = tag->findNextWqe(intendToSend)) {
+    if (auto* wqe = tag->findNextWqe()) {
       if (intendToSend) {
         std::scoped_lock lock(mutex_);
         lastTagNumCheckedForWqes_ = tagNum;

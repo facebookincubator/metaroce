@@ -369,6 +369,7 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
         try {
           if (auto built = getNextPacketToSendFromWqe(*wqe, tagNum)) {
             VLOG(2) << "TxFlow::tryGetNewPacketFromWqe() found a packet on WQE";
+            tag->markProbeSentIfBlockedMsn(*wqe);
             // Release the tag semaphore acquired by findNextWqe().
             tag->markFree();
             packet = std::move(built);

@@ -244,7 +244,17 @@ class Tag {
       const MemoryRegions& memoryRegions);
   // Widens the window of messages that can be recorded until msn falls in it.
   void extendCdmsnTrackerIfNeeded(uint16_t msn);
-  Wqe* FOLLY_NULLABLE findNextWqe(bool intendToSend);
+  Wqe* FOLLY_NULLABLE findNextWqe();
+  // Only a blocked, non-virtual request counts as a probe.
+  bool isProbeWqe(const Wqe& wqe) const {
+    return !wqe.isVirtual() && isBlockedMsn(wqe.getMsn().value());
+  }
+  // Caller holds the Tag semaphore and has built a packet from wqe.
+  void markProbeSentIfBlockedMsn(const Wqe& wqe) {
+    if (brnr_.state() == BrnrState::BRNR_PROBING && isProbeWqe(wqe)) {
+      brnr_.probeSent();
+    }
+  }
   [[nodiscard]] std::optional<uint16_t> getBrnrFirstBlockedMsn() const;
   [[nodiscard]] bool isBlockedMsn(uint16_t msn) const;
   BrnrState getBrnrState() const;
@@ -578,8 +588,7 @@ class Tag {
   Wqe* findNextWqeInMap(
       const std::map<uint16_t, std::unique_ptr<Wqe>>& readLockedWqeMap,
       bool msnsAreRemote,
-      uint16_t startMsn,
-      bool intendToSend);
+      uint16_t startMsn);
   [[nodiscard]] Cqe cqeForWqe(const Wqe& wqe, WorkCompletionStatus status)
       const;
   void enqueueCqeForWqe(const Wqe& wqe, WorkCompletionStatus status);

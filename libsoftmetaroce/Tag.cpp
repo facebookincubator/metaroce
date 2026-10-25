@@ -842,7 +842,7 @@ void Tag::extendCdmsnTrackerIfNeeded(uint16_t msn) {
   return brnr_.isBlockedMsn(msn);
 }
 
-Wqe* FOLLY_NULLABLE Tag::findNextWqe(bool intendToSend) {
+Wqe* FOLLY_NULLABLE Tag::findNextWqe() {
   // Hold the Tag's semaphore across the WQE lookup and until the caller
   // markFree()s: a concurrent completion takes the same semaphore before
   // freeing WQEs, so acquiring it up front keeps the returned pointer alive for
@@ -854,17 +854,14 @@ Wqe* FOLLY_NULLABLE Tag::findNextWqe(bool intendToSend) {
   // First, check remote MSN WQEs.
   {
     auto lockedRemoteMap = remoteMsnToWqe_.rlock();
-    wqeReadyToSend = findNextWqeInMap(
-        *lockedRemoteMap, true /* msnsAreRemote */, cdmsn, intendToSend);
+    wqeReadyToSend =
+        findNextWqeInMap(*lockedRemoteMap, true /* msnsAreRemote */, cdmsn);
   }
   // Second, check locally-generated WQEs.
   if (wqeReadyToSend == nullptr) {
     auto lockedSpan = msnSpan_.rlock();
     wqeReadyToSend = findNextWqeInMap(
-        lockedSpan->wqes,
-        false /* msnsAreRemote */,
-        lockedSpan->nextMsn,
-        intendToSend);
+        lockedSpan->wqes, false /* msnsAreRemote */, lockedSpan->nextMsn);
   }
   // Release the semaphore taken above when there is no WQE to hand back.
   if (wqeReadyToSend == nullptr) {
@@ -877,13 +874,12 @@ Wqe* FOLLY_NULLABLE Tag::findNextWqe(bool intendToSend) {
 Wqe* Tag::findNextWqeInMap(
     const std::map<uint16_t, std::unique_ptr<Wqe>>& readLockedWqeMap,
     bool msnsAreRemote,
-    uint16_t startMsn,
-    bool intendToSend) {
+    uint16_t startMsn) {
   auto range = iterateFrom(readLockedWqeMap, startMsn);
   auto it = std::find_if(
       range.begin(),
       range.end(),
-      [this, msnsAreRemote, intendToSend](const auto& msnWqePair) {
+      [this, msnsAreRemote](const auto& msnWqePair) {
         // Must return true if the WQE has data that is can send and false
         // otherwise.
         const auto& [msn, wqe] = msnWqePair;
@@ -908,11 +904,6 @@ Wqe* Tag::findNextWqeInMap(
           // does not requires an RWQE.
           return false;
         } else if (brnr_.state() == BrnrState::BRNR_PROBING) {
-          // The WQE we return will be used to send a probe, so we need to
-          // perform the BRNR state transition.
-          if (intendToSend) {
-            brnr_.probeSent();
-          }
           return true;
         } else {
           LOG(FATAL) << "Unexpected BRNR state: " << brnr_.state()

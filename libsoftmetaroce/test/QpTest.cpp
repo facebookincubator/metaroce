@@ -2414,7 +2414,7 @@ TEST_F(QpTest, AFatalNakForAReadResponseFailsTheResponderTag) {
       initiatorMsn, rwHeader, &addressError, mrs, mtu);
   ASSERT_EQ(addressError, 0)
       << "precondition: the read's region resolves, or no response is built";
-  Wqe* const response = initialTag->findNextWqe(/*intendToSend=*/true);
+  Wqe* const response = initialTag->findNextWqe();
   ASSERT_NE(response, nullptr);
   ASSERT_TRUE(response->isVirtual())
       << "precondition: the frame on the wire is a read response";
@@ -2460,7 +2460,7 @@ TEST_F(QpTest, AFatalNakNamingAnotherTagThanTheResponseIsCheckedAsThatTags) {
       initialTag->getNextMsn(), rwHeader, &addressError, mrs, mtu);
   ASSERT_EQ(addressError, 0)
       << "precondition: the read's region resolves, or no response is built";
-  Wqe* const response = initialTag->findNextWqe(/*intendToSend=*/true);
+  Wqe* const response = initialTag->findNextWqe();
   ASSERT_NE(response, nullptr);
   ASSERT_TRUE(response->isVirtual())
       << "precondition: the frame on the wire is a read response";
@@ -2510,7 +2510,7 @@ TEST_F(QpTest, AFatalNakForAReadResponseSelectsNoSendByTheInitiatorsMsn) {
       initiatorMsn, rwHeader, &addressError, mrs, mtu);
   ASSERT_EQ(addressError, 0)
       << "precondition: the read's region resolves, or no response is built";
-  Wqe* const response = initialTag->findNextWqe(/*intendToSend=*/true);
+  Wqe* const response = initialTag->findNextWqe();
   ASSERT_NE(response, nullptr);
   ASSERT_TRUE(response->isVirtual())
       << "precondition: the frame on the wire is a read response";
@@ -3081,7 +3081,7 @@ TEST_F(QpTest, AnUnsentFailingReadIsNotSentAndStillWaitsItsTurn) {
 
   // Released before the check so a failure reports rather than wedging the
   // Tag for everything after it.
-  Wqe* const selected = initialTag->findNextWqe(/*intendToSend=*/true);
+  Wqe* const selected = initialTag->findNextWqe();
   if (selected != nullptr) {
     initialTag->markFree();
   }

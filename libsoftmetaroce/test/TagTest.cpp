@@ -632,7 +632,7 @@ TEST_F(TagTest, AnAckedVirtualSendOverASkippedCsnReportsTheRefusal) {
       /*msn=*/2, rwHeader, &addressError, *memoryRegions_, kMtu);
   ASSERT_EQ(addressError, 0)
       << "precondition: the region resolves, or no send is built to ack";
-  Wqe* const virtualWqe = tag_->findNextWqe(false);
+  Wqe* const virtualWqe = tag_->findNextWqe();
   ASSERT_NE(virtualWqe, nullptr);
   ASSERT_TRUE(virtualWqe->isVirtual())
       << "precondition: the responder's own send is the one acked below";
@@ -1096,7 +1096,7 @@ TEST_F(TagTest, AHalfClosedTagFinishesAMessageItStarted) {
   ASSERT_EQ(firstPosn, 0u);
   tag_->markForDeletion();
 
-  Wqe* found = tag_->findNextWqe(/*intendToSend=*/true);
+  Wqe* found = tag_->findNextWqe();
   ASSERT_EQ(found, accepted)
       << "a half-closed tag must still hand over the message it had started, "
          "which is the only way the rest of it reaches the wire";
@@ -1140,7 +1140,7 @@ TEST_F(TagTest, AHalfClosedTagRefusesNewWork) {
 // Test findNextWqe functionality
 TEST_F(TagTest, FindNextWqe) {
   // Initially no WQEs
-  EXPECT_EQ(tag_->findNextWqe(false), nullptr);
+  EXPECT_EQ(tag_->findNextWqe(), nullptr);
 
   // Add a send WQE
   auto sendWqe = std::make_unique<SendWqe>(
@@ -1148,7 +1148,7 @@ TEST_F(TagTest, FindNextWqe) {
   postToTag(*tag_, std::move(sendWqe), kMtu);
 
   // Should find the WQE
-  Wqe* foundWqe = tag_->findNextWqe(false);
+  Wqe* foundWqe = tag_->findNextWqe();
   EXPECT_NE(foundWqe, nullptr);
   EXPECT_EQ(foundWqe->getWorkType(), Wqe::WorkType::kSend);
   tag_->markFree();
@@ -1163,19 +1163,75 @@ TEST_F(TagTest, FindNextWqeWithBlockedMsn) {
 
   tag_->brnr().blockAt(1);
 
-  EXPECT_EQ(tag_->findNextWqe(false), nullptr)
+  EXPECT_EQ(tag_->findNextWqe(), nullptr)
       << "a tag in backoff should offer no work for the msn the receiver is "
          "not ready for";
 
   tag_->brnr().beginProbe();
-  Wqe* foundWqe = tag_->findNextWqe(true); // intendToSend = true
+  Wqe* foundWqe = tag_->findNextWqe();
   EXPECT_NE(foundWqe, nullptr)
       << "a probing tag should offer the blocked msn's work as its one probe";
   tag_->markFree();
 
+  EXPECT_EQ(tag_->getBrnrState(), BrnrState::BRNR_PROBING)
+      << "finding the blocked msn's request must not send it; without a "
+         "built packet the backoff stays probing";
+}
+
+TEST_F(TagTest, ProbeCommitTransitionsOnlyForBuiltBlockedProbe) {
+  // One send WQE (msn 1).
+  auto sendWqe = std::make_unique<SendWqe>(
+      kWorkReqId, oneSge(buffer_->data(), 1000), kMtu);
+  postToTag(*tag_, std::move(sendWqe), kMtu);
+
+  // Outside an episode there is no probe to record.
+  Wqe* foundWqe = tag_->findNextWqe();
+  ASSERT_NE(foundWqe, nullptr)
+      << "precondition: the tag has to return its unblocked request, or "
+         "the commit below has nothing to judge";
+  tag_->markProbeSentIfBlockedMsn(*foundWqe);
+  EXPECT_EQ(tag_->getBrnrState(), BrnrState::NORMAL_TX)
+      << "outside an episode, recording a built packet must not move the "
+         "backoff state";
+  tag_->markFree();
+
+  // Blocked and probing: the blocked request is the probe.
+  tag_->brnr().blockAt(1);
+  tag_->brnr().beginProbe();
+  foundWqe = tag_->findNextWqe();
+  ASSERT_NE(foundWqe, nullptr)
+      << "precondition: the probing tag has to return the blocked msn's "
+         "work, or the commit below has no probe to record";
+  tag_->markProbeSentIfBlockedMsn(*foundWqe);
   EXPECT_EQ(tag_->getBrnrState(), BrnrState::BRNR_PROBE_SENT)
-      << "sending the probe should leave the tag waiting to hear whether the "
-         "receiver is ready";
+      << "a built packet from the probing tag's blocked msn is the probe "
+         "itself, so committing it must move the backoff to PROBE_SENT";
+  tag_->markFree();
+
+  // A virtual response shares the msn space but is responder work, not new
+  // work, so it must never count as a probe.
+  tag_->brnr().blockAt(2);
+  tag_->brnr().beginProbe();
+  VirtualSendWqe virtualWqe(5, buffer_->data(), 100, kMtu);
+  tag_->markProbeSentIfBlockedMsn(virtualWqe);
+  EXPECT_EQ(tag_->getBrnrState(), BrnrState::BRNR_PROBING)
+      << "a built responder message must not move the backoff even when its "
+         "msn sits inside the blocked range";
+
+  // Resume clears the blocked range, so re-blocking past msn 1 leaves msn 1
+  // unblocked while probing again.
+  tag_->brnr().resume();
+  tag_->brnr().blockAt(5);
+  tag_->brnr().beginProbe();
+  foundWqe = tag_->findNextWqe();
+  ASSERT_NE(foundWqe, nullptr)
+      << "precondition: the unblocked msn still has to be returned, or the "
+         "commit below proves nothing about ordinary work";
+  tag_->markProbeSentIfBlockedMsn(*foundWqe);
+  EXPECT_EQ(tag_->getBrnrState(), BrnrState::BRNR_PROBING)
+      << "an ordinary request built while probing is no probe, so "
+         "committing it must not move the backoff";
+  tag_->markFree();
 }
 
 // Test extendCdmsnTrackerIfNeeded
@@ -2117,7 +2173,7 @@ TEST_F(TagTest, WqeLifecycle) {
   EXPECT_EQ(tag_->getNextMsn(), 3);
 
   // Test finding WQEs
-  Wqe* nextWqe = tag_->findNextWqe(false);
+  Wqe* nextWqe = tag_->findNextWqe();
   EXPECT_NE(nextWqe, nullptr);
   EXPECT_EQ(nextWqe->getWorkType(), Wqe::WorkType::kSend);
   tag_->markFree();
@@ -2147,7 +2203,7 @@ TEST_F(TagTest, HandleTxWqesCompletionCleansUpVirtualSendWqe) {
       << "CQ should be empty before completion";
 
   // findNextWqe checks remoteMsnToWqe_ first, so the virtual WQE is returned
-  Wqe* virtualWqePtr = tag_->findNextWqe(false);
+  Wqe* virtualWqePtr = tag_->findNextWqe();
   ASSERT_NE(virtualWqePtr, nullptr);
   ASSERT_TRUE(virtualWqePtr->isVirtual())
       << "findNextWqe should return the virtual WQE first";
@@ -2158,7 +2214,7 @@ TEST_F(TagTest, HandleTxWqesCompletionCleansUpVirtualSendWqe) {
   while (!virtualWqePtr->hasBeenSent()) {
     (void)virtualWqePtr->allocateNextPosn();
   }
-  Wqe* localWqePtr = tag_->findNextWqe(false);
+  Wqe* localWqePtr = tag_->findNextWqe();
   ASSERT_NE(localWqePtr, nullptr);
   ASSERT_FALSE(localWqePtr->isVirtual())
       << "second findNextWqe should return the local WQE";
@@ -2238,7 +2294,7 @@ TEST_F(TagTest, AVirtualSendCompletedInErrorIsHeldUntilItsResponseSettles) {
       << "precondition: the response to the remote read must exist, or there "
          "is no virtual send here to hold";
 
-  Wqe* response = tag_->findNextWqe(false);
+  Wqe* response = tag_->findNextWqe();
   ASSERT_NE(response, nullptr);
   ASSERT_TRUE(response->isVirtual())
       << "precondition: the tag's only work is the read response";
@@ -2663,7 +2719,7 @@ TEST_F(TagTest, CompleteVirtualSendWqeInError) {
       << "should have 1 virtual WQE pending";
 
   // Get a pointer to the VirtualSendWqe
-  Wqe* virtualWqePtr = tag_->findNextWqe(false);
+  Wqe* virtualWqePtr = tag_->findNextWqe();
   ASSERT_NE(virtualWqePtr, nullptr);
   ASSERT_TRUE(virtualWqePtr->isVirtual());
   tag_->markFree();
@@ -2720,7 +2776,7 @@ TEST_F(TagTest, FindNextWqeVsFatalNakFlushNoUseAfterFree) {
     for (int t = 0; t < kFinders; ++t) {
       finders.emplace_back([&] {
         while (!flushed.load(std::memory_order_acquire)) {
-          Wqe* wqe = tag_->findNextWqe(/*intendToSend=*/true);
+          Wqe* wqe = tag_->findNextWqe();
           if (wqe != nullptr) {
             // On a freed WQE this read is the use-after-free under test.
             if (wqe->getMsn().has_value()) {
