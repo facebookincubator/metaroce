@@ -868,6 +868,14 @@ Wqe* FOLLY_NULLABLE Tag::findNextWqe() {
     markFree();
     return nullptr;
   }
+  // A tag in error still returns the WQE, for the send path to fail it. This
+  // check runs after the lookup's msnSpan_ lock is released, since it takes
+  // that lock again.
+  if (wqeReadyToSend->hasFenceFlag() && !isInErrorState() &&
+      !arePriorWqesCompleteForFence(wqeReadyToSend->getMsn().value())) {
+    markFree();
+    return nullptr;
+  }
   return wqeReadyToSend;
 }
 

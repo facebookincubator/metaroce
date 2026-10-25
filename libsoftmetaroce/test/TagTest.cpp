@@ -1234,6 +1234,71 @@ TEST_F(TagTest, ProbeCommitTransitionsOnlyForBuiltBlockedProbe) {
   tag_->markFree();
 }
 
+// Posts a one-frame send (msn 1) and a fenced one-frame send (msn 2) behind
+// it, then puts the prior's frame on the wire unacked, so the fence holds.
+class TagFenceTest : public TagTest {
+ protected:
+  void SetUp() override {
+    TagTest::SetUp();
+    auto priorWqe = std::make_unique<SendWqe>(
+        kWorkReqId, oneSge(buffer_->data(), kMtu), kMtu);
+    prior_ = priorWqe.get();
+    ASSERT_TRUE(postToTag(*tag_, std::move(priorWqe), kMtu))
+        << "precondition: the tag accepts the prior";
+    auto fencedWqe = std::make_unique<SendWqe>(
+        kWorkReqId + 1,
+        oneSge(buffer_->data(), kMtu),
+        kMtu,
+        IBV_SEND_SIGNALED | IBV_SEND_FENCE);
+    fenced_ = fencedWqe.get();
+    ASSERT_TRUE(postToTag(*tag_, std::move(fencedWqe), kMtu))
+        << "precondition: the tag accepts the fenced send";
+
+    ASSERT_EQ(offeredWqe(), prior_)
+        << "precondition: the prior is offered ahead of the fenced send";
+    std::ignore = prior_->allocateNextPosn();
+  }
+
+  // Releases the Tag semaphore a returned WQE holds.
+  Wqe* offeredWqe() {
+    Wqe* const wqe = tag_->findNextWqe();
+    if (wqe != nullptr) {
+      tag_->markFree();
+    }
+    return wqe;
+  }
+
+  void completePrior() {
+    prior_->acknowledgePosn(0);
+    auto retirementGuard = tag_->lockForWqeRetirement();
+    EXPECT_TRUE(tag_->handleTxWqesCompletion({*prior_}))
+        << "precondition: completing the prior finds no csn out of sequence";
+  }
+
+  Wqe* prior_{nullptr};
+  Wqe* fenced_{nullptr};
+};
+
+TEST_F(TagFenceTest, AFencedSendIsOfferedOnlyOnceItsPriorCompletes) {
+  EXPECT_EQ(offeredWqe(), nullptr)
+      << "lookup must not return a fenced send whose prior is unacked; "
+         "returning nothing lets the scan serve another tag and keeps the "
+         "readiness check from counting it as work to send";
+
+  completePrior();
+  EXPECT_EQ(offeredWqe(), fenced_)
+      << "once the prior completes, the fenced send is the tag's next work";
+}
+
+TEST_F(TagFenceTest, ATagInErrorReturnsItsFencedSend) {
+  ibvQp_->state = IBV_QPS_ERR;
+  ASSERT_TRUE(tag_->isInErrorState())
+      << "precondition: the tag is in error with the prior still unacked";
+  EXPECT_EQ(offeredWqe(), fenced_)
+      << "the send path fails an errored tag's work when lookup returns it, "
+         "so lookup must return the fenced send even while its fence holds";
+}
+
 // Test extendCdmsnTrackerIfNeeded
 TEST_F(TagTest, ExtendCdmsnTracker) {
   EXPECT_EQ(tag_->getCDMSN(), 0);

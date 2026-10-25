@@ -9048,6 +9048,117 @@ TEST_F(QpTest, AnExecutionFenceHoldsTheWorkPostedBehindIt) {
       << "the unfenced send should go out behind the fenced one";
 }
 
+TEST_F(QpTest, AFenceHoldsBackOnlyItsOwnTag) {
+  ScopedSuppressedTxTimers suppressTimers;
+  constexpr uint8_t kOtherTag = kMetaRoceInitialTag + 1;
+  qp.addTag(kOtherTag, &cq, &otherIbvQpStorage);
+  createAlwaysSendingMockCongestionController(qp);
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 1, &mockSender);
+  auto flow = qp.getTxFlowById(0);
+
+  auto payload = std::make_unique<char[]>(mtu);
+  const WqeData initialTagSend{
+      .workType = Wqe::WorkType::kSend,
+      .msgSizeBytes = mtu,
+      .tagNum = kMetaRoceInitialTag,
+      .address = payload.get()};
+  WqeData otherTagSend = initialTagSend;
+  otherTagSend.tagNum = kOtherTag;
+  const auto nextDataHeader = [&flow]() -> std::optional<DataHeader> {
+    auto egressPacket = flow->getNextPacketToSend();
+    if (!egressPacket) {
+      return std::nullopt;
+    }
+    auto* dataPacket = dynamic_cast<DataPacket*>(egressPacket->packet.get());
+    if (dataPacket == nullptr) {
+      return std::nullopt;
+    }
+    return dataPacket->getDataHeader();
+  };
+
+  auto* prior = postWqeHelper(&qp, initialTagSend, /*doProcessWqe=*/false);
+  ASSERT_NE(postWqeHelper(&qp, otherTagSend, /*doProcessWqe=*/false), nullptr);
+  ASSERT_TRUE(processWqes(&qp, 2, 0))
+      << "precondition: both tags hold their first send";
+  const auto priorHeader = nextDataHeader();
+  ASSERT_TRUE(priorHeader.has_value())
+      << "precondition: the prior is on the wire and unacked, which is what "
+         "the fence waits on";
+  ASSERT_EQ(priorHeader->getMsn(), prior->getMsn().value())
+      << "precondition: the first packet carries the prior";
+  ASSERT_TRUE(nextDataHeader().has_value())
+      << "precondition: the other tag's first send went out last, so the "
+         "next scan starts at the fenced tag";
+
+  auto* fenced = postWqeHelper(&qp, initialTagSend, /*doProcessWqe=*/false);
+  fenced->setFenceFlag(true);
+  auto* other = postWqeHelper(&qp, otherTagSend, /*doProcessWqe=*/false);
+  ASSERT_TRUE(processWqes(&qp, 4, 0))
+      << "precondition: the fenced send and the other tag's second send are "
+         "on their tags";
+
+  const auto otherHeader = nextDataHeader();
+  ASSERT_TRUE(otherHeader.has_value())
+      << "a fenced send whose prior is unacked must not stop the scan from "
+         "serving another tag";
+  EXPECT_EQ(otherHeader->getTag(), kOtherTag)
+      << "the packet the scan finds past the fence must come from the tag "
+         "that has sendable work";
+  EXPECT_EQ(otherHeader->getMsn(), other->getMsn().value())
+      << "the packet the scan finds past the fence must be the other tag's "
+         "second send";
+  EXPECT_FALSE(nextDataHeader().has_value())
+      << "with the fenced send held and the other tag empty, the sender must "
+         "find nothing to send";
+
+  const AckHeader ackHeader = AckHeader::AckHeaderBuilder()
+                                  .setCumulativeFsn(priorHeader->getFsn())
+                                  .setMaxRcvdFsn(priorHeader->getFsn())
+                                  .setAckStatus(AckStatus::ACK)
+                                  .setTimestamp(priorHeader->getTimestamp())
+                                  .build();
+  flow->processAckPacket(
+      ackHeader, simulatedProcessedAtNs(ackHeader.getTimestamp()));
+  const auto fencedHeader = nextDataHeader();
+  ASSERT_TRUE(fencedHeader.has_value())
+      << "the prior's completion must release the fenced send";
+  EXPECT_EQ(fencedHeader->getMsn(), fenced->getMsn().value())
+      << "once its prior completes, the fenced send is the one sent";
+}
+
+TEST_F(QpTest, AFencedSendDoesNotStopTheRtoRetransmittingItsPrior) {
+  ScopedSuppressedTxTimers suppressTimers;
+  createAlwaysSendingMockCongestionController(qp);
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 1, &mockSender);
+  auto* const flow = qp.getTxFlowById(0);
+
+  auto payload = std::make_unique<char[]>(mtu);
+  const WqeData oneFrameSend{
+      .workType = Wqe::WorkType::kSend,
+      .msgSizeBytes = mtu,
+      .address = payload.get()};
+  ASSERT_NE(postWqeHelper(&qp, oneFrameSend), nullptr);
+  ASSERT_TRUE(flow->getNextPacketToSend())
+      << "precondition: the prior is on the wire and unacked";
+  auto* fenced = postWqeHelper(&qp, oneFrameSend, /*doProcessWqe=*/false);
+  fenced->setFenceFlag(true);
+  ASSERT_TRUE(processWqes(&qp, 2, 0))
+      << "precondition: the fenced send is on the tag behind its prior";
+  ASSERT_EQ(flow->getNumPendingRetxPackets(), 0u)
+      << "precondition: nothing is queued for retransmission before the "
+         "timer fires";
+
+  auto* const callback = flow->retxTimerCallback_.get();
+  retxTimer.cancelCallback(callback);
+  (*callback)();
+
+  EXPECT_EQ(flow->getNumPendingRetxPackets(), 1u)
+      << "the fenced send cannot go until its prior is acked, so the RTO must "
+         "retransmit the prior rather than wait for new data to be sent";
+}
+
 /*
  * End-to-end test for the receiver-side BRNR cancel trigger.
  *

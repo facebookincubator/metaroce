@@ -303,6 +303,7 @@ class TxFlow : public Flow {
   std::unique_ptr<HighResTimer::Callback> retxTimerCallback_;
   bool disabled_{false};
 
+  friend class QpTest_AFencedSendDoesNotStopTheRtoRetransmittingItsPrior_Test;
   friend class QpTest_ARetransmissionQueuedBeforeTheFailureIsNotSent_Test;
   friend class QpTest_CountSackedPacketsDirectWrap_Test;
   friend class QpTest_RtoWithQueuedPacketsKeepsTimerArmed_Test;

@@ -367,18 +367,11 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
       CHECK_NOTNULL(wqe); // for lint(facebook-hte-NullableDereference)
       if (!tag->isInErrorState()) {
         try {
-          if (auto built = getNextPacketToSendFromWqe(*wqe, tagNum)) {
-            VLOG(2) << "TxFlow::tryGetNewPacketFromWqe() found a packet on WQE";
-            tag->markProbeSentIfBlockedMsn(*wqe);
-            // Release the tag semaphore acquired by findNextWqe().
-            tag->markFree();
-            packet = std::move(built);
-          } else {
-            // getNextPacketToSendFromWqe() released the tag before returning
-            // null.
-            VLOG(2)
-                << "TxFlow::tryGetNewPacketFromWqe() find next WQE+tag didn't find a packet";
-          }
+          packet = getNextPacketToSendFromWqe(*wqe, tagNum);
+          VLOG(2) << "TxFlow::tryGetNewPacketFromWqe() found a packet on WQE";
+          tag->markProbeSentIfBlockedMsn(*wqe);
+          // Release the tag semaphore acquired by findNextWqe().
+          tag->markFree();
         } catch (const OversizeWqeException& ex) {
           LOG(ERROR) << "Oversize WQE error: " << ex.what();
           SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
@@ -463,8 +456,8 @@ bool TxFlow::hasUnackedData() const {
  * Build a packet to send from specified WQE+tag. Set RTX timer and
  * update CC.
  *
- * If the WQE has IBV_SEND_FENCE set, block transmission until the
- * previous WQE on this tag has completed.
+ * The caller must supply a WQE eligible to send. Returns a packet; an oversize
+ * WQE throws OversizeWqeException instead.
  *
  * Caller (e.g., tryGetNewPacketFromWqe) must hold sndCur.wlock() and is
  * responsible for semaphore management. In particular, should call
@@ -473,20 +466,6 @@ bool TxFlow::hasUnackedData() const {
 std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSendFromWqe(
     Wqe& wqe,
     uint8_t tagNum) {
-  if (wqe.hasFenceFlag()) {
-    uint16_t currentMsn = wqe.getMsn().value();
-    auto tag = qp_.getTag(tagNum);
-
-    if (!tag->arePriorWqesCompleteForFence(currentMsn)) {
-      // Prior WQEs not complete, cannot send fenced WQE yet
-      tag->markFree();
-      VLOG(2) << "TxFlow::getNextPacketToSendFromWqe: Fence blocking WQE msn: "
-              << currentMsn << " flow: " << flowId_
-              << " tagnum: " << static_cast<uint32_t>(tagNum);
-      return nullptr;
-    }
-  }
-
   auto posn = wqe.allocateNextPosn();
   qp_.tagSet_.decrementUnsentPosns();
   const uint32_t sendPayloadSize = wqe.canHaveSendPayload()
