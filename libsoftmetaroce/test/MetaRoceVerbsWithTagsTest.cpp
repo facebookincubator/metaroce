@@ -437,7 +437,7 @@ TEST_F(TaggedVerbsTest, ModifyingATagTheQueuePairNeverHadIsRefused) {
   struct ibv_qp* qp = makeQp();
   ASSERT_NE(qp, nullptr);
 
-  // A handle lsmr never issued: the queue pair is one it holds, the tag is not.
+  // A fabricated handle: the queue pair is real, but the tag is missing.
   struct ibv_qp fabricated = *qp;
   fabricated.qp_num = MetaRoceVerbs::combineQpAndTag(
       MetaRoceVerbs::qpAndTagToQp(qp->qp_num), 7);
@@ -2033,6 +2033,256 @@ TEST_F(TaggedVerbsTest, ATagTakesTheDomainOfTheQueuePairItJoins) {
   EXPECT_EQ(verbs_.ibv_destroy_qp(tag), 0);
   EXPECT_EQ(verbs_.ibv_destroy_qp(parent), 0);
   EXPECT_EQ(verbs_.ibv_dealloc_pd(otherPd), 0);
+}
+
+// Bundles sl with a usable address into an address-vector update; the
+// success-path modifies need the address accepted to pass.
+static struct ibv_qp_attr makeAvAttrWithSl(
+    uint8_t sl,
+    const char* dgid = "fc00::1") {
+  struct ibv_qp_attr attr{};
+  const auto remoteAddr = folly::IPAddressV6(dgid);
+  memcpy(attr.ah_attr.grh.dgid.raw, remoteAddr.toBinary().data(), 16);
+  attr.ah_attr.sl = sl;
+  return attr;
+}
+
+// Reports the service level ibv_query_qp gives this Tag.
+static uint8_t queriedServiceLevel(
+    libsoftmetaroce::MetaRoceVerbs& verbs,
+    struct ibv_qp* ibvqp) {
+  struct ibv_qp_attr attr{};
+  struct ibv_qp_init_attr initAttr{};
+  verbs.ibv_query_qp(ibvqp, &attr, IBV_QP_AV, &initAttr);
+  return attr.ah_attr.sl;
+}
+
+TEST_F(TaggedVerbsTest, ServiceLevelDefaultsToZero) {
+  struct ibv_qp* qp = makeQp();
+  ASSERT_NE(qp, nullptr);
+
+  struct ibv_qp_attr attr{};
+  struct ibv_qp_init_attr initAttr{};
+  // Mark the queried fields, so the assertions below prove what the query
+  // wrote rather than what zero-initialization left.
+  attr.ah_attr.sl = 0xFF;
+  memset(attr.ah_attr.grh.dgid.raw, 0xAB, sizeof(attr.ah_attr.grh.dgid.raw));
+  ASSERT_EQ(verbs_.ibv_query_qp(qp, &attr, IBV_QP_AV, &initAttr), 0)
+      << "precondition: the query has to succeed for the assertions below";
+  EXPECT_EQ(attr.ah_attr.sl, 0)
+      << "the marked service level must read back zero, proving the query "
+         "wrote it";
+  uint8_t zeroGid[sizeof(attr.ah_attr.grh.dgid.raw)] = {};
+  EXPECT_EQ(memcmp(attr.ah_attr.grh.dgid.raw, zeroGid, sizeof(zeroGid)), 0)
+      << "the query clears the address fields it does not report, so a "
+         "caller never reads its own buffer contents as an address";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp), 0);
+}
+
+TEST_F(TaggedVerbsTest, ServiceLevelConfiguresTagZero) {
+  struct ibv_qp* qp = makeQp();
+  ASSERT_NE(qp, nullptr);
+
+  struct ibv_qp_attr attr = makeAvAttrWithSl(11);
+  ASSERT_EQ(verbs_.ibv_modify_qp(qp, &attr, IBV_QP_AV), 0)
+      << "precondition: the modify has to be accepted, or the query below "
+         "reads back a tag nothing was ever set on";
+  EXPECT_EQ(queriedServiceLevel(verbs_, qp), 11)
+      << "tag zero is addressed by the queue pair's own handle, so its "
+         "service level configures through that handle like any other tag";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp), 0);
+}
+
+TEST_F(TaggedVerbsTest, EachTagKeepsItsOwnServiceLevel) {
+  constexpr uint8_t kParentSl = 3;
+  constexpr uint8_t kChildSl = 9;
+
+  struct ibv_qp* parent = makeQp();
+  ASSERT_NE(parent, nullptr);
+
+  struct ibv_qp* child = addTag(MetaRoceVerbs::qpAndTagToQp(parent->qp_num), 1);
+  ASSERT_NE(child, nullptr);
+
+  struct ibv_qp_attr attr = makeAvAttrWithSl(kParentSl);
+  ASSERT_EQ(verbs_.ibv_modify_qp(parent, &attr, IBV_QP_AV), 0)
+      << "precondition: the parent modify has to be accepted, or the query "
+         "below reads back a tag nothing was ever set on";
+  attr = makeAvAttrWithSl(kChildSl);
+  ASSERT_EQ(verbs_.ibv_modify_qp(child, &attr, IBV_QP_AV), 0)
+      << "precondition: the child modify has to be accepted, or the query "
+         "below reads back a tag nothing was ever set on";
+
+  EXPECT_EQ(queriedServiceLevel(verbs_, parent), kParentSl)
+      << "a tag must keep the service level its own ibv_qp was modified with";
+  EXPECT_EQ(queriedServiceLevel(verbs_, child), kChildSl)
+      << "the second tag was modified after the first, so a level shared "
+         "across the queue pair would report its value for both";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(child), 0);
+  EXPECT_EQ(verbs_.ibv_destroy_qp(parent), 0);
+}
+
+TEST_F(TaggedVerbsTest, ServiceLevelBoundariesAreAccepted) {
+  struct ibv_qp* qp = makeQp();
+  ASSERT_NE(qp, nullptr);
+
+  struct ibv_qp_attr attr = makeAvAttrWithSl(kMaxServiceLevel);
+  EXPECT_EQ(verbs_.ibv_modify_qp(qp, &attr, IBV_QP_AV), 0)
+      << "the top of the four-bit field must be usable, or part of the "
+         "weight range is unreachable";
+  EXPECT_EQ(queriedServiceLevel(verbs_, qp), kMaxServiceLevel)
+      << "the boundary value has to read back what the modify carried";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp), 0);
+}
+
+TEST_F(TaggedVerbsTest, ServiceLevelPastTheFieldIsRefused) {
+  struct ibv_qp* qp = makeQp();
+  ASSERT_NE(qp, nullptr);
+  const auto baseQpNum = MetaRoceVerbs::qpAndTagToQp(qp->qp_num);
+
+  struct ibv_qp_attr attr = makeAvAttrWithSl(kMaxServiceLevel + 1);
+  errno = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp(qp, &attr, IBV_QP_AV), EINVAL)
+      << "a service level the four-bit field cannot carry must be refused "
+         "rather than masked into range";
+  EXPECT_EQ(errno, EINVAL) << "the refusal has to reach a caller reading "
+                              "errno after the return value";
+  EXPECT_EQ(queriedServiceLevel(verbs_, qp), 0)
+      << "a refused modify must leave the value the tag held before it";
+  EXPECT_EQ(verbs_.getQpByNum(baseQpNum)->getNumPortPairs(), 0)
+      << "the refusal lands before the address side effects, so no port "
+         "pair may be left behind";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp), 0);
+}
+
+TEST_F(TaggedVerbsTest, InvalidAddressVectorInstallsNoServiceLevel) {
+  struct ibv_qp* qp = makeQp();
+  ASSERT_NE(qp, nullptr);
+  const auto baseQpNum = MetaRoceVerbs::qpAndTagToQp(qp->qp_num);
+
+  struct ibv_qp_attr attr = makeAvAttrWithSl(5);
+  attr.ah_attr.grh.sgid_index = 0xFF;
+  EXPECT_EQ(verbs_.ibv_modify_qp(qp, &attr, IBV_QP_AV), EINVAL)
+      << "a gid index the test device cannot hold must be refused";
+  EXPECT_EQ(queriedServiceLevel(verbs_, qp), 0)
+      << "an address vector that fails validation must not install its "
+         "service level on the way out";
+  EXPECT_EQ(verbs_.getQpByNum(baseQpNum)->getNumPortPairs(), 0)
+      << "the failed update must leave no port pair behind either";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp), 0);
+}
+
+TEST_F(TaggedVerbsTest, UnknownTagServiceLevelIsRefused) {
+  struct ibv_qp* qp = makeQp();
+  ASSERT_NE(qp, nullptr);
+
+  // A fabricated handle: the queue pair is real, but the tag is missing.
+  struct ibv_qp fabricated = *qp;
+  fabricated.qp_num = MetaRoceVerbs::combineQpAndTag(
+      MetaRoceVerbs::qpAndTagToQp(qp->qp_num), 7);
+
+  struct ibv_qp_attr attr = makeAvAttrWithSl(5);
+  errno = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp(&fabricated, &attr, IBV_QP_AV), ENOENT)
+      << "a tag the queue pair never had is one lsmr looked for and does "
+         "not hold";
+  EXPECT_EQ(errno, ENOENT)
+      << "an int-returning verb sets errno as well as returning it";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp), 0);
+}
+
+TEST_F(TaggedVerbsTest, ServiceLevelCannotChangeOnARunningQp) {
+  constexpr uint8_t kBringUpSl = 3;
+  struct ibv_qp* ibvqp = makeQp();
+  ASSERT_NE(ibvqp, nullptr);
+
+  // Bring-up carries the level through, as the multipath provider does.
+  struct ibv_qp_attr attr = makeAvAttrWithSl(kBringUpSl);
+  attr.dest_qp_num = MetaRoceVerbs::combineQpAndTag(10, kMetaRoceInitialTag);
+  attr.path_mtu = IBV_MTU_4096;
+  attr.qp_state = IBV_QPS_INIT;
+  ASSERT_EQ(
+      verbs_.ibv_modify_qp(
+          ibvqp,
+          &attr,
+          IBV_QP_DEST_QPN | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_STATE),
+      0)
+      << "precondition: the bring-up update has to land, or the frozen "
+         "value below is one nothing ever set";
+  attr.qp_state = IBV_QPS_RTR;
+  ASSERT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_STATE), 0)
+      << "precondition: the refusal below is about the running state, so "
+         "the queue pair has to have left bring-up";
+
+  attr = makeAvAttrWithSl(9);
+  EXPECT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_AV), EINVAL)
+      << "the freeze lands at RTR entry, so a changed level in RTR state "
+         "must already be refused";
+  EXPECT_EQ(queriedServiceLevel(verbs_, ibvqp), kBringUpSl)
+      << "the refused RTR-state update must leave the bring-up value";
+
+  attr.qp_state = IBV_QPS_RTS;
+  ASSERT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_STATE), 0)
+      << "precondition: the refusal below is about the running state, so "
+         "the queue pair has to have reached it";
+
+  attr = makeAvAttrWithSl(7, "fc00::2");
+  EXPECT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_AV), EINVAL)
+      << "weights freeze when the queue pair starts running, so a changed "
+         "level past that point must be refused rather than half adopted";
+  EXPECT_EQ(queriedServiceLevel(verbs_, ibvqp), kBringUpSl)
+      << "a refused modify must leave the frozen bring-up value";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(ibvqp), 0);
+}
+
+TEST_F(TaggedVerbsTest, UnchangedServiceLevelUpdateSucceedsOnARunningQp) {
+  struct ibv_qp* ibvqp = makeQp();
+  ASSERT_NE(ibvqp, nullptr);
+  const auto baseQpNum = MetaRoceVerbs::qpAndTagToQp(ibvqp->qp_num);
+
+  bringTagToRts(verbs_, ibvqp);
+  ASSERT_EQ(ibvqp->state, IBV_QPS_RTS)
+      << "precondition: the update below is about the running state, so the "
+         "queue pair has to have reached it";
+
+  struct ibv_qp_attr attr = makeAvAttrWithSl(0, "fc00::2");
+  EXPECT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_AV), 0)
+      << "repeating the stored level must stay accepted, or multipath "
+         "bring-up after the first path could not add more";
+  EXPECT_EQ(queriedServiceLevel(verbs_, ibvqp), 0)
+      << "the accepted repeat must leave the stored level where it was";
+  EXPECT_EQ(verbs_.getQpByNum(baseQpNum)->getNumPortPairs(), 2)
+      << "the repeat is an address update like any other, so its new path "
+         "lands beside the bring-up one";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(ibvqp), 0);
+}
+
+TEST_F(TaggedVerbsTest, RepeatedAddressVectorUpdatesKeepServiceLevel) {
+  struct ibv_qp* qp = makeQp();
+  ASSERT_NE(qp, nullptr);
+  const auto baseQpNum = MetaRoceVerbs::qpAndTagToQp(qp->qp_num);
+
+  struct ibv_qp_attr attr = makeAvAttrWithSl(4);
+  ASSERT_EQ(verbs_.ibv_modify_qp(qp, &attr, IBV_QP_AV), 0)
+      << "precondition: the first update has to land, or the repeat below "
+         "repeats nothing";
+  ASSERT_EQ(verbs_.ibv_modify_qp(qp, &attr, IBV_QP_AV), 0)
+      << "precondition: multipath bring-up repeats the update per path, so "
+         "a repeat must be accepted";
+  EXPECT_EQ(queriedServiceLevel(verbs_, qp), 4)
+      << "repeating the update must not move the stored level";
+  EXPECT_EQ(verbs_.getQpByNum(baseQpNum)->getNumPortPairs(), 1)
+      << "the repeated identical path deduplicates rather than accumulating";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp), 0);
 }
 
 } // namespace libsoftmetaroce

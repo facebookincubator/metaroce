@@ -585,6 +585,64 @@ TEST_F(TagSetTest, FindNextWqeProbesLeaveSelectionOrderUnchanged) {
       << "a probe must not consume the turn it observes";
 }
 
+TEST_F(TagSetTest, FindNextWqeServesSharesByServiceLevel) {
+  tagSet_->add(1, cqs_[0].get(), ibvQp_);
+  tagSet_->add(2, cqs_[1].get(), ibvQp_);
+  tagSet_->at(1)->setServiceLevel(1);
+
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(1),
+      std::make_unique<SendWqe>(
+          kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
+      kMtu))
+      << "precondition: tag 1 holds work, or the weight ratio below is "
+         "untested";
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(2),
+      std::make_unique<SendWqe>(
+          kWorkReqId + 1, oneSge(buffer_->data(), 2000), kMtu),
+      kMtu))
+      << "precondition: tag 2 holds work, or the weight ratio below is "
+         "untested";
+
+  std::vector<uint8_t> selected;
+  for (int i = 0; i < 6; ++i) {
+    auto found = tagSet_->findNextWqe(true);
+    ASSERT_TRUE(found.has_value())
+        << "precondition: both tags hold work on every visit";
+    selected.push_back(found->second->getTagNum());
+    found->second->markFree();
+  }
+  const std::vector<uint8_t> expectedPrefix{1, 2, 1};
+  EXPECT_EQ(
+      std::vector<uint8_t>(selected.begin(), selected.begin() + 3),
+      expectedPrefix)
+      << "the heavier tag starts the rotation and yields after one "
+         "serving, so turns interleave";
+  EXPECT_EQ(std::count(selected.begin(), selected.end(), 1), 4)
+      << "weight 2 must serve the heavier tag twice as often";
+  EXPECT_EQ(std::count(selected.begin(), selected.end(), 2), 2)
+      << "a default level-zero tag keeps its single turn per cycle";
+}
+
+TEST_F(TagSetTest, FindNextWqeCapsServiceLevelBelowOverflow) {
+  tagSet_->add(1, cqs_[0].get(), ibvQp_);
+  tagSet_->at(1)->setServiceLevel(std::numeric_limits<uint8_t>::max());
+
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(1),
+      std::make_unique<SendWqe>(
+          kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
+      kMtu))
+      << "precondition: the tag holds work, or the cap below is untested";
+  auto found = tagSet_->findNextWqe(true);
+  ASSERT_TRUE(found.has_value())
+      << "a level past the maximum must cap at full weight, not wrap to an "
+         "empty cycle that starves its tag";
+  EXPECT_EQ(found->second->getTagNum(), 1)
+      << "the capped tag's work must be offered";
+  found->second->markFree();
+}
 TEST_F(TagSetTest, FindNextWqeDoesNotDeadlockWithConcurrentTagHolder) {
   constexpr uint8_t kTags = 2;
   for (uint8_t tagNum = 1; tagNum <= kTags; ++tagNum) {

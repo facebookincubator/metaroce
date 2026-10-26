@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <optional>
@@ -287,8 +288,20 @@ class Tag {
   [[nodiscard]] uint8_t getMaxDestRdAtomic() const {
     return maxDestRdAtomic_;
   }
+  // Refills visits on change, so visits match the new weight.
+  void setServiceLevel(uint8_t serviceLevel) {
+    if (serviceLevel_ != serviceLevel) {
+      serviceLevel_ = serviceLevel;
+      refillVisits();
+    }
+  }
+  [[nodiscard]] uint8_t getServiceLevel() const {
+    return serviceLevel_;
+  }
+  // A level-zero tag still sends, so the weight is the level plus one.
+  // Capped so the plus one cannot wrap to zero and exclude the tag.
   [[nodiscard]] uint8_t getWeight() const {
-    return 1;
+    return cappedWeight(getServiceLevel());
   }
   [[nodiscard]] uint8_t getVisitsLeft() const {
     return visitsLeft_;
@@ -521,6 +534,10 @@ class Tag {
   bool arePriorWqesCompleteForFence(uint16_t currentMsn) const;
 
  private:
+  static uint8_t cappedWeight(uint8_t serviceLevel) {
+    return static_cast<uint8_t>(std::min(serviceLevel, kMaxServiceLevel) + 1);
+  }
+
   [[nodiscard]] uint16_t getAndIncrementNextRxCsn();
 
   // For one message the cumulative delivered msn has run over. False where
@@ -692,6 +709,9 @@ class Tag {
   // bit is read as permitting the full depth.
   uint8_t maxRdAtomic_{kMaxOutstandingReadAtomic};
   uint8_t maxDestRdAtomic_{kMaxOutstandingReadAtomic};
+  // Frozen at RTR entry like the other setup values, so it needs no
+  // synchronization.
+  uint8_t serviceLevel_{0};
 
   // Empty when the client set no IBV_QP_TIMEOUT on this Tag.
   std::optional<uint8_t> localAckTimeoutExponent_;

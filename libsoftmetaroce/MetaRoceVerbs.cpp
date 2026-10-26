@@ -1793,6 +1793,17 @@ int MetaRoceVerbs::ibv_modify_qp(
   // Attributes below are applied unguarded: a caller driving this queue pair to
   // ERR from another thread mid-setup is a race accepted here, not prevented.
   if (attr_mask & IBV_QP_AV) {
+    const uint8_t serviceLevel = attr->ah_attr.sl;
+    if (serviceLevel > kMaxServiceLevel) {
+      return withErrno(EINVAL);
+    }
+    // The service level freezes at RTR entry; an update repeating the stored
+    // level configures only addresses.
+    if (!isBeforeRtr(loadQpState(*ibvqp)) &&
+        serviceLevel != tag->getServiceLevel()) {
+      return withErrno(EINVAL);
+    }
+
     // Extract remote address (IPv4 or IPv6) from dgid
     folly::IPAddress remoteAddr;
 
@@ -1841,6 +1852,7 @@ int MetaRoceVerbs::ibv_modify_qp(
     LOG(INFO) << "Added port pair with remote addr " << remoteAddr.str()
               << " and local gid idx " << (int)sgid_index << " ("
               << localAddr.str() << ") to QP " << qpNum;
+    tag->setServiceLevel(serviceLevel);
   }
   if (attr_mask & IBV_QP_DEST_QPN) {
     // Both IBV_QP_DEST_QPN and IBV_QP_AV are set - do full setup
@@ -2026,7 +2038,7 @@ int MetaRoceVerbs::ibv_query_qp(
   // only for a mask asking for an attribute the Tag holds.
   constexpr int kAttrsBackedByTag = IBV_QP_CAP | IBV_QP_RNR_RETRY |
       IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_MAX_QP_RD_ATOMIC |
-      IBV_QP_MAX_DEST_RD_ATOMIC;
+      IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_AV;
   if ((attr_mask & kAttrsBackedByTag) == 0) {
     return 0;
   }
@@ -2071,6 +2083,12 @@ int MetaRoceVerbs::ibv_query_qp(
   }
   if (attr_mask & IBV_QP_MAX_DEST_RD_ATOMIC) {
     attr->max_dest_rd_atomic = tag->getMaxDestRdAtomic();
+  }
+  if (attr_mask & IBV_QP_AV) {
+    // Reports only the tag's service level; the addresses are port pairs
+    // on the QP, so no single address vector exists to return.
+    attr->ah_attr = {};
+    attr->ah_attr.sl = tag->getServiceLevel();
   }
   return 0;
 }

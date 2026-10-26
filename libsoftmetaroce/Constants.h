@@ -51,6 +51,8 @@ inline constexpr uint16_t kDefaultMtu = 1024;
 // --- QP Attribute Field Widths ---
 // IBTA gives ibv_qp_attr::timeout five bits for the exponent.
 inline constexpr uint8_t kMaxLocalAckTimeoutExponent = 31;
+// IBTA gives ibv_qp_attr::ah_attr.sl four bits for the service level.
+inline constexpr uint8_t kMaxServiceLevel = 15;
 
 // --- Local Ack Timeout Derivation ---
 // IBTA's local ack timeout wait is 4.096us * 2^exponent.
