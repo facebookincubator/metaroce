@@ -17,6 +17,7 @@
 #include <libsoftmetaroce/EsunProfile.h>
 
 #include <libsoftmetaroce/Constants.h>
+#include <libsoftmetaroce/Ecn.h>
 #include <libsoftmetaroce/EsunEncapsulation.h>
 #include <libsoftmetaroce/EsunHeader.h>
 #include <libsoftmetaroce/GidDiscovery.h>
@@ -65,6 +66,7 @@ std::unique_ptr<Encapsulation> makeEsunEncapsulation(
       folly::MacAddress(),
       EsunHeader(
           EsunHeader::Fields{
+              .ecn = kEcnECT0,
               .ttl = static_cast<uint8_t>(FLAGS_libsoftmetaroce_esun_ttl)}));
 }
 

@@ -19,6 +19,7 @@
 
 #include <net/if.h>
 #include <libsoftmetaroce/Constants.h>
+#include <libsoftmetaroce/Ecn.h>
 #include <libsoftmetaroce/EsunEncapsulation.h>
 #include <libsoftmetaroce/EsunHeader.h>
 #include <libsoftmetaroce/EsunProfile.h>
@@ -146,6 +147,17 @@ TEST(EsunProfileTest, EncapsulationUsesTtlFlag) {
   EXPECT_EQ(esun->header().ttl(), 3)
       << "operators rely on the flag to bound how many switches a frame may "
          "cross";
+}
+
+TEST(EsunProfileTest, EncapsulationMarksEct0) {
+  const auto encapsulation = makeEsunProfile().makeEncapsulation(
+      buildGidEntry(linkLocalCandidate(), kGidTypeEsun));
+  const auto* esun = dynamic_cast<EsunEncapsulation*>(encapsulation.get());
+  ASSERT_NE(esun, nullptr);
+
+  EXPECT_EQ(esun->header().ecn(), kEcnECT0)
+      << "spec 6.1 requires data packets to carry ECT(0) so switches can mark "
+         "congestion";
 }
 
 TEST(EsunProfileTest, MtuIncludesEsunFraming) {
