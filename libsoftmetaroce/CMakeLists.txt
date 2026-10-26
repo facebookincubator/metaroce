@@ -424,3 +424,21 @@ if(LSMR_BUILD_RDMA_UNIT)
               "is absent; skipping the conformance suite.")
   endif()
 endif()
+
+# The namespace suite is never built by default: it needs user/network
+# namespaces, so it runs only when requested.
+option(LSMR_BUILD_NETNS_TESTS "Build the namespace tests" OFF)
+if(LSMR_BUILD_NETNS_TESTS)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/netns/CMakeLists.txt")
+    # Enable namespace tests even when the basic unit tests are disabled.
+    enable_testing()
+    add_subdirectory(test/netns)
+  else()
+    # Fatal: silently skipping requested coverage would report success
+    # with zero namespace tests.
+    message(
+      FATAL_ERROR
+        "LSMR_BUILD_NETNS_TESTS is on but test/netns/CMakeLists.txt is absent; "
+        "the export is missing the namespace test tree.")
+  endif()
+endif()
