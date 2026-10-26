@@ -212,11 +212,9 @@ semaphore.
 
 `Sender::socketAssignment_` guards the socket assignment (`socketIdFreqMap`,
 `localAddrToSocketIds`, the source-port counter, the socket count) and every new
-entry in `sockets_`, so socket creation and selection stay consistent when three
-thread classes race to bind or pick a socket: the verbs-setup thread (`Qp`
-construction), the retx / HighResTimer thread (repath via `getAlternateSocket`),
-and the parallel send loops (failover via `maybeFailoverRemotePort` ->
-`getSocketIdFromAddress`).
+entry in `sockets_`, covering selection and creation during QP setup, ACK
+source-port repathing (`getAlternateAckSocket`), and sender visits
+(`getAlternateSocket` / `getSocketIdFromAddress`).
 
 It is a leaf beneath the arbiter and inline-ack locks: failover reaches it from
 the build callback, with `arbiterMutex_` and, in inline-ack mode, `txStateLock_`

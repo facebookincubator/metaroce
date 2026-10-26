@@ -137,11 +137,9 @@ class TxFlow : public Flow {
 
   [[nodiscard]] uint32_t computeRtoIntervalUs() const;
 
-  /* It first checks and sends ack packets, if there are any acks that has
-   * to be sent on this flow. After that, if there is any data to send and
-   * there are available window on this flow, it prepares and returns the
-   * packet.
-   */
+  // Return a retransmission or window-eligible new data packet, or nullptr if
+  // none is ready. Caller must serialize TX visits and ACK application; hold
+  // Qp::txStateLock_ when ACKs are applied inline.
   [[nodiscard]] std::unique_ptr<struct EgressPacket> getNextPacketToSend();
 
   // Returns after(sndNxt, sndUna), safely holding the sndCur lock.
@@ -224,6 +222,7 @@ class TxFlow : public Flow {
   // Body of retxTimerCallback_, so it runs on the timer thread.
   void onRetransmissionTimeout();
 
+  void applyRtoRepath();
   [[nodiscard]] uint16_t findAlternatePortPair(
       uint16_t activePortSet,
       bool sameLocalOnly) const;
@@ -299,6 +298,9 @@ class TxFlow : public Flow {
   // Protocol / runtime state.
   TxState txState_;
   folly::relaxed_atomic<uint16_t> consecutiveRtosWithoutAck_{0};
+  // With queued ACKs, sender visits serialize access to this count.
+  // With inline ACKs, Qp::txStateLock_ guards reads and writes.
+  uint16_t lastConsumedRtoCount_{0}; // Last RTO count processed by repathing.
   folly::Synchronized<std::deque<std::unique_ptr<DataPacket>>> retxPktsToSend_;
   std::unique_ptr<HighResTimer::Callback> retxTimerCallback_;
   bool disabled_{false};

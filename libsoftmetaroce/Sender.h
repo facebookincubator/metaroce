@@ -113,6 +113,7 @@ class Sender : public folly::NonCopyableNonMovable {
   folly::IPAddress getAddressFromSocketId(const uint16_t socketId);
 
   // Return a same-address alternative, creating one if allowed, or socketId.
+  // At capacity, reuse an existing socket; new-socket construction may throw.
   [[nodiscard]] uint16_t getAlternateSocket(const uint16_t socketId);
 
   /*

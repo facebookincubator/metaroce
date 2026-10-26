@@ -30,6 +30,7 @@
 #include <libsoftmetaroce/WrappingCompare.h>
 #include <libsoftmetaroce/codec/Header.h>
 #include <libsoftmetaroce/congestion_control/CongestionController.h>
+#include <exception>
 #include <limits>
 #include <unordered_map>
 
@@ -146,7 +147,8 @@ TxFlow::TxFlow(TxFlow&& other) noexcept
       qpRetxTimer_{other.qpRetxTimer_},
       sackRetxConfig_{other.sackRetxConfig_},
       txState_{std::move(other.txState_)},
-      consecutiveRtosWithoutAck_{other.consecutiveRtosWithoutAck_.load()} {
+      consecutiveRtosWithoutAck_{other.consecutiveRtosWithoutAck_.load()},
+      lastConsumedRtoCount_{other.lastConsumedRtoCount_} {
   other.qpRetxTimer_ = nullptr;
 }
 
@@ -220,8 +222,21 @@ void TxFlow::onRetransmissionTimeout() {
     }
   }
 
-  // The first RTO retransmits; only a later one may fail the work.
-  if (consecutiveRtosWithoutAck_ > 0 && qp_.hasWatchdogExpired()) {
+  bool watchdogExpired;
+  {
+    // Keep the outstanding check and count increment ordered with ACK resets.
+    auto lockedSndCur = txState_.sndCur.rlock();
+    if (txState_.sndUna == txState_.sndNxt) {
+      return;
+    }
+    // The first RTO retransmits; only a later one may fail the work.
+    watchdogExpired =
+        consecutiveRtosWithoutAck_ > 0 && qp_.hasWatchdogExpired();
+    if (!watchdogExpired) {
+      ++consecutiveRtosWithoutAck_;
+    }
+  }
+  if (watchdogExpired) {
     qp_.processWatchdogExpiryAsync();
     return;
   }
@@ -229,21 +244,6 @@ void TxFlow::onRetransmissionTimeout() {
   VLOG(2) << "RetxTimer expired for qp: " << qp_.getLocalQpNum()
           << " flow: " << flowId_ << ". HRNR state is " << qp_.getHrnrState()
           << " una: " << txState_.sndUna << " nxt: " << txState_.sndNxt;
-
-  const uint16_t rtoRun = ++consecutiveRtosWithoutAck_;
-  if (FLAGS_libsoftmetaroce_rtos_before_repath != kRtxRepathDisabledSentinel &&
-      (rtoRun >= FLAGS_libsoftmetaroce_rtos_before_repath)) {
-    auto old_socketId = socketId_;
-    socketId_ = qp_.getSender().getAlternateSocket(socketId_);
-    VLOG(2) << "Repath threshold " << FLAGS_libsoftmetaroce_rtos_before_repath
-            << " met.  Repathing flow " << flowId_
-            << " socketId: " << old_socketId << " -> " << socketId_;
-    // note the "old" socketId is still present
-  } else {
-    VLOG(2) << "Repath threshold " << FLAGS_libsoftmetaroce_rtos_before_repath
-            << " not met.  Not Repathing. Using existing socketId "
-            << socketId_;
-  }
   prepareRetxPacketsIfAny(true /*isRtoEvent*/);
 
   // Frames are still outstanding while sndUna trails sndNxt, and this timer
@@ -422,6 +422,7 @@ std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSend() {
     return nullptr;
   }
 
+  applyRtoRepath();
   maybeFailoverRemotePort();
 
   // sndCur is held across the attempt so the tracker can be consulted, in the
@@ -993,6 +994,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     }
 
     consecutiveRtosWithoutAck_ = 0;
+    lastConsumedRtoCount_ = 0;
 
     // With large windows or during retransmission, the maxRcvdFsn may
     // be more than 256 fsn's past lastContiguousFsn. Count this case
@@ -1324,8 +1326,7 @@ uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
               << " msn: " << retxWqe.getMsn().value_or(-1)
               << " posn: " << ts.id.posn
               << " csn: " << retxWqe.getCsn().value_or(-1)
-              << " flow: " << flowId_ << " socketId: " << getSocketId()
-              << " isRTO: " << isRtoEvent
+              << " flow: " << flowId_ << " isRTO: " << isRtoEvent
               << " HRNR state: " << qp_.getHrnrState()
               << " BRNR state: " << tag->getBrnrState();
 
@@ -1520,6 +1521,31 @@ void TxFlow::disableAndNotifyCongestionControl() {
   if (qp_.congestionController_) {
     qp_.congestionController_->onFlowDisabled(flowId_);
   }
+}
+
+// The caller serializes this helper with ACK resets, already holding
+// Qp::txStateLock_ when ACKs are applied inline.
+void TxFlow::applyRtoRepath() {
+  const uint16_t rtoCount = consecutiveRtosWithoutAck_.load();
+  if (rtoCount == lastConsumedRtoCount_) {
+    return;
+  }
+  lastConsumedRtoCount_ = rtoCount;
+  const auto threshold = FLAGS_libsoftmetaroce_rtos_before_repath;
+  if (threshold == kRtxRepathDisabledSentinel || rtoCount < threshold) {
+    return;
+  }
+
+  const auto oldSocketId = socketId_;
+  try {
+    socketId_ = qp_.getSender().getAlternateSocket(socketId_);
+  } catch (const std::exception& ex) {
+    LOG_FIRST_N(WARNING, 10)
+        << "QP " << qp_.getLocalQpNum() << " flow " << flowId_
+        << ": could not change RTO source-port entropy: " << ex.what();
+  }
+  VLOG(2) << "QP " << qp_.getLocalQpNum() << " flow " << flowId_ << ": RTO "
+          << rtoCount << " socket " << oldSocketId << " -> " << socketId_;
 }
 
 uint16_t TxFlow::findAlternatePortPair(
