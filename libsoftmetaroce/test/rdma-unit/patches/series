@@ -1,2 +1,3 @@
 # Compatibility patch for the pinned upstream fetch.
 01-timing-qp-state.patch
+02-magic-enum-include-path.patch

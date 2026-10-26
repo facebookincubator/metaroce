@@ -1,0 +1,26 @@
+Description: rewrite the pinned suite's three <magic_enum.hpp>
+ includes to <magic_enum/magic_enum.hpp>. The getdeps magic_enum
+ 0.9.7 install keeps every header under magic_enum/, with no
+ top-level header.
+Category: upstream-compat
+Revisit-When: drop if the suite pin moves to an upstream commit
+ carrying new-style includes.
+
+diff --git a/public/introspection.cc b/public/introspection.cc
+--- a/public/introspection.cc
++++ b/public/introspection.cc
+@@ -42 +42 @@
+-#include <magic_enum.hpp>
++#include <magic_enum/magic_enum.hpp>
+diff --git a/public/verbs_helper_suite.cc b/public/verbs_helper_suite.cc
+--- a/public/verbs_helper_suite.cc
++++ b/public/verbs_helper_suite.cc
+@@ -38 +38 @@
+-#include <magic_enum.hpp>
++#include <magic_enum/magic_enum.hpp>
+diff --git a/public/verbs_util.cc b/public/verbs_util.cc
+--- a/public/verbs_util.cc
++++ b/public/verbs_util.cc
+@@ -42 +42 @@
+-#include <magic_enum.hpp>
++#include <magic_enum/magic_enum.hpp>

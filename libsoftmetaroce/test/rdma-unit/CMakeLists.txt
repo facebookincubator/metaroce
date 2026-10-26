@@ -22,15 +22,11 @@ find_package(Python3 REQUIRED COMPONENTS Interpreter)
 
 find_package(absl REQUIRED)
 
-# magic_enum at a pinned version (0.9.5).
-FetchContent_Declare(
-  magic_enum
-  URL https://github.com/neargye/magic_enum/archive/d3f466bf0c5651ac41780be07f30eda4fbfe697f.tar.gz)
-FetchContent_MakeAvailable(magic_enum)
+find_package(magic_enum REQUIRED)
 
 # Google upstream at a pinned hash. Populate-only: this project compiles the
 # sources it needs directly, and the suite has no CMake build.
-# Apply completion-wait and retry-count adjustments.
+# Apply completion-wait, retry-count, and magic_enum include-path adjustments.
 # Use a fresh build directory after changing the patches.
 FetchContent_Declare(
   rdma_unit_test
