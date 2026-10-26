@@ -1203,6 +1203,11 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
   // BRNR is per-tag and independent of HRNR: clear a tag's block only once an
   // acked outbound MSN reaches that tag's own first-blocked MSN.
   for (const auto& [tagNum, ackedMsn] : highestAckedMsnByTag) {
+    // A BRNR for this tag takes precedence over accepted sibling fragments
+    // carried by the same ACK; it does not prove the refused buffer is ready.
+    if (minBrnrMsnByTag.contains(tagNum)) {
+      continue;
+    }
     // Tracker entries identify Tags retained until whole-QP teardown.
     const auto tagHandle = qp_.getTag(tagNum);
     Tag& tag = *CHECK_NOTNULL(tagHandle.get());

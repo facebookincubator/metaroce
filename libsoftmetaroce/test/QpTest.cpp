@@ -1443,6 +1443,43 @@ struct TrackedMessageFixture {
   }
 };
 
+// A single BRNR NAK accepts FSN 10 and refuses FSN 11 of the same message.
+// Keep the tag BRNR_BLOCKED_TX, retain its blocked MSN, and leave the refused
+// POSN unallocated. Previously, ACK-based resume processing canceled the block
+// installed earlier while processing the accepted sibling in this same NAK.
+TEST_F(QpTest, BrnrAndAckForOneMessageKeepsTheTagBlocked) {
+  TrackedMessageFixture fixture(
+      arbiter,
+      qp,
+      mtu,
+      initialTag,
+      {Flow::FsnState::UNACKED, Flow::FsnState::UNACKED},
+      /*sndCur=*/12);
+  BitVector<AckHeader::kAckTrackerBits> rnrBits;
+  rnrBits.setBit(0);
+  const AckHeader ack = AckHeader::AckHeaderBuilder()
+                            .setCumulativeFsn(10)
+                            .setMaxRcvdFsn(11)
+                            .setAckStatus(AckStatus::BRNR)
+                            .setRnrBackoffTimeExp(15)
+                            .setRnrBitVector(rnrBits)
+                            .setTimestamp(0)
+                            .build();
+
+  fixture.flow->processAckPacket(ack, simulatedProcessedAtNs(0));
+
+  EXPECT_EQ(initialTag->getBrnrState(), BrnrState::BRNR_BLOCKED_TX)
+      << "accepting a sibling fragment must not release the refused fragment";
+  ASSERT_TRUE(initialTag->getBrnrFirstBlockedMsn().has_value())
+      << "the sender needs the blocked MSN to hold the refused message";
+  EXPECT_EQ(
+      initialTag->getBrnrFirstBlockedMsn().value(),
+      fixture.wqe->getMsn().value())
+      << "the block must remain attached to the message refused by this ACK";
+  EXPECT_FALSE(fixture.wqe->isFrameAllocated(fixture.posns[1]))
+      << "the refused sibling must not be allocated for transmission";
+}
+
 /*
  * Retiring the frames given up on at the head of the window can reveal one
  * that was selectively acked earlier. Stopping there leaves snd_una, the
