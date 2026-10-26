@@ -12,9 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Trial invocation for the namespace probe. Runs the exported script
-# directly; the probe needs no build, so this job does not wait for one. Kept
-# separate from the generated getdeps workflow.
+# Namespace-suite trial on the hosted runner. The probe job runs inline on
+# pull requests and needs no build. The conversation job tests the rdma_gen
+# binary from the release workflow's `metaroce` artifact instead of
+# rebuilding the leaf (~12 minutes saved per run).
+#
+# Triggering: `workflow_run` fires the conversation job after a push-to-main
+# release run completes; the definition comes from the default branch while
+# the checkout pins the triggering commit. `workflow_dispatch` with a run_id
+# input runs the selected branch's scripts against that release run after
+# verifying it is a successful push-to-main `linux` run in this repo.
+# `workflows` must match the release workflow's display name, or the
+# trigger silently never fires. Kept separate from the generated getdeps
+# workflow.
 
 name: netns-probe
 
@@ -25,12 +35,27 @@ on:
   push:
     branches:
       - main
+  workflow_run:
+    workflows:
+      - linux
+    types:
+      - completed
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "Release workflow run id whose metaroce artifact to test"
+        required: true
+        type: string
 
 permissions:
   contents: read  # to fetch code (actions/checkout)
+  actions: read  # to download the release run's artifact
 
 jobs:
   probe:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -45,3 +70,129 @@ jobs:
 
       - name: Run privileged namespace probe
         run: python3 libsoftmetaroce/test/netns/netns_probe.py --mode=privileged
+
+      - name: Run output-format checks
+        run: python3 libsoftmetaroce/test/netns/rdmagen_output_test.py
+
+      - name: Run privileged repeat-launch test
+        run: python3 libsoftmetaroce/test/netns/repeat_launch_test.py --mode=privileged
+
+  conversation:
+    if: >-
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main' &&
+       github.event.workflow_run.head_repository.full_name == github.repository) ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Resolve source run and commit
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WR_RUN_ID: ${{ github.event.workflow_run.id }}
+          WR_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          INPUT_RUN_ID: ${{ inputs.run_id }}
+          DISPATCH_SHA: ${{ github.sha }}
+          REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "$EVENT_NAME" = workflow_run ]; then
+            echo "RUN_ID=$WR_RUN_ID" >> "$GITHUB_ENV"
+            echo "REF=$WR_HEAD_SHA" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          [[ "$INPUT_RUN_ID" =~ ^[0-9]+$ ]] || { echo "run_id must be numeric: $INPUT_RUN_ID"; exit 1; }
+          # The artifact is installed with sudo, so only a push-to-main release run qualifies.
+          info=$(gh api "repos/$REPO/actions/runs/$INPUT_RUN_ID" \
+            --jq '"\(.name) \(.event) \(.head_branch) \(.head_repository.full_name) \(.conclusion)"')
+          [ "$info" = "linux push main $REPO success" ] || {
+            echo "run $INPUT_RUN_ID is not a successful push to main of linux in $REPO: $info"
+            exit 1
+          }
+          echo "RUN_ID=$INPUT_RUN_ID" >> "$GITHUB_ENV"
+          echo "REF=$DISPATCH_SHA" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.REF }}
+          persist-credentials: false
+
+      - name: Download metaroce artifact
+        uses: actions/download-artifact@v6
+        with:
+          name: metaroce
+          run-id: ${{ env.RUN_ID }}
+          path: release-artifact
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install runtime system libraries
+        run: |
+          # The artifact bundles only source-built libraries; system-provided
+          # runtime deps come from install-system-deps per manifest, the same
+          # mapping the release build uses.
+          sudo --preserve-env=http_proxy apt-get update
+          sudo --preserve-env=http_proxy python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps gflags
+          sudo --preserve-env=http_proxy python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps libevent
+
+      - name: Install and verify rdma_gen binary
+        run: |
+          STAGED="$PWD/release-artifact/linux/bin/rdma_gen"
+          [ -f "$STAGED" ] || {
+            echo "missing binary: $STAGED"
+            find release-artifact -maxdepth 3 | head
+            exit 1
+          }
+          # The artifact is an install tree rooted at /usr/local: NEEDED
+          # entries are absolute (/usr/local/lib/...), so install it there.
+          # Download also strips mode bits; restore the executable bit.
+          # A self-contained binary may ship no lib directory; with nullglob
+          # an empty lib tree copies nothing instead of aborting cp, and the
+          # ldd gate below decides whether the binary is runnable as-is.
+          shopt -s nullglob
+          libs=(release-artifact/linux/lib/*)
+          sudo cp release-artifact/linux/bin/* /usr/local/bin/
+          if [ "${#libs[@]}" -gt 0 ]; then
+            sudo cp "${libs[@]}" /usr/local/lib/
+          fi
+          RDMA_GEN=/usr/local/bin/rdma_gen
+          sudo chmod +x "$RDMA_GEN"
+          ldd_out=$(ldd "$RDMA_GEN" 2>&1)
+          ldd_rc=$?
+          if [ $ldd_rc -ne 0 ] \
+              && ! printf '%s\n' "$ldd_out" | grep -q "not a dynamic executable"; then
+            echo "ldd failed on $RDMA_GEN (rc=$ldd_rc):"
+            echo "$ldd_out"
+            exit 1
+          fi
+          missing=$(printf '%s\n' "$ldd_out" | grep "not found" || true)
+          [ -z "$missing" ] || {
+            echo "unresolved libraries:"
+            echo "$missing"
+            exit 1
+          }
+          echo "RDMA_GEN=$RDMA_GEN" >> "$GITHUB_ENV"
+          echo "using $RDMA_GEN"
+
+      - name: Ensure iproute2 and iputils-ping
+        run: |
+          command -v ip && command -v ping || {
+            sudo apt-get update
+            sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends iproute2 iputils-ping
+          }
+
+      - name: Run privileged SEND/RECV conversation
+        run: python3 libsoftmetaroce/test/netns/send_recv_smoke.py --rdma-gen="$RDMA_GEN" --artifact-dir=smoke_artifacts --mode=privileged
+
+      - name: Run privileged interruption test
+        run: python3 libsoftmetaroce/test/netns/interruption_test.py --rdma-gen="$RDMA_GEN" --artifact-dir=interruption_artifacts --mode=privileged
+
+      - uses: actions/upload-artifact@v6
+        if: failure()
+        with:
+          name: netns-conversation-artifacts
+          if-no-files-found: warn
+          path: |
+            smoke_artifacts
+            interruption_artifacts
