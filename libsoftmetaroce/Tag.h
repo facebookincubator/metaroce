@@ -287,6 +287,23 @@ class Tag {
   [[nodiscard]] uint8_t getMaxDestRdAtomic() const {
     return maxDestRdAtomic_;
   }
+  [[nodiscard]] uint8_t getWeight() const {
+    return 1;
+  }
+  [[nodiscard]] uint8_t getVisitsLeft() const {
+    return visitsLeft_;
+  }
+  void refillVisits() {
+    visitsLeft_ = getWeight();
+  }
+  void decrementVisits() {
+    if (visitsLeft_ > 0) {
+      --visitsLeft_;
+    }
+  }
+  void forfeitVisits() {
+    visitsLeft_ = 0;
+  }
   // Whether this tag has used every rnr_retry it was given. An infinite limit
   // never has. Being spent is arithmetic: read it only of a tag the receiver
   // has actually told to wait.
@@ -682,6 +699,9 @@ class Tag {
 
   // Protocol state.
 
+  // Under the TagSet lock, except the setup refill, which predates serving
+  // like the other setup writes.
+  uint8_t visitsLeft_{1};
   ReceiveSequence receiveSequence_;
   // Reads and atomics the msn span holds, written under its lock. One
   // processWqes() coroutine per QP counts in, so a room check may read stale.

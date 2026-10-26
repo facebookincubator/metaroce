@@ -84,7 +84,8 @@ set(LSMR_TEST_SRCS
     WatchdogTimerTest.cpp
     WireProfilesTest.cpp
     WqeTest.cpp
-    WrappingMapIteratorTest.cpp)
+    WrappingMapIteratorTest.cpp
+    WrrSchedulerTest.cpp)
 
 foreach(TEST_SRC ${LSMR_TEST_SRCS})
   get_filename_component(TEST_NAME ${TEST_SRC} NAME_WE)

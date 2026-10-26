@@ -34,6 +34,7 @@
 #include <libsoftmetaroce/QpArbiterIface.h>
 #include <libsoftmetaroce/Tag.h>
 #include <libsoftmetaroce/Wqe.h>
+#include <libsoftmetaroce/WrrScheduler.h>
 
 namespace libsoftmetaroce {
 
@@ -138,7 +139,8 @@ class TagSet {
   // in the QpArbiter), in which case the TagSet should advance its round-robin
   // to the next Tag and the found WQE's Tag should update it's BRNR state, if
   // necessary. A returned Tag holds its semaphore; the caller must call
-  // Tag::markFree() after it finishes using the WQE.
+  // Tag::markFree() after it finishes using the WQE. Call without holding
+  // mutex_.
   [[nodiscard]] std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>>
   findNextWqe(bool intendToSend);
   // Set the QP state of every Tag in this TagSet. A Tag already in
@@ -195,6 +197,8 @@ class TagSet {
   [[nodiscard]] bool allTagsInState(ibv_qp_state state) const;
 
  private:
+  using TagsByNum = std::map<uint8_t, std::shared_ptr<Tag>>;
+
   // Tells the sender a Tag has entered error with work still to be failed, so
   // its next visit sweeps. Any thread. Raising it for a Tag whose work is
   // already failed costs the next sweep a walk of every Tag that finds no
@@ -219,6 +223,11 @@ class TagSet {
       struct ibv_qp* ibvQp) const;
   // Whether every Tag is in this state. Caller holds mutex_.
   [[nodiscard]] bool allTagsInStateWithLockHeld(ibv_qp_state state) const;
+  [[nodiscard]] std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>>
+  peekNextWqe();
+  [[nodiscard]] std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>>
+  findNextWqeToSend();
+  static Tag& asSchedulable(TagsByNum::value_type& entry);
 
   // Injected dependency.
   const std::function<void(uint8_t, uint16_t)> rnrCancelCallback_;
@@ -228,11 +237,9 @@ class TagSet {
 
   // Protocol / runtime state.
   MultiUnboundedQueue<uint8_t, std::unique_ptr<Wqe>> wqeQueue_;
-  std::map<uint8_t, std::shared_ptr<Tag>> tagNumToTag_;
-  // The last Tag that was checked for WQEs. This is used to track round robin
-  // order, and is always incremented before use. The initial value is the max
-  // Tag number (OxFF), which on first increment will wrap to the first Tag.
-  uint8_t lastTagNumCheckedForWqes_ = 0xFF;
+  // Tags are not removed once added.
+  TagsByNum tagNumToTag_;
+  WrrScheduler<TagsByNum::iterator> scheduler_;
   // Protects adding and counting Tags. Mutable because read-only accessors
   // need to acquire a shared lock.
   mutable std::shared_mutex mutex_;

@@ -314,7 +314,8 @@ set(LSMR_LIB_SRCS
     WireProfiles.h
     Wqe.h
     WrappingCompare.h
-    WrappingMapIterator.h)
+    WrappingMapIterator.h
+    WrrScheduler.h)
 
 add_library(softmetaroce STATIC ${LSMR_LIB_SRCS})
 # The LD_PRELOAD interposer links this archive into a shared object, so its

@@ -395,33 +395,79 @@ bool TagSet::waitForRWqesToBePosted(
   return numPendingWqes;
 }
 
+Tag& TagSet::asSchedulable(TagsByNum::value_type& entry) {
+  return *entry.second;
+}
+
 std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>> TagSet::findNextWqe(
     bool intendToSend) {
-  std::vector<std::pair<uint8_t, std::shared_ptr<Tag>>> tags;
+  if (!intendToSend) {
+    return peekNextWqe();
+  }
+  return findNextWqeToSend();
+}
+
+std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>> TagSet::peekNextWqe() {
+  // A readiness peek changes no scheduler state. It snapshots the tags,
+  // taking Tag semaphores without holding mutex_.
+  std::vector<std::shared_ptr<Tag>> tags;
   {
     std::scoped_lock lock(mutex_);
+    auto start = scheduler_.peek(
+        tagNumToTag_.begin(), tagNumToTag_.end(), asSchedulable);
+    if (start == tagNumToTag_.end()) {
+      return std::nullopt;
+    }
     tags.reserve(tagNumToTag_.size());
-    auto nextTagIt = tagNumToTag_.upper_bound(lastTagNumCheckedForWqes_);
-    for (size_t i = 0; i < tagNumToTag_.size(); ++i) {
-      if (nextTagIt == tagNumToTag_.end()) {
-        nextTagIt = tagNumToTag_.begin();
-      }
-      tags.emplace_back(nextTagIt->first, nextTagIt->second);
-      ++nextTagIt;
+    for (auto it = start; it != tagNumToTag_.end(); ++it) {
+      tags.push_back(it->second);
+    }
+    for (auto it = tagNumToTag_.begin(); it != start; ++it) {
+      tags.push_back(it->second);
     }
   }
-
-  // Snapshot so the scan can wait on a busy Tag's semaphore without holding
-  // mutex_. Two callers may snapshot the same starting Tag, which costs
-  // fairness, not safety: the Tag semaphore serializes WQE access.
-  for (const auto& [tagNum, tag] : tags) {
+  for (const auto& tag : tags) {
     if (auto* wqe = tag->findNextWqe()) {
-      if (intendToSend) {
-        std::scoped_lock lock(mutex_);
-        lastTagNumCheckedForWqes_ = tagNum;
-      }
       return std::make_pair(wqe, tag);
     }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>>
+TagSet::findNextWqeToSend() {
+  // Each turn selects from the live map, so a tag added mid-scan joins at
+  // once. The Tag semaphore waits outside mutex_.
+  size_t numLive = 0;
+  {
+    std::scoped_lock lock(mutex_);
+    numLive = tagNumToTag_.size();
+  }
+  // One pass over at most every live tag; a miss marks the tag fully
+  // visited, so the scan reaches servable work.
+  for (size_t attempt = 0; attempt < numLive; ++attempt) {
+    // Iterator to the selected entry, held across the Tag semaphore wait
+    // outside mutex_. Recorded entries are never erased, so it stays valid.
+    TagsByNum::iterator selected;
+    std::shared_ptr<Tag> tag;
+    // Claim this turn up front, so a hit costs one lock hold; a miss
+    // forfeits the claimed visit with the rest below.
+    {
+      std::scoped_lock lock(mutex_);
+      auto it = scheduler_.select(
+          tagNumToTag_.begin(), tagNumToTag_.end(), asSchedulable);
+      if (it == tagNumToTag_.end()) {
+        return std::nullopt;
+      }
+      scheduler_.noteServed(it, asSchedulable);
+      selected = it;
+      tag = it->second;
+    }
+    if (auto* wqe = tag->findNextWqe()) {
+      return std::make_pair(wqe, tag);
+    }
+    std::scoped_lock lock(mutex_);
+    scheduler_.noteSkipped(selected, asSchedulable);
   }
   return std::nullopt;
 }

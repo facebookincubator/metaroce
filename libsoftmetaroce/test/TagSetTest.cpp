@@ -470,6 +470,121 @@ TEST_F(TagSetTest, FindNextWqeRoundRobin) {
   maybeWqeAndTag4.value().second->markFree();
 }
 
+TEST_F(TagSetTest, FindNextWqeSparseTagsStayInNumericOrder) {
+  tagSet_->add(1, cqs_[0].get(), ibvQp_);
+  tagSet_->add(5, cqs_[1].get(), ibvQp_);
+  tagSet_->add(200, cqs_[2].get(), ibvQp_);
+
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(1),
+      std::make_unique<SendWqe>(
+          kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
+      kMtu))
+      << "precondition: tag 1 holds work, or the order below is untested";
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(5),
+      std::make_unique<SendWqe>(
+          kWorkReqId + 1, oneSge(buffer_->data(), 2000), kMtu),
+      kMtu))
+      << "precondition: tag 5 holds work, or the order below is untested";
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(200),
+      std::make_unique<SendWqe>(
+          kWorkReqId + 2, oneSge(buffer_->data(), 1500), kMtu),
+      kMtu))
+      << "precondition: tag 200 holds work, or the order below is untested";
+
+  std::vector<uint8_t> selected;
+  for (int i = 0; i < 4; ++i) {
+    auto found = tagSet_->findNextWqe(true);
+    ASSERT_TRUE(found.has_value())
+        << "precondition: every tag still holds work on every visit";
+    selected.push_back(found->second->getTagNum());
+    found->second->markFree();
+  }
+  const std::vector<uint8_t> expected{1, 5, 200, 1};
+  EXPECT_EQ(selected, expected)
+      << "gaps in the tag range must not reorder or strand service; "
+         "selection order is numeric with wraparound";
+}
+
+TEST_F(TagSetTest, FindNextWqeSkipsTagsWithoutWork) {
+  tagSet_->add(1, cqs_[0].get(), ibvQp_);
+  tagSet_->add(2, cqs_[1].get(), ibvQp_);
+  tagSet_->add(3, cqs_[2].get(), ibvQp_);
+
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(1),
+      std::make_unique<SendWqe>(
+          kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
+      kMtu))
+      << "precondition: tag 1 holds work, or the skip below is untested";
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(3),
+      std::make_unique<SendWqe>(
+          kWorkReqId + 2, oneSge(buffer_->data(), 1500), kMtu),
+      kMtu))
+      << "precondition: tag 3 holds work, or the skip below is untested";
+
+  std::vector<uint8_t> selected;
+  for (int i = 0; i < 4; ++i) {
+    auto found = tagSet_->findNextWqe(true);
+    ASSERT_TRUE(found.has_value())
+        << "precondition: an idle tag must not end the scan while work "
+           "remains elsewhere";
+    selected.push_back(found->second->getTagNum());
+    found->second->markFree();
+  }
+  const std::vector<uint8_t> expected{1, 3, 1, 3};
+  EXPECT_EQ(selected, expected)
+      << "a tag with no work must yield its turn without consuming it, or "
+         "one idle tag would deny the others their turns";
+}
+
+TEST_F(TagSetTest, FindNextWqeProbesLeaveSelectionOrderUnchanged) {
+  tagSet_->add(1, cqs_[0].get(), ibvQp_);
+  tagSet_->add(2, cqs_[1].get(), ibvQp_);
+
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(1),
+      std::make_unique<SendWqe>(
+          kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
+      kMtu))
+      << "precondition: tag 1 holds work, or the order below is untested";
+  ASSERT_TRUE(postToTag(
+      *tagSet_->at(2),
+      std::make_unique<SendWqe>(
+          kWorkReqId + 1, oneSge(buffer_->data(), 2000), kMtu),
+      kMtu))
+      << "precondition: tag 2 holds work, or the order below is untested";
+
+  std::vector<uint8_t> selected;
+  std::vector<uint8_t> probed;
+  for (int i = 0; i < 3; ++i) {
+    auto send = tagSet_->findNextWqe(true);
+    ASSERT_TRUE(send.has_value())
+        << "precondition: both tags hold work for the whole sequence";
+    selected.push_back(send->second->getTagNum());
+    send->second->markFree();
+    if (i == 2) {
+      break;
+    }
+    auto probe = tagSet_->findNextWqe(false);
+    ASSERT_TRUE(probe.has_value())
+        << "precondition: a probe must still observe the pending work";
+    probed.push_back(probe->second->getTagNum());
+    probe->second->markFree();
+  }
+  const std::vector<uint8_t> expectedSelected{1, 2, 1};
+  EXPECT_EQ(selected, expectedSelected)
+      << "readiness probes between sends must leave the selection order "
+         "unchanged, or the retransmission path's probes would reorder "
+         "traffic";
+  const std::vector<uint8_t> expectedProbed{2, 1};
+  EXPECT_EQ(probed, expectedProbed)
+      << "a probe must not consume the turn it observes";
+}
+
 TEST_F(TagSetTest, FindNextWqeDoesNotDeadlockWithConcurrentTagHolder) {
   constexpr uint8_t kTags = 2;
   for (uint8_t tagNum = 1; tagNum <= kTags; ++tagNum) {
