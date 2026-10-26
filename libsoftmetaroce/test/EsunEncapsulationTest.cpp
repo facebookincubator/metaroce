@@ -19,6 +19,7 @@
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 #include <libsoftmetaroce/Constants.h>
+#include <libsoftmetaroce/Encapsulation.h>
 #include <libsoftmetaroce/EsunEncapsulation.h>
 #include <libsoftmetaroce/Icrc.h>
 #include <libsoftmetaroce/ProtocolCompatibility.h>
@@ -33,17 +34,20 @@ namespace libsoftmetaroce {
 namespace {
 
 // Nonzero field values make misplaced bits visible in the encoded bytes.
+EsunHeader::Fields testFields() {
+  return EsunHeader::Fields{
+      .revision = 2,
+      .flowLabelValid = true,
+      .classOfService = 5,
+      .ecn = 3,
+      .flowLabel = 0x1234,
+      .ttl = 9,
+      .userDefined = 2,
+  };
+}
+
 EsunHeader testHeader() {
-  return EsunHeader(
-      EsunHeader::Fields{
-          .revision = 2,
-          .flowLabelValid = true,
-          .classOfService = 5,
-          .ecn = 3,
-          .flowLabel = 0x1234,
-          .ttl = 9,
-          .userDefined = 2,
-      });
+  return EsunHeader(testFields());
 }
 
 std::array<uint8_t, EsunHeader::kSizeBytes> headerBytes(
@@ -158,6 +162,25 @@ TEST(EsunHeaderTest, RejectsOutOfRangeLocalFields) {
       << "user-defined values wider than two bits should fail locally";
 }
 
+TEST(EsunHeaderTest, SetClassOfServiceChangesOnlyTheCosBits) {
+  EsunHeader header = testHeader();
+  auto expectedFields = testFields();
+  expectedFields.classOfService = 2;
+
+  header.setClassOfService(2);
+
+  EXPECT_EQ(headerBytes(header), headerBytes(EsunHeader(expectedFields)))
+      << "configuring CoS on a socket must leave the revision, flow label, "
+         "ECN, TTL and user-defined bits it shares a header with untouched";
+}
+
+TEST(EsunHeaderTest, SetClassOfServiceRejectsValuesWiderThanThreeBits) {
+  EsunHeader header;
+  EXPECT_DEATH(header.setClassOfService(8), "cos")
+      << "a CoS wider than three bits would spill into the flow-label-valid "
+         "bit";
+}
+
 TEST(EsunHeaderTest, ToleratesNonzeroReservedBitsOnReceive) {
   auto reservedSet =
       folly::IOBuf::copyBuffer(std::string("\xff\xff\xff\xff", 4));
@@ -208,6 +231,23 @@ TEST_F(EsunEncapsulationTest, FramesKnownOuterBytes) {
       std::vector<uint8_t>(expected.begin(), expected.end()))
       << "the Ethernet and ESUN headers should precede the PDU in wire order";
   EXPECT_EQ(data[18], 'A') << "the PDU should follow the outer headers";
+}
+
+TEST_F(EsunEncapsulationTest, ClassOfServiceSetThroughBaseReachesTheWire) {
+  Encapsulation& base = encapsulation_;
+  auto expectedFields = testFields();
+  expectedFields.classOfService = 1;
+
+  base.setClassOfService(1);
+  auto buffer = frame("A");
+  folly::io::Cursor cursor(buffer.get());
+  cursor.skip(kEthernetHeaderSize);
+  const EsunHeader framed{cursor};
+
+  EXPECT_EQ(framed, EsunHeader(expectedFields))
+      << "the sender configures CoS through the Encapsulation interface, so "
+         "the ESUN override must reach every outgoing header; framed CoS is "
+      << static_cast<int>(framed.classOfService());
 }
 
 TEST_F(EsunEncapsulationTest, IcrcCoversThePduAndMinimumFramePadding) {

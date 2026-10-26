@@ -47,6 +47,8 @@ namespace libsoftmetaroce {
  * and one for ACK / control packets. Each socket has its IP TOS / Traffic Class
  * set once at creation from FLAGS_libsoftmetaroce_{data,ack}_dscp shifted into
  * the upper 6 bits, with ECT(0) OR'd into the lower 2 (ECN) bits.
+ * ESUN framing uses FLAGS_libsoftmetaroce_esun_{data,ack}_cos to set its
+ * three-bit CoS independently of IP DSCP, also once at creation.
  */
 class Sender : public folly::NonCopyableNonMovable {
  public:

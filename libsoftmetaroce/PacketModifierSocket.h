@@ -37,6 +37,8 @@
 
 DECLARE_uint32(libsoftmetaroce_data_dscp);
 DECLARE_uint32(libsoftmetaroce_ack_dscp);
+DECLARE_uint32(libsoftmetaroce_esun_data_cos);
+DECLARE_uint32(libsoftmetaroce_esun_ack_cos);
 DECLARE_bool(libsoftmetaroce_profile_send_egress);
 DECLARE_string(libsoftmetaroce_send);
 
@@ -148,6 +150,9 @@ class PacketModifierSocket : public PacketSocket::ReadCallback {
   void setTosOrTrafficClass(uint8_t tosOrTclass) {
     unmodifiedTosOrTrafficClass_ = tosOrTclass;
     packetSocket_->setTosOrTrafficClass(tosOrTclass);
+  }
+  void setEsunCos(uint8_t cos) noexcept {
+    encapsulation_->setClassOfService(cos);
   }
   void setRecvTos(bool recvTos) {
     packetSocket_->setRecvTos(recvTos);

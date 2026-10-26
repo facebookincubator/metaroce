@@ -552,7 +552,7 @@ uint16_t Sender::createSocketWithLocalAddr(
   // The caller checked hasRoomForSocket() under this lock; sockets_ is fixed
   // storage.
   CHECK_LT(assignment->socketCount, kMaxNumSockets);
-  auto makeSocket = [&](uint8_t dscp) {
+  auto makeSocket = [&](uint8_t dscp, uint8_t esunCos) {
     auto owned = makePacketModifierSocket(&evb_, entry, socketMaker_);
     // makePacketModifierSocket throws instead of returning null.
     auto& socket = *CHECK_NOTNULL(owned.get());
@@ -563,6 +563,7 @@ uint16_t Sender::createSocketWithLocalAddr(
     // OR in ECT(0) in the lower 2 (ECN) bits to keep the socket
     // ECN-capable. No-op for raw Ethernet, which has no IP TOS.
     socket.setTosOrTrafficClass(static_cast<uint8_t>((dscp << 2) | kEcnECT0));
+    socket.setEsunCos(esunCos);
     // Under parallel send, consumers sharing this socket serialize on its
     // own write mutex.
     if (parallelSend_) {
@@ -572,8 +573,12 @@ uint16_t Sender::createSocketWithLocalAddr(
   };
 
   PerCosSockets perCosSockets{
-      .data = makeSocket(static_cast<uint8_t>(FLAGS_libsoftmetaroce_data_dscp)),
-      .ack = makeSocket(static_cast<uint8_t>(FLAGS_libsoftmetaroce_ack_dscp)),
+      .data = makeSocket(
+          static_cast<uint8_t>(FLAGS_libsoftmetaroce_data_dscp),
+          static_cast<uint8_t>(FLAGS_libsoftmetaroce_esun_data_cos)),
+      .ack = makeSocket(
+          static_cast<uint8_t>(FLAGS_libsoftmetaroce_ack_dscp),
+          static_cast<uint8_t>(FLAGS_libsoftmetaroce_esun_ack_cos)),
   };
 
   // Store the socket pair and track which address it's bound to. socketId is

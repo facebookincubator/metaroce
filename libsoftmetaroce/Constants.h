@@ -167,6 +167,10 @@ inline constexpr uint16_t kProvisionalEsunEthertype = 0xFC0E;
 inline constexpr uint8_t kDefaultDataDscp = 24; // CS3
 inline constexpr uint8_t kDefaultAckDscp = 46; // EF
 
+// ESUN CoS values (3-bit, 0-7) are independent of IP DSCP.
+inline constexpr uint8_t kDefaultEsunDataCos = 3;
+inline constexpr uint8_t kDefaultEsunAckCos = 5;
+
 // --- Unit Conversions ---
 inline constexpr uint64_t kNsPerSecond = 1'000'000'000ULL;
 

@@ -68,10 +68,25 @@ DEFINE_uint32(
     "and other control (e.g. RNR-cancel) packets. ECN bits are set by LSMR "
     "and are not part of this value.");
 
+DEFINE_uint32(
+    libsoftmetaroce_esun_data_cos,
+    libsoftmetaroce::kDefaultEsunDataCos,
+    "ESUN CoS (0-7) for the sender socket that carries data packets. "
+    "Independent of IP DSCP.");
+
+DEFINE_uint32(
+    libsoftmetaroce_esun_ack_cos,
+    libsoftmetaroce::kDefaultEsunAckCos,
+    "ESUN CoS (0-7) for the sender socket that carries ACK and other control "
+    "(e.g. RNR-cancel) packets. Independent of IP DSCP.");
+
 namespace {
 // Reject values that don't fit in a 6-bit DSCP code point.
 bool isValidDscp(const char* /*flagname*/, uint32_t value) {
   return value <= 63u;
+}
+bool isValidEsunCos(const char* /*flagname*/, uint32_t value) {
+  return value <= 7u;
 }
 // Valid send egress modes for --libsoftmetaroce_send.
 bool isValidSendMode(const char* /*flagname*/, const std::string& value) {
@@ -81,6 +96,8 @@ bool isValidSendMode(const char* /*flagname*/, const std::string& value) {
 
 DEFINE_validator(libsoftmetaroce_data_dscp, &isValidDscp);
 DEFINE_validator(libsoftmetaroce_ack_dscp, &isValidDscp);
+DEFINE_validator(libsoftmetaroce_esun_data_cos, &isValidEsunCos);
+DEFINE_validator(libsoftmetaroce_esun_ack_cos, &isValidEsunCos);
 
 // Defined here (with the other Sender-path socket flags) rather than in
 // MetaRoceVerbs so test binaries that link the Sender without MetaRoceVerbs

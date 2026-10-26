@@ -93,6 +93,10 @@ class EsunHeader {
   [[nodiscard]] constexpr uint8_t classOfService() const noexcept {
     return (encoded_[0] >> 2) & 0x7;
   }
+  void setClassOfService(uint8_t cos) noexcept {
+    CHECK_LE(cos, 0x7);
+    encoded_[0] = static_cast<uint8_t>((encoded_[0] & ~0x1c) | (cos << 2));
+  }
   [[nodiscard]] constexpr uint8_t ecn() const noexcept {
     return encoded_[0] & 0x3;
   }

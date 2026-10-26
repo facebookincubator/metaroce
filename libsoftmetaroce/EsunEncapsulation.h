@@ -37,6 +37,10 @@ class EsunEncapsulation : public RawEncapsulation {
       folly::IOBufQueue& bufferQueue,
       std::optional<uint32_t> originalIcrc) noexcept override;
 
+  void setClassOfService(uint8_t cos) noexcept override {
+    header_.setClassOfService(cos);
+  }
+
   std::optional<IngressMetadata> deframeIncoming(
       std::unique_ptr<folly::IOBuf>& buffer) noexcept override;
 

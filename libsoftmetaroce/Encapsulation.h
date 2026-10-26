@@ -18,6 +18,7 @@
 
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
+#include <cstdint>
 #include <memory>
 #include <optional>
 
@@ -37,6 +38,10 @@ namespace libsoftmetaroce {
 class Encapsulation {
  public:
   virtual ~Encapsulation() = default;
+
+  // Set the outgoing framing's class of service.
+  // Encapsulations without a CoS field ignore this setting.
+  virtual void setClassOfService(uint8_t /*cos*/) noexcept {}
 
   // TX: add framing bytes to the serialized MetaRoCE packet.
   // originalIcrc, when present, overrides the computed integrity value
