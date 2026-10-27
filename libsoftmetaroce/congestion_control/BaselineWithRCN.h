@@ -118,11 +118,10 @@ class BaselineWithRCN : public Baseline {
     // - shift=0 (reduce by numAcked) when qwnd > 2*qwnd_max
     // - shift=1 (reduce by numAcked/2) when qwnd > qwnd_max
     auto& flow = flowStateForId(flowId);
-    // Spec 6.3.3: a flow at or below the floor is protected from RCN alone;
-    // congestion response may still take it below the floor.
-    const int protectedBelow =
-        static_cast<int>(flowId) * FLAGS_libsoftmetaroce_fwnd_floor;
-    if (qwnd_ > protectedBelow &&
+    // Flow 0 keeps its floor at any max.
+    const int64_t qwndThatWouldProtectThisFlow =
+        (int64_t{flowId} + 1) * FLAGS_libsoftmetaroce_fwnd_floor;
+    if ((flowId == 0 || qwnd_max_ >= qwndThatWouldProtectThisFlow) &&
         flow.fwnd <= FLAGS_libsoftmetaroce_fwnd_floor) {
       return;
     }

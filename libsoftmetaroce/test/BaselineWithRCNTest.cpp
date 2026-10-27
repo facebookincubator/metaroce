@@ -76,6 +76,35 @@ class BaselineWithRCNTest : public ::testing::Test {
   static void exitFastStart(TestableBaselineWithRCN& cc) {
     cc.onPacketAck(kFlowId, makeAck(1, 0, kOneMillisecondNs, 1000));
   }
+
+  // Helper to open ten packets on each of numFlows flows and exit fast start.
+  static void openFlows(TestableBaselineWithRCN& cc, int numFlows) {
+    for (int f = 0; f < numFlows; f++) {
+      cc.onFlowAdded(static_cast<uint16_t>(f));
+    }
+    for (int f = 0; f < numFlows; f++) {
+      for (int i = 0; i < 10; i++) {
+        cc.onPacketSent(static_cast<uint16_t>(f));
+      }
+    }
+    exitFastStart(cc);
+  }
+
+  // Helper to ack every flow round-robin at the given rate and RTT, driving
+  // the aggregate toward the max those compute.
+  static void ackAllFlows(
+      TestableBaselineWithRCN& cc,
+      int numFlows,
+      int rounds,
+      uint32_t rttNs,
+      uint32_t rateGbps) {
+    for (int i = 0; i < rounds; i++) {
+      for (int f = 0; f < numFlows; f++) {
+        cc.onPacketAck(
+            static_cast<uint16_t>(f), makeAck(1, 0, rttNs, rateGbps));
+      }
+    }
+  }
 };
 
 TEST_F(BaselineWithRCNTest, QwndMaxUpdatedFromRCN) {
@@ -236,11 +265,11 @@ TEST_F(BaselineWithRCNTest, QwndMaxNotCappedWhenFlagIsZero) {
 /*
  * RCN must leave a protected flow alone (protocol spec 6.3.3).
  *
- * A flow is protected when the aggregate window is above flowId * fwnd_floor
- * and the flow is already at or below fwnd_floor: there is enough QWND for the
- * flow to stay active, so rate reduction takes its packets from elsewhere. The
- * flowId term protects low-numbered flows deterministically, which makes flow 0
- * protected whenever QWND is above zero.
+ * A flow is protected when it is already at or below fwnd_floor and the
+ * computed max is at least (flowId + 1) * fwnd_floor: the max covers the floors
+ * of this flow and every lower-numbered one, so rate reduction takes its
+ * packets from higher-numbered flows. The flowId term protects low-numbered
+ * flows deterministically, and flow 0 is protected at any max.
  *
  * This is a floor rather than a minimum -- congestion response may still take a
  * flow below it. Only RCN is constrained here.
@@ -280,13 +309,11 @@ TEST_F(BaselineWithRCNTest, RcnLeavesAProtectedFlowAlone) {
 }
 
 /*
- * The flowId term, which spec 6.3.3 states as: flow 0 is never reduced below
- * the floor by RCN, while flow 1 may be if QWND is not above the floor.
- *
- * A floor above the aggregate window makes the contrast visible in one run.
- * Flow 0 compares against flowId * floor = 0 and stays protected; flow 1
- * compares against the whole floor, which the aggregate does not clear, so it
- * is reduced like any other flow.
+ * Spec 6.3.3 excepts flow 0 from RCN reduction below the floor, while any
+ * other flow keeps its floor only when the max is at least the floors
+ * through it. A floor above the computed max makes the contrast visible in
+ * one run: flow 0 stays although the max is below even one floor, while
+ * flow 1 sheds although both sit below the floor.
  */
 TEST_F(BaselineWithRCNTest, RcnProtectsFlowZeroButNotFlowOneBelowTheFloor) {
   gflags::FlagSaver flagSaver;
@@ -314,11 +341,131 @@ TEST_F(BaselineWithRCNTest, RcnProtectsFlowZeroButNotFlowOneBelowTheFloor) {
   }
 
   EXPECT_GT(cc.getFwnd(kFlowId), 0)
-      << "flow 0 compares against a zero threshold, which any aggregate "
-         "clears, so RCN must leave it alone whatever the floor is set to";
+      << "flow 0 is excepted from RCN reduction below the floor, so RCN "
+         "must leave it alone whatever the floor is set to";
   EXPECT_LT(cc.getFwnd(kOtherFlowId), cc.getFwnd(kFlowId))
-      << "flow 1 is protected only while the aggregate exceeds one whole "
-         "floor; below that RCN may reduce it like any other flow";
+      << "flow 1 keeps its floor only while the max is at least the two "
+         "floors through it; here it is not, so RCN may reduce flow 1 "
+         "like any other flow";
+}
+
+/*
+ * RCN sheds the flows past what the max keeps until the aggregate meets
+ * it. With max 10 and the floor 2, flows 0-4 keep their floor while
+ * flows 5-7 shed to zero, since the max is exactly five floors.
+ */
+TEST_F(BaselineWithRCNTest, RcnShedsHighFlowsToReachMax) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_fwnd_floor = 2;
+  constexpr int kNumFlows = 8;
+  TestableBaselineWithRCN cc(kEpsilon, kBeta, kGammaNumerator, kOmegaNs);
+  openFlows(cc, kNumFlows);
+  ASSERT_EQ(cc.getQwnd(), 80)
+      << "precondition: ten sends on each of eight flows open an aggregate "
+         "of 80, or the descent below never starts above the max";
+
+  // Rate 1Gbps at 300us computes max 10, below the floored sum 16, so every
+  // ack asks for a reduction until the aggregate meets the max.
+  constexpr uint32_t kRttNs = 300'000;
+  ackAllFlows(cc, kNumFlows, 400, kRttNs, kOneGbps);
+
+  ASSERT_EQ(cc.getQwndMax(), 10)
+      << "precondition: RCN derives this max from the rate and RTT, or the "
+         "descent below exercises the wrong regime; rate is "
+      << kOneGbps << " Gbps and RTT is " << kRttNs << "ns";
+  EXPECT_EQ(cc.getQwnd(), 10)
+      << "reduction must stop at the computed max; an aggregate parked at "
+         "the floored sum 16 sits above the maximum";
+  for (int f = 0; f <= 4; f++) {
+    EXPECT_EQ(cc.getFwnd(static_cast<uint16_t>(f)), 2)
+        << "flow " << f
+        << ": the max is at least the floors through this flow, so RCN "
+           "must leave its floor alone";
+  }
+  for (int f = 5; f < kNumFlows; f++) {
+    EXPECT_EQ(cc.getFwnd(static_cast<uint16_t>(f)), 0)
+        << "flow " << f
+        << " is past what the max keeps, so RCN must shed it to reach 10";
+  }
+}
+
+/*
+ * A max past a whole number of floors holds the remainder past the kept
+ * floors. With max 11 and the floor 2, flows 0-4 keep theirs while
+ * flows 5-7 shed all but one packet, since nothing fires once the
+ * aggregate meets the max.
+ */
+TEST_F(BaselineWithRCNTest, RcnHoldsOnePacketPastTheKeptFloors) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_fwnd_floor = 2;
+  constexpr int kNumFlows = 8;
+  TestableBaselineWithRCN cc(kEpsilon, kBeta, kGammaNumerator, kOmegaNs);
+  openFlows(cc, kNumFlows);
+  ASSERT_EQ(cc.getQwnd(), 80)
+      << "precondition: ten sends on each of eight flows open an aggregate "
+         "of 80, or the descent below never starts above the max";
+
+  // Rate 1Gbps at 350us computes max 11. Reductions fire only while the
+  // aggregate is above the max, so the descent stops at 11 rather than at
+  // the five kept floors.
+  constexpr uint32_t kRttNs = 350'000;
+  ackAllFlows(cc, kNumFlows, 400, kRttNs, kOneGbps);
+
+  ASSERT_EQ(cc.getQwndMax(), 11)
+      << "precondition: RCN derives this max from the rate and RTT, or the "
+         "descent below exercises the wrong regime; rate is "
+      << kOneGbps << " Gbps and RTT is " << kRttNs << "ns";
+  EXPECT_EQ(cc.getQwnd(), 11)
+      << "the descent must stop at the computed max; shedding the last "
+         "packet would drop the aggregate below the maximum";
+  for (int f = 0; f <= 4; f++) {
+    EXPECT_EQ(cc.getFwnd(static_cast<uint16_t>(f)), 2)
+        << "flow " << f
+        << ": the max is at least the floors through this flow, so RCN "
+           "must leave its floor alone";
+  }
+  EXPECT_EQ(cc.getFwnd(5) + cc.getFwnd(6) + cc.getFwnd(7), 1)
+      << "one packet above the kept floors must survive past them, "
+         "since nothing fires once the aggregate meets the max; qwnd is "
+      << cc.getQwnd();
+}
+
+/*
+ * A higher max keeps higher-numbered floors. With max 13 and the floor 2,
+ * flows 0-5 keep theirs while flows 6-7 shed all but one packet.
+ */
+TEST_F(BaselineWithRCNTest, RcnKeepsAnotherFloorAtHigherMax) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_fwnd_floor = 2;
+  constexpr int kNumFlows = 8;
+  TestableBaselineWithRCN cc(kEpsilon, kBeta, kGammaNumerator, kOmegaNs);
+  openFlows(cc, kNumFlows);
+  ASSERT_EQ(cc.getQwnd(), 80)
+      << "precondition: ten sends on each of eight flows open an aggregate "
+         "of 80, or the descent below never starts above the max";
+
+  // Rate 1Gbps at 410us computes max 13, which is six floors with one
+  // packet over.
+  constexpr uint32_t kRttNs = 410'000;
+  ackAllFlows(cc, kNumFlows, 400, kRttNs, kOneGbps);
+
+  ASSERT_EQ(cc.getQwndMax(), 13)
+      << "precondition: RCN derives this max from the rate and RTT, or the "
+         "descent below exercises the wrong regime; rate is "
+      << kOneGbps << " Gbps and RTT is " << kRttNs << "ns";
+  EXPECT_EQ(cc.getQwnd(), 13)
+      << "the descent must stop at the computed max; shedding the last "
+         "packet would drop the aggregate below the maximum";
+  for (int f = 0; f <= 5; f++) {
+    EXPECT_EQ(cc.getFwnd(static_cast<uint16_t>(f)), 2)
+        << "flow " << f
+        << ": the max is at least the floors through this flow, so RCN "
+           "must leave its floor alone";
+  }
+  EXPECT_EQ(cc.getFwnd(6) + cc.getFwnd(7), 1)
+      << "one packet above the kept floors must survive past them, "
+         "since nothing fires once the aggregate meets the max; qwnd is "
+      << cc.getQwnd();
 }
 
 /*
