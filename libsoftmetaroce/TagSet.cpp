@@ -16,6 +16,8 @@
 
 #include <folly/ScopeGuard.h>
 #include <algorithm>
+#include <bitset>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -444,7 +446,12 @@ TagSet::findNextWqeToSend() {
     numLive = tagNumToTag_.size();
   }
   // One pass over at most every live tag; a miss marks the tag fully
-  // visited, so the scan reaches servable work.
+  // visited, so the scan reaches servable work. A tag this scan has tried is
+  // excluded from the rest of it, refills included.
+  std::bitset<std::numeric_limits<uint8_t>::max() + 1> tried;
+  const auto wasTried = [&tried](const auto& entry) {
+    return tried.test(entry.first);
+  };
   for (size_t attempt = 0; attempt < numLive; ++attempt) {
     // Iterator to the selected entry, held across the Tag semaphore wait
     // outside mutex_. Recorded entries are never erased, so it stays valid.
@@ -455,10 +462,11 @@ TagSet::findNextWqeToSend() {
     {
       std::scoped_lock lock(mutex_);
       auto it = scheduler_.select(
-          tagNumToTag_.begin(), tagNumToTag_.end(), asSchedulable);
+          tagNumToTag_.begin(), tagNumToTag_.end(), asSchedulable, wasTried);
       if (it == tagNumToTag_.end()) {
         return std::nullopt;
       }
+      tried.set(it->first);
       scheduler_.noteServed(it, asSchedulable);
       selected = it;
       tag = it->second;

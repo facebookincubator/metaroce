@@ -41,18 +41,26 @@ class WrrScheduler {
   // wrap. Refills every entry first when none holds visits.
   template <typename SchedProj>
   EntryIt select(EntryIt begin, EntryIt end, SchedProj proj) {
-    if (begin == end) {
-      return end;
-    }
-    const bool noneHoldsVisits = std::none_of(begin, end, [&proj](auto& entry) {
-      return proj(entry).getVisitsLeft() > 0;
-    });
+    return select(begin, end, proj, [](const auto&) { return false; });
+  }
+
+  // The same, skipping each entry `excluded` matches: such an entry is neither
+  // chosen nor refilled. End when every entry is excluded.
+  template <typename SchedProj, typename Excluded>
+  EntryIt
+  select(EntryIt begin, EntryIt end, SchedProj proj, Excluded excluded) {
+    const bool noneHoldsVisits =
+        std::none_of(begin, end, [&proj, &excluded](auto& entry) {
+          return !excluded(entry) && proj(entry).getVisitsLeft() > 0;
+        });
     if (noneHoldsVisits) {
       for (auto it = begin; it != end; ++it) {
-        proj(*it).refillVisits();
+        if (!excluded(*it)) {
+          proj(*it).refillVisits();
+        }
       }
     }
-    return peek(begin, end, proj);
+    return nextEligible(begin, end, proj, excluded).value_or(end);
   }
 
   // The same choice without the refill, for readiness peeks: it identifies
@@ -62,21 +70,9 @@ class WrrScheduler {
     if (begin == end) {
       return end;
     }
-    const EntryIt resume = cursor_.has_value() && std::next(*cursor_) != end
-        ? std::next(*cursor_)
-        : begin;
-    for (auto it = resume; it != end; ++it) {
-      if (proj(*it).getVisitsLeft() > 0) {
-        return it;
-      }
-    }
-    for (auto it = begin; it != resume; ++it) {
-      if (proj(*it).getVisitsLeft() > 0) {
-        return it;
-      }
-    }
     // No visits anywhere; offer the lowest entry so selection advances.
-    return begin;
+    return nextEligible(begin, end, proj, [](const auto&) { return false; })
+        .value_or(begin);
   }
 
   // The entry must be live: callers pass only what select returned.
@@ -94,6 +90,33 @@ class WrrScheduler {
   }
 
  private:
+  // First eligible entry, holding visits and not matching `excluded`, from
+  // after `cursor_` with wrap.
+  template <typename SchedProj, typename Excluded>
+  std::optional<EntryIt> nextEligible(
+      EntryIt begin,
+      EntryIt end,
+      SchedProj proj,
+      Excluded excluded) const {
+    const EntryIt resume = cursor_.has_value() && std::next(*cursor_) != end
+        ? std::next(*cursor_)
+        : begin;
+    const auto isEligible = [&proj, &excluded](auto& entry) {
+      return !excluded(entry) && proj(entry).getVisitsLeft() > 0;
+    };
+    for (auto it = resume; it != end; ++it) {
+      if (isEligible(*it)) {
+        return it;
+      }
+    }
+    for (auto it = begin; it != resume; ++it) {
+      if (isEligible(*it)) {
+        return it;
+      }
+    }
+    return std::nullopt;
+  }
+
   // Last recorded position; selection starts after it. Recorded entries are
   // never erased, so this stays valid.
   std::optional<EntryIt> cursor_;

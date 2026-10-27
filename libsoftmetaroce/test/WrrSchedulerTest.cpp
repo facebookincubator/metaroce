@@ -153,6 +153,27 @@ TEST(WrrScheduler, EmptySetReconciles) {
       << "rejoining after an empty set must start at the live tag";
 }
 
+TEST(WrrScheduler, SelectSkipsAndLeavesExcludedTagsUnrefilled) {
+  FakeScheduler scheduler;
+  FakeSet set{{1, FakeSchedulable{2, 0}}, {2, FakeSchedulable{1, 0}}};
+  const auto excludeTag1 = [](const FakeSet::value_type& entry) {
+    return entry.first == 1;
+  };
+  const auto it = scheduler.select(set.begin(), set.end(), asFake, excludeTag1);
+  ASSERT_NE(it, set.end())
+      << "an eligible tag remains, so selection must offer it";
+  EXPECT_EQ(it->first, 2)
+      << "an excluded tag must not be chosen, even holding the higher weight";
+  EXPECT_EQ(set.at(1).visits, 0)
+      << "refilling an excluded tag restores visits forfeited earlier in this "
+         "scan";
+
+  const auto excludeAll = [](const FakeSet::value_type&) { return true; };
+  EXPECT_EQ(
+      scheduler.select(set.begin(), set.end(), asFake, excludeAll), set.end())
+      << "with every tag excluded, selection must report nothing to scan";
+}
+
 TEST(WrrScheduler, PeekDoesNotRefill) {
   FakeSet set{{1, joining(2)}, {2, joining(2)}};
   FakeScheduler scheduler;

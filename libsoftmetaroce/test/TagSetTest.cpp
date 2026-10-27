@@ -625,6 +625,46 @@ TEST_F(TagSetTest, FindNextWqeServesSharesByServiceLevel) {
       << "a default level-zero tag keeps its single turn per cycle";
 }
 
+TEST_F(TagSetTest, FindNextWqeReachesAnUntriedTagAfterARefill) {
+  // Weights 2, 1 and 2; tag 2 holds a second send behind its first.
+  for (uint8_t tagNum = 1; tagNum <= 3; ++tagNum) {
+    tagSet_->add(tagNum, cqs_[tagNum - 1].get(), ibvQp_);
+  }
+  tagSet_->at(1)->setServiceLevel(1);
+  tagSet_->at(3)->setServiceLevel(1);
+  for (const uint8_t tagNum : {1, 2, 2, 3}) {
+    ASSERT_TRUE(postToTag(
+        *tagSet_->at(tagNum),
+        std::make_unique<SendWqe>(
+            kWorkReqId, oneSge(buffer_->data(), kMtu), kMtu),
+        kMtu))
+        << "precondition: tag " << static_cast<int>(tagNum)
+        << " accepts its send";
+  }
+
+  // Each tag sends one packet. Tags 1 and 3 are left empty with one visit
+  // each, and tag 2 with an unsent send and no visits.
+  for (const uint8_t expectedTag : {1, 2, 3}) {
+    auto found = tagSet_->findNextWqe(true);
+    ASSERT_TRUE(found.has_value())
+        << "precondition: every tag holds a send for the first rotation";
+    ASSERT_EQ(found->second->getTagNum(), expectedTag)
+        << "precondition: the first rotation selects the tags in order";
+    std::ignore = found->first->allocateNextPosn();
+    found->second->markFree();
+  }
+
+  auto found = tagSet_->findNextWqe(true);
+  ASSERT_TRUE(found.has_value())
+      << "tag 2 holds an unsent send, so the scan must find it after tags 1 "
+         "and 3 return no WQE; refilling the round must not return the scan "
+         "to a tag it already tried";
+  EXPECT_EQ(found->second->getTagNum(), 2)
+      << "tag 2 is the only tag with unsent work, so the scan must return "
+         "its send";
+  found->second->markFree();
+}
+
 TEST_F(TagSetTest, FindNextWqeCapsServiceLevelBelowOverflow) {
   tagSet_->add(1, cqs_[0].get(), ibvQp_);
   tagSet_->at(1)->setServiceLevel(std::numeric_limits<uint8_t>::max());
