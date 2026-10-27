@@ -1519,6 +1519,174 @@ TEST_F(SenderTest, ProcessAckPacketIgnoresOldAckWhenSlowFlagIsFalse) {
   sender = nullptr;
 }
 
+// Each test starts with kFrames frames in flight, slow-receiver mode off, and
+// no RTT sample.
+class StaleAckTest : public SenderTest {
+ protected:
+  static constexpr uint16_t kFrames = 5;
+
+  void SetUp() override {
+    SenderTest::SetUp();
+    FLAGS_libsoftmetaroce_slow_receiver = false;
+    FLAGS_libsoftmetaroce_rfc6298_first_rtt_sample = true;
+    sender_ = createTestSenderWithFlows(
+        mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
+    flow_ = qp->getTxFlowById(0);
+    ASSERT_NE(flow_, nullptr);
+    const auto mtu = qp->getMtu();
+    payload_ = std::make_unique<char[]>(kFrames * mtu);
+    wqe_ = std::make_unique<SendWqe>(
+        0 /* workReqId */, oneSge(payload_.get(), kFrames * mtu), mtu);
+    wqe_->setMsn(0);
+    wqe_->setCsn(0);
+    setupTxStateWithSentPackets(flow_, wqe_.get(), kFrames, mtu);
+  }
+
+  // Processes an ack of every fsn through cumulativeFsn, echoing a timestamp
+  // rttNs before now.
+  void ackThrough(uint16_t cumulativeFsn, uint32_t rttNs) {
+    const uint32_t nowNs = getNowNs();
+    flow_->processAckPacket(
+        AckHeader::AckHeaderBuilder()
+            .setTag(kMetaRoceInitialTag)
+            .setCumulativeFsn(cumulativeFsn)
+            .setMaxRcvdFsn(cumulativeFsn)
+            .setAckStatus(AckStatus::ACK)
+            .setTimestamp(nowNs - rttNs)
+            .build(),
+        nowNs);
+  }
+
+  static uint64_t maxRtoLimitNs() {
+    return uint64_t{4} * FLAGS_libsoftmetaroce_max_rto_us * kNsPerUs;
+  }
+
+  uint64_t rttLimitNs() {
+    const auto& txState = flow_->getTxState();
+    return (uint64_t{txState.estRttNs} + txState.mdevRttNs) *
+        kStaleAckRttMultiplier;
+  }
+
+  std::string estimatorState() {
+    const auto& txState = flow_->getTxState();
+    return fmt::format(
+        "srtt {}ns, mdev {}ns, haveRttSample {}, sndUna {}",
+        txState.estRttNs,
+        txState.mdevRttNs,
+        txState.haveRttSample,
+        txState.sndUna);
+  }
+
+  gflags::FlagSaver flagSaver_;
+  std::unique_ptr<LimitedTestSender> sender_;
+  TxFlow* flow_{nullptr};
+  std::unique_ptr<char[]> payload_;
+  std::unique_ptr<SendWqe> wqe_;
+};
+
+TEST_F(StaleAckTest, FirstAckOlderThanInitialRttLimitSeedsTheEstimator) {
+  constexpr uint32_t kRttNs = 300'000'000;
+  ASSERT_GT(kRttNs, rttLimitNs())
+      << "precondition: the RTT limit from the initial srtt and mdev, "
+      << rttLimitNs() << "ns, is shorter than this ack's RTT";
+  ASSERT_LT(kRttNs, maxRtoLimitNs())
+      << "precondition: the max-RTO limit, " << maxRtoLimitNs()
+      << "ns, accepts this ack";
+
+  ackThrough(kFrames - 1, kRttNs);
+
+  const auto& txState = flow_->getTxState();
+  EXPECT_EQ(txState.sndUna, kFrames)
+      << "a flow with no RTT sample has to accept an ack within the max-RTO "
+         "limit; a discard leaves the initial srtt and mdev in place, and "
+         "every later ack as old is discarded the same way; "
+      << estimatorState();
+  EXPECT_EQ(txState.estRttNs, kRttNs)
+      << "the accepted ack's RTT has to reach the estimator, which on a first "
+         "sample sets srtt to it (RFC 6298 2.2) so later acks are judged "
+         "against the measured path; "
+      << estimatorState();
+  EXPECT_EQ(txState.mdevRttNs, kRttNs / 2)
+      << "a first sample sets mdev to half the RTT (RFC 6298 2.2); an initial "
+         "mdev left in place keeps the RTT limit partly configured; "
+      << estimatorState();
+}
+
+TEST_F(StaleAckTest, FirstAckOlderThanMaxRtoLimitIsDiscarded) {
+  const auto rttNs = static_cast<uint32_t>(maxRtoLimitNs() + 100'000'000);
+
+  ackThrough(kFrames - 1, rttNs);
+
+  const auto& txState = flow_->getTxState();
+  EXPECT_EQ(txState.sndUna, 0)
+      << "an ack older than 4 * max RTO may report an fsn from before a wrap, "
+         "so the max-RTO limit discards it whether or not the flow has an RTT "
+         "sample; "
+      << estimatorState();
+  EXPECT_FALSE(txState.haveRttSample)
+      << "a discarded ack is dropped whole, including its RTT, which must not "
+         "become the flow's first sample; "
+      << estimatorState();
+}
+
+TEST_F(StaleAckTest, AckOlderThanMeasuredRttLimitIsDiscarded) {
+  ackThrough(1, 100'000 /* rttNs */);
+  const auto& txState = flow_->getTxState();
+  ASSERT_TRUE(txState.haveRttSample)
+      << "precondition: the first ack gives the flow an RTT sample; "
+      << estimatorState();
+  const uint16_t sndUnaAfterSample = txState.sndUna;
+
+  constexpr uint32_t kRttNs = 50'000'000;
+  ASSERT_GT(kRttNs, rttLimitNs())
+      << "precondition: the RTT limit from the sample, " << rttLimitNs()
+      << "ns, is shorter than this ack's RTT";
+  ASSERT_LT(kRttNs, maxRtoLimitNs())
+      << "precondition: the max-RTO limit, " << maxRtoLimitNs()
+      << "ns, accepts this ack, so only the RTT limit can discard it";
+
+  ackThrough(kFrames - 1, kRttNs);
+
+  EXPECT_EQ(txState.sndUna, sndUnaAfterSample)
+      << "once the flow has an RTT sample, the RTT limit is the tighter of the "
+         "two and has to discard an ack far older than the measured round "
+         "trip; "
+      << estimatorState();
+}
+
+/*
+ * A 1 s max RTO puts the max-RTO limit at 4 s, past the 2^32 ns that srtt +
+ * mdev reaches after a first sample of about 2.86 s.
+ */
+class StaleAckLongMaxRtoTest : public StaleAckTest {
+ protected:
+  void SetUp() override {
+    FLAGS_libsoftmetaroce_max_rto_us = 1'000'000;
+    StaleAckTest::SetUp();
+  }
+};
+
+TEST_F(StaleAckLongMaxRtoTest, RttLimitHoldsWhenSrttPlusMdevPassesUint32) {
+  // srtt + mdev after this sample is R + R / 2 = 2^32 ns.
+  constexpr uint32_t kFirstRttNs = 2'863'311'531;
+  ASSERT_LT(kFirstRttNs, maxRtoLimitNs())
+      << "precondition: the max-RTO limit, " << maxRtoLimitNs()
+      << "ns, accepts the first ack";
+  ackThrough(1, kFirstRttNs);
+  const auto& txState = flow_->getTxState();
+  ASSERT_GT(uint64_t{txState.estRttNs} + txState.mdevRttNs, UINT32_MAX)
+      << "precondition: the first sample puts srtt + mdev past 32 bits; "
+      << estimatorState();
+
+  ackThrough(kFrames - 1, 100'000 /* rttNs */);
+
+  EXPECT_EQ(txState.sndUna, kFrames)
+      << "an ack far younger than the measured round trip has to be accepted; "
+         "srtt + mdev summed in 32 bits wraps the RTT limit to zero, which "
+         "discards every later ack; "
+      << estimatorState();
+}
+
 /*
  * Repathing: a flow that keeps timing out without an ack moves to another
  * socket, so its retransmission hashes to a different network path.

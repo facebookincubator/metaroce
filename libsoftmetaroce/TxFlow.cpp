@@ -856,17 +856,28 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
   // those are not excessively delayed.
   const auto rttNs = computeRttNs(ack.getTimestamp(), nowNs);
   if (ack.getTimestamp()) {
-    if (rttNs > std::min(
-                    (unsigned long)kDefaultMaxRtoNs << 2,
-                    (unsigned long)(txState_.estRttNs + txState_.mdevRttNs) *
-                        kStaleAckRttMultiplier)) {
+    const uint64_t maxRtoLimitNs = uint64_t{kDefaultMaxRtoNs} << 2;
+    const uint64_t rttLimitNs =
+        (uint64_t{txState_.estRttNs} + txState_.mdevRttNs) *
+        kStaleAckRttMultiplier;
+    // srtt and mdev hold configured initial values until the first RTT sample.
+    const bool rttLimitApplies =
+        txState_.haveRttSample && rttLimitNs < maxRtoLimitNs;
+    const uint64_t ageLimitNs = rttLimitApplies ? rttLimitNs : maxRtoLimitNs;
+    if (rttNs > ageLimitNs) {
       if (!FLAGS_libsoftmetaroce_slow_receiver) {
-        LOG(WARNING) << "Discarding " << rttNs / 1000 << "us (> 64 * ("
-                     << txState_.estRttNs / 1000 << "us + "
-                     << txState_.mdevRttNs / 1000 << "us) and (>"
-                     << ((kDefaultMaxRtoNs << 2) / 1000)
-                     << "us) old ack of cfsn " << ack.getCumulativeFsn()
-                     << " to protect against wrapped sequence.";
+        const std::string limit = rttLimitApplies
+            ? fmt::format(
+                  "{} * (srtt {}us + mdev {}us)",
+                  kStaleAckRttMultiplier,
+                  txState_.estRttNs / 1000,
+                  txState_.mdevRttNs / 1000)
+            : "4 * max rto";
+        LOG(WARNING) << "Discarding " << rttNs / 1000 << "us old ack of cfsn "
+                     << ack.getCumulativeFsn() << ", over the " << limit
+                     << " limit of " << ageLimitNs / 1000 << "us"
+                     << (txState_.haveRttSample ? "" : " before any rtt sample")
+                     << ", to protect against wrapped sequence.";
         return;
       } else {
         LOG_FIRST_N(WARNING, 1)
