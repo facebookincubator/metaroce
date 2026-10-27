@@ -265,7 +265,8 @@ class StripedMessageWaveModifierConfig : public ModifierConfig {
       uint16_t tailPosn,
       uint32_t maxPendingPackets,
       uint32_t releaseIntervalUs,
-      const std::optional<std::string>& maybeName = std::nullopt)
+      const std::optional<std::string>& maybeName = std::nullopt,
+      std::optional<uint32_t> tailReleaseIntervalUs = std::nullopt)
       : ModifierConfig(
             ModifierType::StripedMessageWave,
             filter,
@@ -274,12 +275,14 @@ class StripedMessageWaveModifierConfig : public ModifierConfig {
         qpCount(qpCount),
         tailPosn(tailPosn),
         maxPendingPackets(maxPendingPackets),
-        releaseIntervalUs(releaseIntervalUs) {}
+        releaseIntervalUs(releaseIntervalUs),
+        tailReleaseIntervalUs(tailReleaseIntervalUs) {}
 
   uint32_t qpCount;
   uint16_t tailPosn;
   uint32_t maxPendingPackets;
   uint32_t releaseIntervalUs;
+  std::optional<uint32_t> tailReleaseIntervalUs;
   std::shared_ptr<StripedMessageWaveState> state;
 };
 

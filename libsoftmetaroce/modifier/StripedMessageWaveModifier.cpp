@@ -22,6 +22,8 @@ namespace libsoftmetaroce {
 
 namespace {
 constexpr uint32_t kRecoveryIntervalMultiplier = 2;
+// Bounds both early timer arming and the final spin on the release thread.
+constexpr uint64_t kMaxPacingWakeLeadNs = 20'000;
 
 void sendWavePacketNoThrow(
     StripedMessageWaveState::DelayedSend& send,
@@ -265,12 +267,17 @@ void StripedMessageWaveModifier::releaseReadyMessageWaves() {
     }
     for (uint16_t posn = 0; posn < config_->tailPosn; ++posn) {
       for (const auto& key : wave) {
-        queueWavePacket(key, state.pendingMessages.at(key).packetIds[posn]);
+        queueWavePacket(
+            key,
+            state.pendingMessages.at(key).packetIds[posn],
+            config_->releaseIntervalUs);
       }
     }
     for (const auto& key : wave) {
       queueWavePacket(
-          key, state.pendingMessages.at(key).packetIds[config_->tailPosn]);
+          key,
+          state.pendingMessages.at(key).packetIds[config_->tailPosn],
+          config_->tailReleaseIntervalUs.value_or(config_->releaseIntervalUs));
       state.readyMessagesByQp.at(key.first).pop_front();
       state.pendingMessages.erase(key);
     }
@@ -287,7 +294,8 @@ void StripedMessageWaveModifier::releaseReadyMessageWaves() {
 
 void StripedMessageWaveModifier::queueWavePacket(
     const MessageKey& key,
-    uint64_t packetId) {
+    uint64_t packetId,
+    uint32_t releaseIntervalUs) {
   auto& state = *CHECK_NOTNULL(state_.get());
   auto it = state.packets.find(packetId);
   CHECK(it != state.packets.end());
@@ -301,7 +309,7 @@ void StripedMessageWaveModifier::queueWavePacket(
           (static_cast<size_t>(config_->tailPosn) + 1));
   state.scheduledSends.push_back(
       StripedMessageWaveState::ScheduledSend{
-          key, std::move(send), historyLimit});
+          key, std::move(send), historyLimit, releaseIntervalUs});
 }
 
 void StripedMessageWaveModifier::armWaveRelease() {
@@ -313,11 +321,20 @@ void StripedMessageWaveModifier::armWaveRelease() {
   auto* statePtr = &state;
   const uint64_t notBeforeNs =
       getNowNs64() + static_cast<uint64_t>(config_->releaseIntervalUs) * 1000;
-  state.releaseQueue.scheduleAt(
-      notBeforeNs,
-      [statePtr, releaseIntervalUs = config_->releaseIntervalUs, notBeforeNs] {
-        dispatchWavePacket(statePtr, releaseIntervalUs, notBeforeNs);
-      });
+  scheduleWavePacket(statePtr, notBeforeNs, config_->releaseIntervalUs);
+}
+
+void StripedMessageWaveModifier::scheduleWavePacket(
+    StripedMessageWaveState* state,
+    uint64_t notBeforeNs,
+    uint32_t releaseIntervalUs) {
+  const uint64_t wakeLeadNs =
+      static_cast<uint64_t>(releaseIntervalUs) * 1000 > kMaxPacingWakeLeadNs
+      ? kMaxPacingWakeLeadNs
+      : 0;
+  state->releaseQueue.scheduleAt(
+      notBeforeNs - wakeLeadNs,
+      [state, notBeforeNs] { dispatchWavePacket(state, notBeforeNs); });
 }
 
 void StripedMessageWaveModifier::armRecoveryRelease() {
@@ -384,17 +401,19 @@ void StripedMessageWaveModifier::dispatchRecoveryPacket(
 
 void StripedMessageWaveModifier::dispatchWavePacket(
     StripedMessageWaveState* state,
-    uint32_t releaseIntervalUs,
     uint64_t notBeforeNs) {
+  // The steady-clock bound limits spinning if the protocol clock moves back.
+  const uint64_t spinUntilNs = steadyNowNs() + kMaxPacingWakeLeadNs;
+  while (getNowNs64() < notBeforeNs && steadyNowNs() < spinUntilNs) {
+  }
   if (getNowNs64() < notBeforeNs) {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->stopping) {
       state->releaseArmed = false;
     } else {
-      state->releaseQueue.scheduleAt(
-          notBeforeNs, [state, releaseIntervalUs, notBeforeNs] {
-            dispatchWavePacket(state, releaseIntervalUs, notBeforeNs);
-          });
+      state->releaseQueue.scheduleAt(notBeforeNs, [state, notBeforeNs] {
+        dispatchWavePacket(state, notBeforeNs);
+      });
     }
     return;
   }
@@ -406,6 +425,7 @@ void StripedMessageWaveModifier::dispatchWavePacket(
     state->scheduledSends.pop_front();
   }
   sendWavePacketNoThrow(*scheduled.send, "scheduled");
+  const uint64_t sentAtNs = getNowNs64();
   finishScheduledPacket(state, scheduled.key, scheduled.historyLimit);
 
   {
@@ -414,11 +434,8 @@ void StripedMessageWaveModifier::dispatchWavePacket(
       state->releaseArmed = false;
     } else {
       const uint64_t nextNotBeforeNs =
-          getNowNs64() + static_cast<uint64_t>(releaseIntervalUs) * 1000;
-      state->releaseQueue.scheduleAt(
-          nextNotBeforeNs, [state, releaseIntervalUs, nextNotBeforeNs] {
-            dispatchWavePacket(state, releaseIntervalUs, nextNotBeforeNs);
-          });
+          sentAtNs + static_cast<uint64_t>(scheduled.releaseIntervalUs) * 1000;
+      scheduleWavePacket(state, nextNotBeforeNs, scheduled.releaseIntervalUs);
     }
   }
 }

@@ -406,6 +406,11 @@ std::unique_ptr<ModifierConfig> ModifierConfig::buildModifierConfigFromJson(
         }
         return static_cast<uint64_t>(value);
       };
+      std::optional<uint32_t> tailReleaseIntervalUs;
+      if (configJson.get_ptr("tail_release_interval_us")) {
+        tailReleaseIntervalUs = static_cast<uint32_t>(getPositive(
+            "tail_release_interval_us", std::numeric_limits<uint32_t>::max()));
+      }
       return std::make_unique<StripedMessageWaveModifierConfig>(
           modifierFilter,
           modificationTimes,
@@ -417,7 +422,8 @@ std::unique_ptr<ModifierConfig> ModifierConfig::buildModifierConfigFromJson(
               "max_pending_packets", std::numeric_limits<uint32_t>::max())),
           static_cast<uint32_t>(getPositive(
               "release_interval_us", std::numeric_limits<uint32_t>::max())),
-          maybeModifierName);
+          maybeModifierName,
+          tailReleaseIntervalUs);
     } else if (typeStr == "duplicate") {
       uint32_t delayUs = 0;
       if (auto delayPtr = configJson.get_ptr("delay_us")) {

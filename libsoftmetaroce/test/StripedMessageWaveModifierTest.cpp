@@ -229,6 +229,92 @@ TEST(
       << "a suppressed repeated key must not open a new wave";
 }
 
+TEST(StripedMessageWaveModifierTest, ShortTailsRetainFullFragmentSpacing) {
+  const auto jsonStr = R"({
+        "type": "striped_message_wave",
+        "filter": {"direction": "tx", "packet_type": "data"},
+        "qp_count": 2,
+        "tail_posn": 1,
+        "max_pending_packets": 4,
+        "release_interval_us": 2000000,
+        "tail_release_interval_us": 10000
+      })";
+  auto config =
+      ModifierConfig::buildModifierConfigFromJson(folly::parseJson(jsonStr));
+  StripedMessageWaveModifier modifier(std::move(config));
+  std::vector<std::pair<uint32_t, uint16_t>> delivered;
+  std::vector<uint64_t> deliveredAtNs;
+  std::mutex deliveredMutex;
+  std::condition_variable deliveredCv;
+  SendPacketFn sendFn = [&](const folly::SocketAddress&,
+                            std::unique_ptr<Packet> packet,
+                            std::optional<uint32_t>) {
+    const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
+    CHECK(dataPacket);
+    {
+      std::lock_guard<std::mutex> lock(deliveredMutex);
+      delivered.emplace_back(
+          packet->getBaseHeader().getSrcQp(),
+          dataPacket->getDataHeader().getPosn());
+      deliveredAtNs.push_back(getNowNs64());
+    }
+    deliveredCv.notify_all();
+    return static_cast<ssize_t>(packet->getSizeBytes());
+  };
+  for (uint32_t qp = 0; qp < 2; ++qp) {
+    for (uint16_t posn = 0; posn < 2; ++posn) {
+      modifier.modifyTxPacketIfMatches(
+          sendFn,
+          std::make_unique<Modifier::TxPacketWithMetadata>(
+              kDefaultRemoteAddr,
+              std::make_unique<DataPacket>(
+                  createBaseHeader(BaseHeader::Opcode::OperationType::SEND, qp),
+                  createDataHeader(posn, 100 + qp, posn),
+                  nullptr,
+                  0)));
+    }
+  }
+  {
+    std::unique_lock<std::mutex> lock(deliveredMutex);
+    ASSERT_TRUE(deliveredCv.wait_for(lock, std::chrono::seconds(12), [&] {
+      return delivered.size() == 4;
+    })) << "the full-fragment and tail stripes must both drain";
+  }
+  ASSERT_TRUE(modifier.waitForDrainForTest(std::chrono::seconds(2)))
+      << "completed tail delivery must leave no scheduled callbacks";
+  const std::vector<std::pair<uint32_t, uint16_t>> expected = {
+      {0, 0}, {1, 0}, {0, 1}, {1, 1}};
+  EXPECT_EQ(delivered, expected)
+      << "tail-specific pacing must preserve ascending fragment stripes";
+  for (size_t index = 1; index < 3; ++index) {
+    EXPECT_GE(deliveredAtNs[index] - deliveredAtNs[index - 1], 2'000'000'000)
+        << "full fragments must retain their configured transmission interval";
+  }
+  const auto tailGapNs = deliveredAtNs[3] - deliveredAtNs[2];
+  EXPECT_GE(tailGapNs, 10'000'000)
+      << "short tails must retain their own minimum transmission interval";
+  EXPECT_LT(tailGapNs, 1'000'000'000)
+      << "a short tail must not consume a full-fragment interval";
+}
+
+TEST(StripedMessageWaveModifierTest, RejectsInvalidTailIntervals) {
+  auto json = folly::parseJson(R"({
+        "type": "striped_message_wave",
+        "filter": {"direction": "tx", "packet_type": "data"},
+        "qp_count": 2,
+        "tail_posn": 1,
+        "max_pending_packets": 4,
+        "release_interval_us": 1000
+      })");
+  for (int64_t intervalUs : {int64_t{-1}, int64_t{0}, int64_t{1} << 32}) {
+    json["tail_release_interval_us"] = intervalUs;
+    EXPECT_THROW(
+        std::ignore = ModifierConfig::buildModifierConfigFromJson(json),
+        std::out_of_range)
+        << "tail intervals must be positive and fit the scheduler's duration";
+  }
+}
+
 TEST(StripedMessageWaveModifierTest, TxMessageWaveFallsBackAtPendingPacketCap) {
   const auto jsonStr = R"({
         "name": "bounded_message_wave",

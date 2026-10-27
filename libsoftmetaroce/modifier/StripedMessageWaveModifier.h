@@ -49,6 +49,7 @@ struct StripedMessageWaveState {
     MessageKey key;
     std::unique_ptr<DelayedSend> send;
     size_t historyLimit{0};
+    uint32_t releaseIntervalUs{0};
   };
 
   struct RecoverySend {
@@ -151,9 +152,15 @@ class StripedMessageWaveModifier : public Modifier {
       uint64_t notBeforeNs);
   static void dispatchWavePacket(
       StripedMessageWaveState* state,
-      uint32_t releaseIntervalUs,
       uint64_t notBeforeNs);
-  void queueWavePacket(const MessageKey& key, uint64_t packetId);
+  static void scheduleWavePacket(
+      StripedMessageWaveState* state,
+      uint64_t notBeforeNs,
+      uint32_t releaseIntervalUs);
+  void queueWavePacket(
+      const MessageKey& key,
+      uint64_t packetId,
+      uint32_t releaseIntervalUs);
 
   // Configuration.
   const StripedMessageWaveModifierConfig* config_{nullptr};
