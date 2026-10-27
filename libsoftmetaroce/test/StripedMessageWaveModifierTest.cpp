@@ -229,6 +229,83 @@ TEST(
       << "a suppressed repeated key must not open a new wave";
 }
 
+TEST(
+    StripedMessageWaveModifierTest,
+    RecoversSentHeadWhileTailsRemainScheduled) {
+  const auto jsonStr = R"({
+        "type": "striped_message_wave",
+        "filter": {"direction": "tx", "packet_type": "data"},
+        "qp_count": 2,
+        "tail_posn": 1,
+        "max_pending_packets": 4,
+        "release_interval_us": 1000000
+      })";
+  auto config =
+      ModifierConfig::buildModifierConfigFromJson(folly::parseJson(jsonStr));
+  StripedMessageWaveModifier modifier(std::move(config));
+  using Fragment = std::tuple<uint32_t, uint16_t, bool>;
+  std::vector<Fragment> delivered;
+  std::mutex deliveredMutex;
+  std::condition_variable deliveredCv;
+  SendPacketFn sendFn = [&](const folly::SocketAddress&,
+                            std::unique_ptr<Packet> packet,
+                            std::optional<uint32_t>) {
+    const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
+    CHECK(dataPacket);
+    {
+      std::lock_guard<std::mutex> lock(deliveredMutex);
+      delivered.emplace_back(
+          packet->getBaseHeader().getSrcQp(),
+          dataPacket->getDataHeader().getPosn(),
+          dataPacket->getDataHeader().getIsRetransmit());
+    }
+    deliveredCv.notify_all();
+    return static_cast<ssize_t>(packet->getSizeBytes());
+  };
+  const auto submit = [&](uint32_t qp, uint16_t posn, bool retry) {
+    auto header = createDataHeader(posn, 1, posn);
+    header.setIsRetransmit(retry);
+    modifier.modifyTxPacketIfMatches(
+        sendFn,
+        std::make_unique<Modifier::TxPacketWithMetadata>(
+            kDefaultRemoteAddr,
+            std::make_unique<DataPacket>(
+                createBaseHeader(BaseHeader::Opcode::OperationType::SEND, qp),
+                header,
+                nullptr,
+                0)));
+  };
+  for (uint32_t qp = 0; qp < 2; ++qp) {
+    for (uint16_t posn = 0; posn < 2; ++posn) {
+      submit(qp, posn, false);
+    }
+  }
+  {
+    std::unique_lock<std::mutex> lock(deliveredMutex);
+    ASSERT_TRUE(deliveredCv.wait_for(lock, std::chrono::seconds(10), [&] {
+      return delivered.size() >= 2;
+    })) << "precondition: both original heads must reach the sender";
+    ASSERT_EQ(delivered.size(), 2)
+        << "precondition: tails must remain scheduled when recovery arrives";
+  }
+  submit(0, 0, true);
+  submit(0, 0, true);
+  submit(1, 1, true);
+  {
+    std::unique_lock<std::mutex> lock(deliveredMutex);
+    ASSERT_TRUE(deliveredCv.wait_for(lock, std::chrono::seconds(10), [&] {
+      return delivered.size() >= 5;
+    })) << "a sent head must recover while its original tail is still queued";
+  }
+  ASSERT_TRUE(modifier.waitForDrainForTest(std::chrono::seconds(10)))
+      << "original and recovery callbacks must finish before teardown";
+  const std::vector<Fragment> expected = {
+      {0, 0, false}, {1, 0, false}, {0, 0, true}, {0, 1, false}, {1, 1, false}};
+  EXPECT_EQ(delivered, expected)
+      << "recovery must preserve original stripes, suppress queued duplicates, "
+         "and leave unsent tails on the original schedule";
+}
+
 TEST(StripedMessageWaveModifierTest, RecoverySharesOriginalPacketPacing) {
   const auto jsonStr = R"({
         "type": "striped_message_wave",

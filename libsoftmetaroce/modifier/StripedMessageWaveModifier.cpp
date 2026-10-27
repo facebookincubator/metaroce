@@ -158,10 +158,17 @@ void StripedMessageWaveModifier::enqueuePacket(
   }
 
   const MessageKey key{qp, msn};
-  if (state.scheduledMessages.contains(key)) {
+  const auto scheduled = state.scheduledMessages.find(key);
+  const size_t numFragments = static_cast<size_t>(config_->tailPosn) + 1;
+  // Original delivery advances each message's posn prefix.
+  const bool recoverReleasedFragment = dataHeader.getIsRetransmit() &&
+      scheduled != state.scheduledMessages.end() &&
+      scheduled->second <= numFragments &&
+      posn < numFragments - scheduled->second;
+  if (scheduled != state.scheduledMessages.end() && !recoverReleasedFragment) {
     return;
   }
-  if (state.completedMessages.contains(key)) {
+  if (state.completedMessages.contains(key) || recoverReleasedFragment) {
     if (dataHeader.getIsRetransmit()) {
       const StripedMessageWaveState::FragmentKey fragmentKey{qp, msn, posn};
       if (state.recoveryQueued.insert(fragmentKey).second) {
@@ -192,8 +199,8 @@ void StripedMessageWaveModifier::enqueuePacket(
     }
     return;
   }
-  auto [messageIt, inserted] = state.pendingMessages.try_emplace(
-      key, static_cast<size_t>(config_->tailPosn) + 1);
+  auto [messageIt, inserted] =
+      state.pendingMessages.try_emplace(key, numFragments);
   auto& message = messageIt->second;
   if (message.packetIds[posn] != 0) {
     const bool qpSetComplete = state.waveQps.size() == config_->qpCount;
