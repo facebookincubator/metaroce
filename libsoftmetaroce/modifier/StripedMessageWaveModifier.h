@@ -55,6 +55,7 @@ struct StripedMessageWaveState {
   struct RecoverySend {
     FragmentKey key;
     std::unique_ptr<DelayedSend> send;
+    uint64_t releaseIntervalUs{0};
   };
 
   StripedMessageWaveState() = default;
@@ -69,7 +70,6 @@ struct StripedMessageWaveState {
       stopping = true;
     }
     releaseQueue.stop();
-    recoveryQueue.stop();
   }
 
   // Runtime state.
@@ -88,8 +88,8 @@ struct StripedMessageWaveState {
   uint64_t releasedWaves{0};
   std::atomic<size_t> scheduledPackets{0};
   std::atomic<size_t> recoveryPackets{0};
+  bool lastSendWasRecovery{false};
   bool releaseArmed{false};
-  bool recoveryArmed{false};
   bool stopping{false};
   bool bypass{false};
 
@@ -98,7 +98,6 @@ struct StripedMessageWaveState {
 
   // Declared after callback state so scheduler destruction happens first.
   DeadlineQueue releaseQueue{"lsmrStripe"};
-  DeadlineQueue recoveryQueue{"lsmrRecovery"};
 };
 
 struct StripedMessageWaveSendTarget {
@@ -145,18 +144,13 @@ class StripedMessageWaveModifier : public Modifier {
       const MessageKey& key,
       size_t historyLimit);
   void armWaveRelease();
-  void armRecoveryRelease();
-  static void dispatchRecoveryPacket(
-      StripedMessageWaveState* state,
-      uint64_t recoveryIntervalUs,
-      uint64_t notBeforeNs);
   static void dispatchWavePacket(
       StripedMessageWaveState* state,
       uint64_t notBeforeNs);
   static void scheduleWavePacket(
       StripedMessageWaveState* state,
       uint64_t notBeforeNs,
-      uint32_t releaseIntervalUs);
+      uint64_t releaseIntervalUs);
   void queueWavePacket(
       const MessageKey& key,
       uint64_t packetId,

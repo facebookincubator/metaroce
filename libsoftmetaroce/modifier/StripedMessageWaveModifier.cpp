@@ -184,8 +184,10 @@ void StripedMessageWaveModifier::enqueuePacket(
                         << "StripedMessageWaveModifier: dropping recovery packet after "
                            "send target teardown";
                   }
-                })});
-        armRecoveryRelease();
+                }),
+                static_cast<uint64_t>(config_->releaseIntervalUs) *
+                    kRecoveryIntervalMultiplier});
+        armWaveRelease();
       }
     }
     return;
@@ -314,20 +316,23 @@ void StripedMessageWaveModifier::queueWavePacket(
 
 void StripedMessageWaveModifier::armWaveRelease() {
   auto& state = *CHECK_NOTNULL(state_.get());
-  if (state.releaseArmed || state.scheduledSends.empty()) {
+  if (state.releaseArmed ||
+      (state.scheduledSends.empty() && state.recoverySends.empty())) {
     return;
   }
   state.releaseArmed = true;
   auto* statePtr = &state;
-  const uint64_t notBeforeNs =
-      getNowNs64() + static_cast<uint64_t>(config_->releaseIntervalUs) * 1000;
-  scheduleWavePacket(statePtr, notBeforeNs, config_->releaseIntervalUs);
+  const uint64_t intervalUs = state.recoverySends.empty()
+      ? config_->releaseIntervalUs
+      : state.recoverySends.front().releaseIntervalUs;
+  const uint64_t notBeforeNs = getNowNs64() + intervalUs * 1000;
+  scheduleWavePacket(statePtr, notBeforeNs, intervalUs);
 }
 
 void StripedMessageWaveModifier::scheduleWavePacket(
     StripedMessageWaveState* state,
     uint64_t notBeforeNs,
-    uint32_t releaseIntervalUs) {
+    uint64_t releaseIntervalUs) {
   const uint64_t wakeLeadNs =
       static_cast<uint64_t>(releaseIntervalUs) * 1000 > kMaxPacingWakeLeadNs
       ? kMaxPacingWakeLeadNs
@@ -335,68 +340,6 @@ void StripedMessageWaveModifier::scheduleWavePacket(
   state->releaseQueue.scheduleAt(
       notBeforeNs - wakeLeadNs,
       [state, notBeforeNs] { dispatchWavePacket(state, notBeforeNs); });
-}
-
-void StripedMessageWaveModifier::armRecoveryRelease() {
-  auto& state = *CHECK_NOTNULL(state_.get());
-  if (state.recoveryArmed || state.recoverySends.empty()) {
-    return;
-  }
-  state.recoveryArmed = true;
-  const uint64_t recoveryIntervalUs =
-      static_cast<uint64_t>(config_->releaseIntervalUs) *
-      kRecoveryIntervalMultiplier;
-  auto* statePtr = &state;
-  const uint64_t notBeforeNs = getNowNs64() + recoveryIntervalUs * 1000;
-  state.recoveryQueue.scheduleAt(
-      notBeforeNs, [statePtr, recoveryIntervalUs, notBeforeNs] {
-        dispatchRecoveryPacket(statePtr, recoveryIntervalUs, notBeforeNs);
-      });
-}
-
-void StripedMessageWaveModifier::dispatchRecoveryPacket(
-    StripedMessageWaveState* state,
-    uint64_t recoveryIntervalUs,
-    uint64_t notBeforeNs) {
-  if (getNowNs64() < notBeforeNs) {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->stopping) {
-      state->recoveryArmed = false;
-    } else {
-      state->recoveryQueue.scheduleAt(
-          notBeforeNs, [state, recoveryIntervalUs, notBeforeNs] {
-            dispatchRecoveryPacket(state, recoveryIntervalUs, notBeforeNs);
-          });
-    }
-    return;
-  }
-  StripedMessageWaveState::RecoverySend recovery;
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    CHECK(!state->recoverySends.empty());
-    recovery = std::move(state->recoverySends.front());
-    state->recoverySends.pop_front();
-  }
-  sendWavePacketNoThrow(*recovery.send, "recovery");
-  state->recoveryPackets.fetch_sub(1, std::memory_order_relaxed);
-
-  {
-    std::lock_guard<std::mutex> lock(state->mutex);
-    state->recoveryQueued.erase(recovery.key);
-    if (state->recoverySends.empty() || state->stopping) {
-      state->recoveryArmed = false;
-    } else {
-      const uint64_t nextNotBeforeNs = getNowNs64() + recoveryIntervalUs * 1000;
-      state->recoveryQueue.scheduleAt(
-          nextNotBeforeNs, [state, recoveryIntervalUs, nextNotBeforeNs] {
-            dispatchRecoveryPacket(state, recoveryIntervalUs, nextNotBeforeNs);
-          });
-    }
-    if (state->scheduledPackets.load(std::memory_order_relaxed) == 0 &&
-        state->recoveryPackets.load(std::memory_order_relaxed) == 0) {
-      state->scheduledPacketsCv.notify_all();
-    }
-  }
 }
 
 void StripedMessageWaveModifier::dispatchWavePacket(
@@ -418,24 +361,52 @@ void StripedMessageWaveModifier::dispatchWavePacket(
     return;
   }
   StripedMessageWaveState::ScheduledSend scheduled;
+  StripedMessageWaveState::RecoverySend recovery;
+  bool isRecovery;
+  uint64_t releaseIntervalUs;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
-    CHECK(!state->scheduledSends.empty());
-    scheduled = std::move(state->scheduledSends.front());
-    state->scheduledSends.pop_front();
+    isRecovery = !state->recoverySends.empty() &&
+        (state->scheduledSends.empty() || !state->lastSendWasRecovery);
+    state->lastSendWasRecovery = isRecovery;
+    if (isRecovery) {
+      CHECK_GT(state->recoverySends.size(), 0);
+      recovery = std::move(state->recoverySends.front());
+      state->recoverySends.pop_front();
+      releaseIntervalUs = recovery.releaseIntervalUs;
+    } else {
+      CHECK_GT(state->scheduledSends.size(), 0);
+      scheduled = std::move(state->scheduledSends.front());
+      state->scheduledSends.pop_front();
+      releaseIntervalUs = scheduled.releaseIntervalUs;
+    }
   }
-  sendWavePacketNoThrow(*scheduled.send, "scheduled");
+  sendWavePacketNoThrow(
+      isRecovery ? *recovery.send : *scheduled.send,
+      isRecovery ? "recovery" : "scheduled");
   const uint64_t sentAtNs = getNowNs64();
-  finishScheduledPacket(state, scheduled.key, scheduled.historyLimit);
+  if (isRecovery) {
+    state->recoveryPackets.fetch_sub(1, std::memory_order_relaxed);
+  } else {
+    finishScheduledPacket(state, scheduled.key, scheduled.historyLimit);
+  }
 
   {
     std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->scheduledSends.empty() || state->stopping) {
+    if (isRecovery) {
+      state->recoveryQueued.erase(recovery.key);
+    }
+    if ((state->scheduledSends.empty() && state->recoverySends.empty()) ||
+        state->stopping) {
       state->releaseArmed = false;
+      state->lastSendWasRecovery = false;
     } else {
-      const uint64_t nextNotBeforeNs =
-          sentAtNs + static_cast<uint64_t>(scheduled.releaseIntervalUs) * 1000;
-      scheduleWavePacket(state, nextNotBeforeNs, scheduled.releaseIntervalUs);
+      const uint64_t nextNotBeforeNs = sentAtNs + releaseIntervalUs * 1000;
+      scheduleWavePacket(state, nextNotBeforeNs, releaseIntervalUs);
+    }
+    if (state->scheduledPackets.load(std::memory_order_relaxed) == 0 &&
+        state->recoveryPackets.load(std::memory_order_relaxed) == 0) {
+      state->scheduledPacketsCv.notify_all();
     }
   }
 }

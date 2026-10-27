@@ -229,6 +229,104 @@ TEST(
       << "a suppressed repeated key must not open a new wave";
 }
 
+TEST(StripedMessageWaveModifierTest, RecoverySharesOriginalPacketPacing) {
+  const auto jsonStr = R"({
+        "type": "striped_message_wave",
+        "filter": {"direction": "tx", "packet_type": "data"},
+        "qp_count": 2,
+        "tail_posn": 1,
+        "max_pending_packets": 4,
+        "release_interval_us": 10000
+      })";
+  auto config =
+      ModifierConfig::buildModifierConfigFromJson(folly::parseJson(jsonStr));
+  StripedMessageWaveModifier modifier(std::move(config));
+  using Fragment = std::tuple<uint32_t, uint32_t, uint16_t, bool>;
+  std::vector<Fragment> delivered;
+  std::vector<uint64_t> deliveredAtNs;
+  std::mutex deliveredMutex;
+  std::condition_variable deliveredCv;
+  SendPacketFn sendFn = [&](const folly::SocketAddress&,
+                            std::unique_ptr<Packet> packet,
+                            std::optional<uint32_t>) {
+    const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
+    CHECK(dataPacket);
+    const auto& header = dataPacket->getDataHeader();
+    {
+      std::lock_guard<std::mutex> lock(deliveredMutex);
+      delivered.emplace_back(
+          packet->getBaseHeader().getSrcQp(),
+          header.getMsn(),
+          header.getPosn(),
+          header.getIsRetransmit());
+      deliveredAtNs.push_back(getNowNs64());
+    }
+    deliveredCv.notify_all();
+    return static_cast<ssize_t>(packet->getSizeBytes());
+  };
+  const auto submit = [&](uint32_t qp,
+                          uint32_t msn,
+                          uint16_t posn,
+                          bool retry) {
+    auto header = createDataHeader(msn * 2 + posn, msn, posn);
+    header.setIsRetransmit(retry);
+    modifier.modifyTxPacketIfMatches(
+        sendFn,
+        std::make_unique<Modifier::TxPacketWithMetadata>(
+            kDefaultRemoteAddr,
+            std::make_unique<DataPacket>(
+                createBaseHeader(BaseHeader::Opcode::OperationType::SEND, qp),
+                header,
+                nullptr,
+                0)));
+  };
+  for (uint32_t qp = 0; qp < 2; ++qp) {
+    for (uint16_t posn = 0; posn < 2; ++posn) {
+      submit(qp, 1, posn, false);
+    }
+  }
+  ASSERT_TRUE(modifier.waitForDrainForTest(std::chrono::seconds(2)))
+      << "precondition: the first wave must complete before recovery is queued";
+  for (uint32_t qp = 0; qp < 2; ++qp) {
+    for (uint16_t posn = 0; posn < 2; ++posn) {
+      submit(qp, 2, posn, false);
+    }
+  }
+  submit(0, 1, 0, true);
+  submit(1, 1, 1, true);
+  {
+    std::unique_lock<std::mutex> lock(deliveredMutex);
+    ASSERT_TRUE(deliveredCv.wait_for(lock, std::chrono::seconds(2), [&] {
+      return delivered.size() == 10;
+    })) << "mixed original and recovery traffic must deliver every fragment";
+  }
+  ASSERT_TRUE(modifier.waitForDrainForTest(std::chrono::seconds(2)))
+      << "mixed traffic must release all deferred callbacks before teardown";
+  std::vector<Fragment> originals;
+  bool previousWasRecovery = false;
+  for (size_t index = 4; index < delivered.size(); ++index) {
+    const bool isRecovery = std::get<3>(delivered[index]);
+    if (!isRecovery) {
+      originals.push_back(delivered[index]);
+    } else if (originals.size() < 4) {
+      EXPECT_FALSE(previousWasRecovery)
+          << "pending originals must make progress between recovery packets";
+    }
+    previousWasRecovery = isRecovery;
+    const uint64_t expectedIntervalNs =
+        std::get<3>(delivered[index - 1]) ? 20'000'000 : 10'000'000;
+    EXPECT_GE(
+        deliveredAtNs[index] - deliveredAtNs[index - 1], expectedIntervalNs)
+        << "recovery and originals must share one delivery-rate budget; "
+        << "previous retry=" << std::get<3>(delivered[index - 1])
+        << ", current retry=" << std::get<3>(delivered[index]);
+  }
+  const std::vector<Fragment> expectedOriginals = {
+      {0, 2, 0, false}, {1, 2, 0, false}, {0, 2, 1, false}, {1, 2, 1, false}};
+  EXPECT_EQ(originals, expectedOriginals)
+      << "recovery must preserve the original fragment stripes and tail order";
+}
+
 TEST(StripedMessageWaveModifierTest, ShortTailsRetainFullFragmentSpacing) {
   const auto jsonStr = R"({
         "type": "striped_message_wave",
