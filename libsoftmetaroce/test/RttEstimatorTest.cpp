@@ -226,6 +226,33 @@ TEST_F(RttEstimatorTest, ExplicitMdevFlagBeatsTheSlowReceiverPrior) {
          "the flag inert in the one configuration that ships";
 }
 
+TEST_F(RttEstimatorTest, ExplicitMaxRtoFlagBeatsTheSlowReceiverCap) {
+  FLAGS_libsoftmetaroce_slow_receiver = true;
+  constexpr uint32_t kMaxRtoUs = 200'000;
+  const auto flagSetResult = gflags::SetCommandLineOption(
+      "libsoftmetaroce_max_rto_us", std::to_string(kMaxRtoUs).c_str());
+  ASSERT_FALSE(flagSetResult.empty())
+      << "precondition: gflags must accept the explicit cap so the test exercises "
+         "operator configuration";
+  ASSERT_FALSE(
+      gflags::GetCommandLineFlagInfoOrDie("libsoftmetaroce_max_rto_us")
+          .is_default)
+      << "precondition: explicitly setting even the compiled default must "
+         "override the slow-receiver cap";
+
+  auto* flow = makeFlow();
+  ASSERT_NE(flow, nullptr);
+  const auto& txState = flow->getTxState();
+  ASSERT_GT((txState.estRttNs + 4 * txState.mdevRttNs) / kNsPerUs, kMaxRtoUs)
+      << "precondition: the initial estimate must exceed the explicit cap so "
+         "the test exercises RTO limiting without backoff";
+
+  EXPECT_EQ(flow->computeRtoIntervalUs(), kMaxRtoUs)
+      << "an explicit maximum must bound retransmission delays even in "
+         "slow-receiver mode; substituting the 2s cap makes operator "
+         "configuration ineffective";
+}
+
 TEST_F(RttEstimatorTest, InitialRttFlagsRejectValuesThatOverflowNanoseconds) {
   constexpr uint32_t kMaxUs = std::numeric_limits<uint32_t>::max() / kNsPerUs;
 

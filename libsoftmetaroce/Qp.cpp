@@ -40,7 +40,7 @@ DEFINE_uint32(
 DEFINE_uint32(
     libsoftmetaroce_max_rto_us,
     200000,
-    "Default maximum RTO in microseconds");
+    "Maximum retransmission timeout interval in microseconds.");
 
 DEFINE_bool(
     libsoftmetaroce_single_owner_tx,

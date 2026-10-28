@@ -43,7 +43,9 @@ DECLARE_uint32(libsoftmetaroce_min_rto_us);
 DEFINE_bool(
     libsoftmetaroce_slow_receiver,
     true,
-    "apply settings that accommodate a slow receiver: ignore staleness of acks and use long rto");
+    "apply settings that accommodate a slow receiver: ignore staleness of "
+    "acks, seed a 250ms RTT deviation prior, and cap RTO at 2s unless "
+    "--libsoftmetaroce_max_rto_us is explicitly set.");
 
 DEFINE_uint32(
     libsoftmetaroce_initial_est_rtt_us,
@@ -168,8 +170,9 @@ TxFlow::~TxFlow() {
 uint32_t TxFlow::computeRtoIntervalUs() const {
   unsigned int exponent = std::min(
       kMaxRtoBackoffExponent, (unsigned int)consecutiveRtosWithoutAck_);
-  // Allow up to 2s RTO for slow receivers; 1s initial.
-  const auto maxRtoNs = FLAGS_libsoftmetaroce_slow_receiver
+  const auto maxRtoNs = FLAGS_libsoftmetaroce_slow_receiver &&
+          gflags::GetCommandLineFlagInfoOrDie("libsoftmetaroce_max_rto_us")
+              .is_default
       ? kSlowReceiverMaxRtoNs
       : kDefaultMaxRtoNs;
   const auto rtoNs = std::max(
