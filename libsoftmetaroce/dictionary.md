@@ -368,3 +368,10 @@ a cost instead of saying what the bytes are.
 
 **Carry** is what a packet or a header field does with a value: it conveys that
 value on the wire.
+
+**Corrupted** bytes are changed without regard to their meaning, as by a bit
+flip. Damage in flight leaves the original mcrc, which the mcrc check catches;
+damage at the sender, before the mcrc is computed (`calculate_new_icrc`), passes
+that check, and only parsing, a protocol check or payload verification can
+notice. A deliberate change to a named field, such as an rkey set to one never
+registered, makes a *modified* packet.
