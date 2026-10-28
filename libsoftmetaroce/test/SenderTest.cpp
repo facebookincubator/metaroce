@@ -297,17 +297,27 @@ TEST_F(SenderTest, RepathAtLimitKeepsItsLocalAddress) {
          "its configured port pair";
 }
 
-TEST_F(SenderTest, RtoRepathKeepsTheFlowsPortPair) {
+TEST_F(SenderTest, RtoMovesTheWholePairAfterEntropy) {
   gflags::FlagSaver flagSaver;
   FLAGS_libsoftmetaroce_slow_receiver = false;
   FLAGS_libsoftmetaroce_rtos_before_repath = 1;
   qp->setRemoteQpNum(102);
-  qp->addPortPair(folly::IPAddress{"fc00::2"}, folly::IPAddress{"fc00::102"});
+  const folly::IPAddress otherLocalAddr{"fc00::2"};
+  const folly::IPAddress otherRemoteAddr{"fc00::102"};
+  qp->addPortPair(otherLocalAddr, otherRemoteAddr);
   qp->configureWatchdogInterval(std::chrono::hours(1));
   std::vector<char> payload(qp->getMtu());
   std::mutex mutex;
   std::condition_variable written;
-  std::vector<std::pair<folly::IPAddress, folly::IPAddress>> transmissions;
+  std::vector<std::tuple<folly::IPAddress, folly::IPAddress, bool>>
+      transmissions;
+  using AddressPair = std::pair<folly::IPAddress, folly::IPAddress>;
+  std::vector<AddressPair> routeChanges;
+  const std::vector<AddressPair> expectedRouteChanges{
+      {localAddr, remoteAddr},
+      {otherLocalAddr, otherRemoteAddr},
+      {localAddr, remoteAddr},
+      {otherLocalAddr, otherRemoteAddr}};
   std::set<uint16_t> sourcePorts;
   auto socketMaker = [&](folly::EventBase* evb) {
     auto socket = std::make_unique<NiceMock<MockUDPSocket>>(evb);
@@ -321,8 +331,18 @@ TEST_F(SenderTest, RtoRepathKeepsTheFlowsPortPair) {
                            const folly::SocketAddress& destination,
                            const std::unique_ptr<folly::IOBuf>& buf) {
           std::lock_guard<std::mutex> lock(mutex);
+          folly::io::Cursor cursor(buf.get());
+          BaseHeader baseHeader(cursor);
+          DataHeader dataHeader(cursor);
           transmissions.emplace_back(
-              boundAddress->getIPAddress(), destination.getIPAddress());
+              boundAddress->getIPAddress(),
+              destination.getIPAddress(),
+              dataHeader.getIsTimeout());
+          const AddressPair pair{
+              boundAddress->getIPAddress(), destination.getIPAddress()};
+          if (routeChanges.empty() || routeChanges.back() != pair) {
+            routeChanges.push_back(pair);
+          }
           sourcePorts.insert(boundAddress->getPort());
           written.notify_one();
           return buf->computeChainDataLength();
@@ -358,18 +378,27 @@ TEST_F(SenderTest, RtoRepathKeepsTheFlowsPortPair) {
   {
     std::unique_lock<std::mutex> lock(mutex);
     ASSERT_TRUE(written.wait_for(lock, std::chrono::seconds(30), [&] {
-      return transmissions.size() >= 9;
-    })) << "the unanswered frame must keep retransmitting through repeated RTOs";
+      return routeChanges.size() >= expectedRouteChanges.size();
+    })) << "unanswered retransmissions must keep moving between configured pairs";
   }
   qp = nullptr;
   sender = nullptr;
 
-  for (const auto& [source, destination] : transmissions) {
-    EXPECT_EQ(source, localAddr)
-        << "RTO repathing must not send from a different plane's local address";
-    EXPECT_EQ(destination, remoteAddr)
-        << "the retransmission must stay within the configured port pair";
+  const std::set<std::pair<folly::IPAddress, folly::IPAddress>> configuredPairs{
+      {localAddr, remoteAddr}, {otherLocalAddr, otherRemoteAddr}};
+  for (size_t i = 0; i < transmissions.size(); ++i) {
+    const auto& [source, destination, isTimeout] = transmissions[i];
+    EXPECT_TRUE(configuredPairs.contains({source, destination}))
+        << "RTO recovery must change the source and destination as a configured "
+           "pair, never combine addresses from different pairs";
+    EXPECT_EQ(isTimeout, i != 0)
+        << "each repeat of the unanswered frame must identify timeout recovery";
   }
+  ASSERT_GE(routeChanges.size(), expectedRouteChanges.size())
+      << "continued RTOs must produce further pair moves without an ACK or APS update";
+  routeChanges.resize(expectedRouteChanges.size());
+  EXPECT_EQ(routeChanges, expectedRouteChanges)
+      << "each later RTO must continue searching after a successful pair move";
   EXPECT_GT(sourcePorts.size(), 1u)
       << "the test must observe source-port changes rather than a pinned flow";
 }

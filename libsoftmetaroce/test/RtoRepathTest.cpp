@@ -606,6 +606,351 @@ TEST_P(RtoRepathTest, TimeoutPublishesWorkOnlyWithOutstandingFrames) {
       << "the retransmission must use the owner-selected entropy socket";
 }
 
+TEST_P(RtoRepathTest, EntropyThenPairMovesOnEachTimeout) {
+  testQp = makeQp(distinctPairs());
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(8))
+      << "precondition: actual frames arm the timer before owner observations";
+  const auto original = route(*flow);
+  const auto originalRemote = flow->getRemoteAddr();
+  const size_t originalPair = originalRemote == remotes[0] ? 0 : 1;
+  const size_t alternatePair = 1 - originalPair;
+
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "the first callback must return before the owner visits";
+  auto beforeThreshold = flow->getNextPacketToSend();
+  ASSERT_TRUE(beforeThreshold)
+      << "the flow must emit the work used to observe its route";
+  EXPECT_EQ(route(*flow), original)
+      << "RTOs below the threshold must leave both endpoints and entropy intact";
+
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "the threshold callback must return before the owner visits";
+  auto entropyPacket = flow->getNextPacketToSend();
+  ASSERT_TRUE(entropyPacket)
+      << "the threshold visit must emit a packet with its selected entropy";
+  EXPECT_NE(flow->getSocketId(), std::get<2>(original))
+      << "the first threshold crossing must vary UDP source-port entropy";
+  expectPacketRoute(
+      *entropyPacket,
+      *flow,
+      std::make_pair(locals[originalPair], remotes[originalPair]));
+  const auto afterEntropyCreations = socketCreations;
+  expectRepeatedVisitPreservesRoute(*flow);
+  EXPECT_EQ(socketCreations, afterEntropyCreations)
+      << "a repeated snapshot must not acquire another socket";
+
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "the post-threshold callback must return before the owner visits";
+  auto pairPacket = flow->getNextPacketToSend();
+  ASSERT_TRUE(pairPacket)
+      << "the post-threshold visit must expose the moved route on a packet";
+  expectPacketRoute(
+      *pairPacket,
+      *flow,
+      std::make_pair(locals[alternatePair], remotes[alternatePair]));
+  expectRepeatedVisitPreservesRoute(*flow);
+
+  for (const size_t nextPair : {originalPair, alternatePair, originalPair}) {
+    SCOPED_TRACE(nextPair);
+    ASSERT_TRUE(advanceTimeouts(1))
+        << "each later RTO must permit another configured pair move";
+    auto laterPacket = flow->getNextPacketToSend();
+    ASSERT_TRUE(laterPacket)
+        << "continued recovery must retransmit data on the next selected pair";
+    EXPECT_EQ(
+        std::make_pair(
+            sender->getAddressFromSocketId(flow->getSocketId()),
+            laterPacket->remoteAddr),
+        std::make_pair(locals[nextPair], remotes[nextPair]))
+        << "unanswered RTOs must keep moving the complete configured pair";
+    expectRepeatedVisitPreservesRoute(*flow);
+  }
+}
+
+TEST_P(RtoRepathTest, CoalescedTimeoutsApplyOneEntropyThenPair) {
+  testQp = makeQp(distinctPairs());
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(1))
+      << "precondition: an actual frame arms the timer before owner observations";
+  const auto original = route(*flow);
+  const size_t originalPair = flow->getRemoteAddr() == remotes[0] ? 0 : 1;
+  const auto creationsBefore = socketCreations;
+  boundLocals.clear();
+
+  ASSERT_TRUE(advanceTimeouts(7))
+      << "coalesced callbacks must return before the owner consumes their work";
+  (void)flow->getNextPacketToSend();
+  EXPECT_EQ(flow->getRemoteAddr(), remotes[1 - originalPair])
+      << "an owner that coalesces RTOs must move the configured pair immediately";
+  EXPECT_EQ(
+      sender->getAddressFromSocketId(flow->getSocketId()),
+      locals[1 - originalPair])
+      << "coalescing must preserve a configured source/destination pair";
+  EXPECT_EQ(socketCreations - creationsBefore, 4u)
+      << "the owner must acquire one entropy socket and one new-local socket, "
+         "each with data and ACK traffic classes";
+  const std::vector<folly::IPAddress> expectedBindings{
+      locals[originalPair],
+      locals[originalPair],
+      locals[1 - originalPair],
+      locals[1 - originalPair]};
+  EXPECT_EQ(boundLocals, expectedBindings)
+      << "a coalesced visit must vary entropy on the old local address before "
+         "acquiring the alternate pair's socket";
+  const auto moved = route(*flow);
+  expectRepeatedVisitPreservesRoute(*flow);
+  EXPECT_NE(moved, original)
+      << "coalesced RTOs must produce an observable route change";
+}
+
+TEST_P(RtoRepathTest, SameLocalMovePreservesEntropySocket) {
+  testQp =
+      makeQp({{0, locals[0], 0, remotes[0]}, {0, locals[0], 1, remotes[1]}});
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(1))
+      << "precondition: actual data arms the same-local flow's timer";
+  const auto originalSocket = flow->getSocketId();
+  const auto originalRemote = flow->getRemoteAddr();
+  ASSERT_TRUE(advanceTimeouts(2))
+      << "the threshold must be reached by genuine callbacks";
+  (void)flow->getNextPacketToSend();
+  ASSERT_NE(flow->getSocketId(), originalSocket)
+      << "precondition: the local address has two sockets to alternate entropy";
+  const auto creationsAfterEntropy = socketCreations;
+
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "the post-threshold callback must finish before same-local selection";
+  (void)flow->getNextPacketToSend();
+  EXPECT_NE(flow->getRemoteAddr(), originalRemote)
+      << "sharing a local endpoint must not prevent a configured pair move";
+  EXPECT_EQ(flow->getSocketId(), originalSocket)
+      << "the same-local move must retain the socket selected by entropy rotation";
+  EXPECT_EQ(socketCreations, creationsAfterEntropy)
+      << "a same-local move must not perform a new-local socket acquisition";
+  const auto movedRemote = flow->getRemoteAddr();
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "a later RTO must permit another same-local pair move";
+  (void)flow->getNextPacketToSend();
+  EXPECT_EQ(flow->getRemoteAddr(), originalRemote)
+      << "same-local recovery must continue moving between configured destinations";
+  EXPECT_NE(flow->getRemoteAddr(), movedRemote)
+      << "a successful pair move must not stop recovery on later RTOs";
+}
+
+TEST_P(RtoRepathTest, RepeatedTimeoutsVisitEveryConfiguredPair) {
+  testQp = makeQp(
+      {{0, locals[0], 0, remotes[0]},
+       {1, locals[1], 1, remotes[1]},
+       {0, locals[0], 2, remotes[2]},
+       {2, locals[2], 3, remotes[3]}},
+      8);
+  const std::array<std::pair<folly::IPAddress, folly::IPAddress>, 4>
+      expectedEndpoints{{
+          {locals[1], remotes[1]},
+          {locals[0], remotes[2]},
+          {locals[2], remotes[3]},
+          {locals[0], remotes[0]},
+      }};
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(1))
+      << "precondition: an actual frame arms the configured-pair recovery timer";
+  const auto original = route(*flow);
+  const auto initialEndpoints = std::make_pair(locals[0], remotes[0]);
+  ASSERT_EQ(
+      std::make_pair(std::get<0>(original), std::get<1>(original)),
+      initialEndpoints)
+      << "precondition: pair zero seeds the configured-pair traversal";
+
+  ASSERT_TRUE(advanceTimeouts(2))
+      << "the entropy threshold must follow two complete timer callbacks";
+  EXPECT_EQ(route(*flow), original)
+      << "the timer must leave threshold entropy selection to the sender";
+  auto entropyOnly = flow->getNextPacketToSend();
+  ASSERT_TRUE(entropyOnly)
+      << "the threshold sender visit must retransmit the outstanding frame";
+  EXPECT_NE(flow->getSocketId(), std::get<2>(original))
+      << "the first threshold crossing must vary UDP source-port entropy";
+  expectPacketRoute(*entropyOnly, *flow, initialEndpoints);
+  expectRepeatedVisitPreservesRoute(*flow);
+
+  for (size_t lap = 0; lap < 2; ++lap) {
+    SCOPED_TRACE(lap);
+    for (const auto& endpoints : expectedEndpoints) {
+      SCOPED_TRACE(endpoints.second.str());
+      const auto oldRoute = route(*flow);
+      ASSERT_TRUE(advanceTimeouts(1))
+          << "each configured-pair move must follow a complete timer callback";
+      EXPECT_EQ(route(*flow), oldRoute)
+          << "timer callbacks must leave configured-pair selection to the sender";
+      auto packet = flow->getNextPacketToSend();
+      ASSERT_TRUE(packet)
+          << "continued recovery must retransmit on every configured pair";
+      expectPacketRoute(*packet, *flow, endpoints);
+      expectRepeatedVisitPreservesRoute(*flow);
+    }
+  }
+}
+
+TEST_P(RtoRepathTest, SocketCapacityFailureRetriesOnlyAfterNewTimeout) {
+  sender->setLimitNumSockets(1);
+  testQp = makeQp(distinctPairs());
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(1))
+      << "precondition: actual data arms the capacity-limited flow's timer";
+  const auto original = route(*flow);
+  const size_t originalPair = flow->getRemoteAddr() == remotes[0] ? 0 : 1;
+  const auto creationsBefore = socketCreations;
+
+  ASSERT_TRUE(advanceTimeouts(3))
+      << "socket recovery must follow actual post-threshold callbacks";
+  EXPECT_NO_THROW((void)flow->getNextPacketToSend())
+      << "a missing new-local socket at capacity must not escape the send path";
+  EXPECT_EQ(route(*flow), original)
+      << "socket acquisition failure must retain the complete usable old route";
+  EXPECT_EQ(socketCreations, creationsBefore)
+      << "the full Sender must not create a socket during failed pair acquisition";
+
+  sender->setLimitNumSockets(LimitedTestSender::kMaxSocketsNoLimit);
+  (void)flow->getNextPacketToSend();
+  EXPECT_EQ(route(*flow), original)
+      << "raising capacity must not retry an already consumed timeout snapshot";
+  EXPECT_EQ(socketCreations, creationsBefore)
+      << "the same failed snapshot must not retry entropy after capacity changes";
+
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "a new actual timeout must permit the capacity retry";
+  (void)flow->getNextPacketToSend();
+  EXPECT_EQ(flow->getRemoteAddr(), remotes[1 - originalPair])
+      << "a later RTO must retry a pair move that never succeeded";
+  EXPECT_EQ(
+      sender->getAddressFromSocketId(flow->getSocketId()),
+      locals[1 - originalPair])
+      << "a successful retry must acquire the destination pair's local socket";
+}
+
+TEST_P(RtoRepathTest, AcceptedAcksResetTimeoutConsumption) {
+  for (const auto ackKind :
+       {AckKind::Cumulative, AckKind::Sack, AckKind::Brnr}) {
+    SCOPED_TRACE(static_cast<int>(ackKind));
+    resetQp();
+    testQp = makeQp(distinctPairs());
+    auto* flow = testQp->getTxFlowById(0);
+    ASSERT_NE(flow, nullptr);
+    ASSERT_EQ(testQp->usesSingleOwnerRxRing(), GetParam())
+        << "precondition: ACKs use the requested owner or inline application mode";
+    ASSERT_TRUE(sendFrames(4))
+        << "precondition: ACKs need sent frames and must leave other frames unacked";
+    ASSERT_EQ(testQp->getHrnrState(), HrnrState::NORMAL_TX)
+        << "precondition: ACK application must not synchronously cancel HRNR timers";
+    const auto originalRemote = flow->getRemoteAddr();
+    ASSERT_TRUE(advanceTimeouts(3))
+        << "the first pair move must follow three complete timer callbacks";
+    (void)flow->getNextPacketToSend();
+    ASSERT_NE(flow->getRemoteAddr(), originalRemote)
+        << "precondition: an ACK must follow a consumed post-threshold timeout";
+    const auto movedRemote = flow->getRemoteAddr();
+
+    const auto ack = makePartialAck(ackKind);
+    applyAck(*testQp, ack);
+    EXPECT_EQ(flow->getRemoteAddr(), movedRemote)
+        << "an accepted ACK must reset the timeout count while retaining the selected pair";
+
+    // The next visit observes the same count as before the ACK, so resetting
+    // timeout consumption is necessary to apply the new RTOs.
+    ASSERT_TRUE(flow->hasUnackedData())
+        << "precondition: accepted ACKs leave data to drive the next RTO run";
+    ASSERT_TRUE(advanceTimeouts(3))
+        << "the reset timeout count must advance through three new callbacks";
+    (void)flow->getNextPacketToSend();
+    EXPECT_EQ(flow->getRemoteAddr(), originalRemote)
+        << "accepted ACKs must allow a repeated timeout count to move the pair again";
+  }
+}
+
+TEST_P(RtoRepathTest, RedundantAckDoesNotRestartThresholdWait) {
+  testQp = makeQp(distinctPairs());
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(4))
+      << "precondition: a redundant ACK requires a sent frame and leaves others unacked";
+  ASSERT_EQ(testQp->getHrnrState(), HrnrState::NORMAL_TX)
+      << "precondition: ACK application must not synchronously cancel HRNR timers";
+  AckHeader advancing = AckHeader::AckHeaderBuilder()
+                            .setCumulativeFsn(0)
+                            .setMaxRcvdFsn(0)
+                            .setAckStatus(AckStatus::ACK)
+                            .setTimestamp(getNowNs() - kNsPerUs)
+                            .build();
+  applyAck(*testQp, advancing);
+  ASSERT_TRUE(flow->hasUnackedData())
+      << "precondition: the advancing ACK leaves frames to drive RTO recovery";
+  const auto originalRemote = flow->getRemoteAddr();
+  ASSERT_TRUE(advanceTimeouts(3))
+      << "the pair move must follow three complete timer callbacks";
+  auto pairPacket = flow->getNextPacketToSend();
+  ASSERT_TRUE(pairPacket)
+      << "the owner must retransmit a frame the advancing ACK left unacked";
+  const auto* dataPacket =
+      dynamic_cast<const DataPacket*>(pairPacket->packet.get());
+  ASSERT_NE(dataPacket, nullptr);
+  EXPECT_EQ(dataPacket->getDataHeader().getFsn(), 1)
+      << "the advancing ACK must retire frame zero before redundant-ACK recovery";
+  ASSERT_NE(flow->getRemoteAddr(), originalRemote)
+      << "precondition: the redundant ACK follows a consumed successful pair move";
+  const auto movedRemote = flow->getRemoteAddr();
+
+  advancing.setTimestamp(getNowNs() - kNsPerUs);
+  applyAck(*testQp, advancing);
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "the next RTO after a redundant ACK must remain above the threshold";
+  (void)flow->getNextPacketToSend();
+  EXPECT_EQ(flow->getRemoteAddr(), originalRemote)
+      << "a redundant ACK below sndUna must not delay the next configured pair move";
+  EXPECT_NE(flow->getRemoteAddr(), movedRemote)
+      << "recovery must continue searching after a redundant ACK";
+}
+
+TEST_P(RtoRepathTest, ApsRestoreSuppressedButDownFailoverRemainsActive) {
+  testQp = makeQp(distinctPairs(), 8);
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(1))
+      << "precondition: actual data arms the APS flow's timer";
+  ASSERT_EQ(flow->getRemoteAddr(), remotes[0])
+      << "precondition: pair 0 is the original pair used by the APS recovery check";
+  testQp->updateRemoteActivePortSet(0x3);
+  ASSERT_TRUE(advanceTimeouts(3))
+      << "APS recovery must observe a pair move driven by actual timeouts";
+  (void)flow->getNextPacketToSend();
+  ASSERT_EQ(flow->getRemoteAddr(), remotes[1])
+      << "RTO application must precede APS processing and survive original-port recovery";
+  (void)flow->getNextPacketToSend();
+  EXPECT_EQ(flow->getRemoteAddr(), remotes[1])
+      << "APS recovery must not undo a successful RTO move on later owner visits";
+
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "another RTO must continue searching despite advertised port availability";
+  (void)flow->getNextPacketToSend();
+  EXPECT_EQ(flow->getRemoteAddr(), remotes[0])
+      << "continued RTO recovery must allow another configured pair move";
+  ASSERT_TRUE(advanceTimeouts(1))
+      << "further unanswered RTOs must keep searching";
+  (void)flow->getNextPacketToSend();
+  ASSERT_EQ(flow->getRemoteAddr(), remotes[1])
+      << "APS restoration must not undo the next RTO-driven pair move";
+
+  testQp->updateRemoteActivePortSet(0x1);
+  (void)flow->getNextPacketToSend();
+  EXPECT_EQ(flow->getRemoteAddr(), remotes[0])
+      << "APS must still move a flow off a down port during RTO recovery";
+}
+
 INSTANTIATE_TEST_SUITE_P(OwnershipModes, RtoRepathTest, Bool());
 
 } // namespace libsoftmetaroce
