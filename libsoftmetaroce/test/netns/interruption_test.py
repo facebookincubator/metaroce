@@ -32,8 +32,13 @@ import time
 from pathlib import Path
 
 
-def _stray_endpoints(artifact_dir: Path) -> list:
-    """Pids whose command line names a conversation artifact JSON file."""
+def _stray_endpoints(artifact_dir: Path) -> list[tuple[int, str, str, str]]:
+    """Live endpoints as (pid, comm, pgrp, cmdline) details for diagnosis.
+
+    Matches processes whose command line names a conversation artifact
+    JSON file. The group id distinguishes an unsignaled tree from one
+    that escaped its signaled group.
+    """
     needle = f"json_path={artifact_dir}".encode()
     strays = []
     for pid in os.listdir("/proc"):
@@ -41,10 +46,15 @@ def _stray_endpoints(artifact_dir: Path) -> list:
             continue
         try:
             args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
-        except OSError:
+            comm = Path(f"/proc/{pid}/comm").read_text().strip()
+            after_comm = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1]
+            # stat fields after "(comm)": state ppid pgrp ...
+            pgrp = after_comm.split()[2]
+        except (OSError, IndexError):
             continue
         if any(needle in arg for arg in args):
-            strays.append(int(pid))
+            cmd = b" ".join(a for a in args if a).decode(errors="replace")
+            strays.append((int(pid), comm, pgrp, cmd))
     return strays
 
 
@@ -135,7 +145,15 @@ def main() -> int:
         ok = False
     strays = _stray_endpoints(artifact_dir)
     if strays:
-        print(f"endpoints outlived the smoke: {strays}", flush=True)
+        print(
+            f"endpoints outlived the smoke: {[p for p, _, _, _ in strays]}",
+            flush=True,
+        )
+        for pid, comm, pgrp, cmd in strays:
+            print(
+                f"stray pid={pid} comm={comm} pgrp={pgrp} cmd={cmd}",
+                flush=True,
+            )
         ok = False
     print("INTERRUPTION_PASS" if ok else "INTERRUPTION_FAIL", flush=True)
     return 0 if ok else 1

@@ -28,6 +28,7 @@ as root inside their namespaces; only namespace setup, entry, and cleanup
 use privilege. Stdlib only.
 """
 
+import contextlib
 import os
 import re
 import signal
@@ -124,6 +125,29 @@ def _on_sigterm(signum: int, _frame: object) -> None:
     raise SystemExit(128 + signum)
 
 
+@contextlib.contextmanager
+def _defer_sigterm():
+    """Record SIGTERM inside launches instead of raising it immediately.
+
+    A launch whose popen forked but whose handle is not published yet
+    would orphan a running, untracked endpoint if SystemExit struck
+    between the two. Recording defers the exit until the handle is
+    published, so shutdown always covers launched trees. A mask would
+    persist across fork into the endpoint itself; a recording handler
+    resets to default on exec instead.
+    """
+    pending = []
+    previous = signal.signal(signal.SIGTERM, lambda s, f: pending.append(s))
+    try:
+        yield pending
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+    # Unreached when the body raised: a failed launch takes precedence
+    # over a concurrently recorded signal.
+    if pending:
+        raise SystemExit(128 + signal.SIGTERM)
+
+
 def _tail(path: Path, lines: int = 20) -> str:
     try:
         return "\n".join(path.read_text().splitlines()[-lines:])
@@ -192,11 +216,12 @@ def _launch_endpoints(spec, rdma_gen, topo, start_s, paths, summary, problems, l
     ]
     summary.append("server: " + " ".join(server_cmd))
     try:
-        server = topo.popen("a", server_cmd, str(paths.server_log))
+        with _defer_sigterm():
+            server = topo.popen("a", server_cmd, str(paths.server_log))
+            live.server = server
     except OSError as e:
         problems.append(f"server did not start: {e}")
         raise _Abort from None
-    live.server = server
     ready = _wait_for_tcp(
         topo, topo.server_addr, spec.control_port, server, spec.ready_timeout_s
     )
@@ -215,11 +240,12 @@ def _launch_endpoints(spec, rdma_gen, topo, start_s, paths, summary, problems, l
     ]
     summary.append("client: " + " ".join(client_cmd))
     try:
-        client = topo.popen("b", client_cmd, str(paths.client_log))
+        with _defer_sigterm():
+            client = topo.popen("b", client_cmd, str(paths.client_log))
+            live.client = client
     except (OSError, netns_topology.TopologyError) as e:
         problems.append(f"client did not start: {e}")
         raise _Abort from None
-    live.client = client
 
 
 def _await_and_verify(spec, start_s, server, client, paths, summary, problems):
