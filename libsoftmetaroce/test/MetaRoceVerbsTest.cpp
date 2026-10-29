@@ -53,6 +53,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -2599,6 +2600,127 @@ TEST_F(VerbsTest, AQueuePairAskingForNoDepthTakesTheDefault) {
          "the device's ceiling, which nothing asking for none has use for";
 
   EXPECT_EQ(verbs_.ibv_destroy_qp(ibvqp), 0);
+}
+
+static void expectCapGrantedAtCreate(
+    const ibv_qp_cap& reported,
+    const ibv_qp_cap& granted,
+    std::string_view output) {
+  EXPECT_EQ(reported.max_send_wr, granted.max_send_wr)
+      << output << ": ibv_query_qp(3) reports the send depth create granted";
+  EXPECT_EQ(reported.max_recv_wr, granted.max_recv_wr)
+      << output << ": ibv_query_qp(3) reports the receive depth create granted";
+  EXPECT_EQ(reported.max_send_sge, granted.max_send_sge)
+      << output
+      << ": ibv_query_qp(3) reports the send sge limit create granted";
+  EXPECT_EQ(reported.max_recv_sge, granted.max_recv_sge)
+      << output
+      << ": ibv_query_qp(3) reports the receive sge limit create granted";
+  EXPECT_EQ(reported.max_inline_data, granted.max_inline_data)
+      << output << ": ibv_query_qp(3) reports the inline cap create granted";
+}
+
+TEST_F(VerbsTest, AStateOnlyQueryReportsHowTheQueuePairWasCreated) {
+  struct ibv_cq* recvCq =
+      verbs_.ibv_create_cq(&context_, kCqEntries, nullptr, nullptr, 0);
+  ASSERT_NE(recvCq, nullptr);
+  constexpr ibv_qp_cap kAskedCap{
+      .max_send_wr = 4,
+      .max_recv_wr = 6,
+      .max_send_sge = 1,
+      .max_recv_sge = 1,
+      .max_inline_data = 32};
+  int qpContext = 0;
+  struct ibv_qp_init_attr init{
+      .qp_context = &qpContext,
+      .send_cq = cq_,
+      .recv_cq = recvCq,
+      .cap = kAskedCap,
+      .qp_type = IBV_QPT_RC,
+      .sq_sig_all = 1};
+  struct ibv_qp* ibvqp = verbs_.ibv_create_qp(pd_, &init);
+  ASSERT_NE(ibvqp, nullptr);
+
+  // Distinct initial values expose fields the query leaves unchanged.
+  int otherContext = 0;
+  struct ibv_srq otherSrq{};
+  struct ibv_qp_attr attr{};
+  struct ibv_qp_init_attr queried{
+      .qp_context = &otherContext,
+      .send_cq = recvCq,
+      .recv_cq = cq_,
+      .srq = &otherSrq,
+      .cap = {.max_send_wr = 8, .max_recv_wr = 8, .max_inline_data = 64},
+      .qp_type = IBV_QPT_UC,
+      .sq_sig_all = 0};
+  ASSERT_EQ(verbs_.ibv_query_qp(ibvqp, &attr, IBV_QP_STATE, &queried), 0)
+      << "precondition: the query succeeds, or init_attr holds whatever it "
+         "held before";
+  EXPECT_EQ(attr.qp_state, IBV_QPS_RESET)
+      << "ibv_query_qp(3) reports the state an IBV_QP_STATE mask asks for, "
+         "alongside the init_attr it fills";
+  EXPECT_EQ(queried.qp_context, &qpContext)
+      << "ibv_query_qp(3) reports the qp_context given at create";
+  EXPECT_EQ(queried.send_cq, cq_)
+      << "ibv_query_qp(3) reports the send CQ bound at create";
+  EXPECT_EQ(queried.recv_cq, recvCq)
+      << "ibv_query_qp(3) reports the receive CQ bound at create, which "
+         "differs from the send CQ here";
+  EXPECT_EQ(queried.srq, nullptr)
+      << "ibv_query_qp(3) reports no SRQ for a queue pair created without "
+         "one";
+  EXPECT_EQ(queried.qp_type, IBV_QPT_RC)
+      << "ibv_query_qp(3) reports the transport type given at create";
+  EXPECT_EQ(queried.sq_sig_all, 1)
+      << "ibv_query_qp(3) reports the sq_sig_all given at create";
+  expectCapGrantedAtCreate(
+      queried.cap, init.cap, "a state-only query's init_attr");
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(ibvqp), 0);
+  EXPECT_EQ(verbs_.ibv_destroy_cq(recvCq), 0);
+}
+
+TEST_F(VerbsTest, ACapQueryReportsOneCapThroughBothOutputs) {
+  struct ibv_srq_init_attr srqInitAttr{
+      .attr = ibv_srq_attr{.max_wr = 4, .max_sge = 1}};
+  struct ibv_srq* srq = verbs_.ibv_create_srq(pd_, &srqInitAttr);
+  ASSERT_NE(srq, nullptr);
+  constexpr ibv_qp_cap kAskedCap{
+      .max_send_wr = 5,
+      .max_recv_wr = 3,
+      .max_send_sge = 1,
+      .max_recv_sge = 1,
+      .max_inline_data = 100};
+  struct ibv_qp_init_attr init{
+      .send_cq = cq_,
+      .recv_cq = cq_,
+      .srq = srq,
+      .cap = kAskedCap,
+      .qp_type = IBV_QPT_RC,
+      .sq_sig_all = 0};
+  struct ibv_qp* ibvqp = verbs_.ibv_create_qp(pd_, &init);
+  ASSERT_NE(ibvqp, nullptr);
+
+  // Each output starts with a different cap, so neither can pass by being
+  // left as it was.
+  struct ibv_qp_attr attr{
+      .cap = {.max_send_wr = 9, .max_recv_wr = 9, .max_inline_data = 1}};
+  struct ibv_qp_init_attr queried{
+      .cap = {.max_send_wr = 7, .max_recv_wr = 7, .max_inline_data = 2},
+      .sq_sig_all = 1};
+  ASSERT_EQ(verbs_.ibv_query_qp(ibvqp, &attr, IBV_QP_CAP, &queried), 0)
+      << "precondition: the query succeeds, or both caps hold whatever they "
+         "held before";
+  expectCapGrantedAtCreate(attr.cap, init.cap, "attr->cap");
+  expectCapGrantedAtCreate(queried.cap, init.cap, "init_attr->cap");
+  EXPECT_EQ(queried.srq, srq)
+      << "ibv_query_qp(3) reports the SRQ given at create";
+  EXPECT_EQ(queried.sq_sig_all, 0)
+      << "ibv_query_qp(3) reports the sq_sig_all given at create, including "
+         "when it is clear";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(ibvqp), 0);
+  EXPECT_EQ(verbs_.ibv_destroy_srq(srq), 0);
 }
 
 TEST_F(VerbsTest, ASendDepthPastTheDeviceMaximumIsRefused) {
@@ -5522,6 +5644,9 @@ TEST(
         << "and the same code reaches a caller reading errno, for mask "
         << attrMask;
   }
+  EXPECT_EQ(verbs.ibv_query_qp(ibvqp, &attr, IBV_QP_STATE, &initAttr), ENOENT)
+      << "a successful query fills init_attr, so with no Tag to fill its cap "
+         "and signaling from, a state-only query fails too";
 
   ibvqp->qp_num = allocatedQpNum;
   EXPECT_EQ(verbs.ibv_destroy_qp(ibvqp), 0);

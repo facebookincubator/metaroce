@@ -1987,6 +1987,74 @@ TEST_F(TaggedVerbsTest, ATagTakesTheSendDepthItsOwnCreateAsksFor) {
   EXPECT_EQ(verbs_.ibv_destroy_qp(qp_tag0), 0);
 }
 
+TEST_F(TaggedVerbsTest, EachTagReportsTheAttributesOfItsOwnCreate) {
+  int tag0Context = 0;
+  struct ibv_qp_init_attr tag0Attr{
+      .qp_context = &tag0Context,
+      .send_cq = cq_,
+      .recv_cq = cq_,
+      .cap = {.max_send_wr = 4, .max_recv_wr = 4, .max_inline_data = 16},
+      .sq_sig_all = 0};
+  struct ibv_qp* qp_tag0 = verbs_.ibv_create_qp(pd_, &tag0Attr);
+  ASSERT_NE(qp_tag0, nullptr);
+
+  int tag1Context = 0;
+  struct ibv_qp_init_attr_ex tag1Attr{};
+  tag1Attr.qp_context = &tag1Context;
+  tag1Attr.send_cq = cq_;
+  tag1Attr.recv_cq = cq_;
+  tag1Attr.cap = {.max_send_wr = 7, .max_recv_wr = 2, .max_inline_data = 64};
+  tag1Attr.qp_type = IBV_QPT_RC;
+  tag1Attr.sq_sig_all = 1;
+  tag1Attr.pd = pd_;
+  tag1Attr.comp_mask = IBV_QP_INIT_ATTR_CREATE_FLAGS;
+  tag1Attr.create_flags = IBV_QP_CREATE_SOURCE_QPN;
+  tag1Attr.source_qpn = MetaRoceVerbs::combineQpAndTag(
+      MetaRoceVerbs::qpAndTagToQp(qp_tag0->qp_num), 1);
+  struct ibv_qp* qp_tag1 = verbs_.ibv_create_qp_ex(&context_, &tag1Attr);
+  ASSERT_NE(qp_tag1, nullptr);
+
+  // One struct receives both results, so a query that leaves it untouched keeps
+  // the other Tag's values and fails the checks.
+  struct ibv_qp_attr attr{};
+  struct ibv_qp_init_attr queried{};
+  ASSERT_EQ(verbs_.ibv_query_qp(qp_tag1, &attr, IBV_QP_STATE, &queried), 0)
+      << "precondition: the query succeeds for the added tag";
+  ASSERT_EQ(verbs_.ibv_query_qp(qp_tag0, &attr, IBV_QP_STATE, &queried), 0)
+      << "precondition: the query succeeds for the first tag";
+  EXPECT_EQ(queried.qp_context, &tag0Context)
+      << "the first Tag's query reports the qp_context its own create gave, "
+         "unchanged by adding a Tag";
+  EXPECT_EQ(queried.sq_sig_all, 0)
+      << "the first Tag's query reports the sq_sig_all its own create gave, "
+         "unchanged by adding a Tag";
+  EXPECT_EQ(queried.cap.max_send_wr, 4u)
+      << "the first Tag's query reports the send depth its own create "
+         "negotiated";
+  EXPECT_EQ(queried.cap.max_inline_data, 16u)
+      << "the first Tag's query reports the inline cap its own create was "
+         "granted";
+
+  ASSERT_EQ(verbs_.ibv_query_qp(qp_tag1, &attr, IBV_QP_STATE, &queried), 0)
+      << "precondition: the query succeeds for the added tag";
+  EXPECT_EQ(queried.qp_context, &tag1Context)
+      << "the added Tag's query reports the qp_context its own create gave";
+  EXPECT_EQ(queried.sq_sig_all, 1)
+      << "the added Tag's query reports the sq_sig_all its own create gave";
+  EXPECT_EQ(queried.cap.max_send_wr, 7u)
+      << "the added Tag's query reports the send depth its own create "
+         "negotiated";
+  EXPECT_EQ(queried.cap.max_recv_wr, 2u)
+      << "the added Tag's query reports the receive depth its own create "
+         "negotiated";
+  EXPECT_EQ(queried.cap.max_inline_data, 64u)
+      << "the added Tag's query reports the inline cap its own create was "
+         "granted";
+
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp_tag1), 0);
+  EXPECT_EQ(verbs_.ibv_destroy_qp(qp_tag0), 0);
+}
+
 TEST_F(TaggedVerbsTest, ATagTakesTheDomainOfTheQueuePairItJoins) {
   struct ibv_pd* otherPd = verbs_.ibv_alloc_pd(&context_);
   ASSERT_NE(otherPd, nullptr);

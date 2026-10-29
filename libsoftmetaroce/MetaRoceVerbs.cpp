@@ -2012,6 +2012,17 @@ int MetaRoceVerbs::ibv_modify_qp(
   return 0;
 }
 
+namespace {
+ibv_qp_cap negotiatedCap(const Tag& tag) {
+  return {
+      .max_send_wr = tag.getSendQueueDepth(),
+      .max_recv_wr = tag.getReceiveQueueDepth(),
+      .max_send_sge = kMaxSgesPerWorkRequest,
+      .max_recv_sge = kMaxSgesPerWorkRequest,
+      .max_inline_data = tag.getMaxInlineData()};
+}
+} // namespace
+
 int MetaRoceVerbs::ibv_query_qp(
     struct ibv_qp* ibvqp,
     struct ibv_qp_attr* attr,
@@ -2027,6 +2038,11 @@ int MetaRoceVerbs::ibv_query_qp(
   if (qp == nullptr) {
     return withErrno(ENOENT);
   }
+  const std::shared_ptr<const Tag> tag =
+      qp->getTag(qpAndTagToTag(ibvqp->qp_num));
+  if (tag == nullptr) {
+    return withErrno(ENOENT);
+  }
   if (attr_mask & IBV_QP_STATE) {
     const ibv_qp_state state = loadQpState(*ibvqp);
     if (state > IBV_QPS_UNKNOWN) {
@@ -2034,31 +2050,16 @@ int MetaRoceVerbs::ibv_query_qp(
     }
     attr->qp_state = state;
   }
-  // A state-only query answers from the caller's own struct, so resolve a Tag
-  // only for a mask asking for an attribute the Tag holds.
-  constexpr int kAttrsBackedByTag = IBV_QP_CAP | IBV_QP_RNR_RETRY |
-      IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_MAX_QP_RD_ATOMIC |
-      IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_AV;
-  if ((attr_mask & kAttrsBackedByTag) == 0) {
-    return 0;
-  }
-
-  const std::shared_ptr<const Tag> tag =
-      qp->getTag(qpAndTagToTag(ibvqp->qp_num));
-  if (tag == nullptr) {
-    return withErrno(ENOENT);
-  }
+  *init_attr = {
+      .qp_context = ibvqp->qp_context,
+      .send_cq = ibvqp->send_cq,
+      .recv_cq = ibvqp->recv_cq,
+      .srq = ibvqp->srq,
+      .cap = negotiatedCap(*tag),
+      .qp_type = ibvqp->qp_type,
+      .sq_sig_all = tag->getSqSigAll() ? 1 : 0};
   if (attr_mask & IBV_QP_CAP) {
-    // Populate every cap field so a caller passing an uninitialized attr does
-    // not read indeterminate values. The work request depths are the ones this
-    // Tag's create asked for.
-    attr->cap.max_send_wr = tag->getSendQueueDepth();
-    attr->cap.max_recv_wr = tag->getReceiveQueueDepth();
-    attr->cap.max_send_sge = kMaxSgesPerWorkRequest;
-    attr->cap.max_recv_sge = kMaxSgesPerWorkRequest;
-    // Each Tag negotiated its own cap, so report the one this ibv_qp addresses
-    // rather than a value shared across the tags of the underlying QP.
-    attr->cap.max_inline_data = tag->getMaxInlineData();
+    attr->cap = negotiatedCap(*tag);
   }
   if (attr_mask & IBV_QP_RNR_RETRY) {
     attr->rnr_retry = tag->getRnrRetryLimit();
@@ -2243,6 +2244,10 @@ struct ibv_qp* FOLLY_NULLABLE MetaRoceVerbs::ibv_create_qp(
   publishTagConfig(initialTagConfig);
   qp_init_attr->cap.max_send_wr = sendQueueDepth;
   qp_init_attr->cap.max_recv_wr = receiveQueueDepth;
+  // ibv_create_qp(3) may grant more than was asked; every queue pair is granted
+  // the device's sge limit.
+  qp_init_attr->cap.max_send_sge = kMaxSgesPerWorkRequest;
+  qp_init_attr->cap.max_recv_sge = kMaxSgesPerWorkRequest;
   return ibvQp;
 }
 
@@ -2394,6 +2399,10 @@ struct ibv_qp* FOLLY_NULLABLE MetaRoceVerbs::ibv_create_qp_ex(
        .sendMsn = addedTag->getNextMsn()});
   qp_init_attr->cap.max_send_wr = sendQueueDepth;
   qp_init_attr->cap.max_recv_wr = receiveQueueDepth;
+  // ibv_create_qp(3) may grant more than was asked; every queue pair is granted
+  // the device's sge limit.
+  qp_init_attr->cap.max_send_sge = kMaxSgesPerWorkRequest;
+  qp_init_attr->cap.max_recv_sge = kMaxSgesPerWorkRequest;
   return &addedQp;
 }
 
