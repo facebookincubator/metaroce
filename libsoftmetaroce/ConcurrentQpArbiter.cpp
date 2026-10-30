@@ -85,7 +85,7 @@ void ConcurrentQpArbiter::RegisteredQp::signal() noexcept {
   // Bump even when the QP is already queued or in service, so a signal that
   // arrives mid-turn is recorded and not lost; only the 0 -> 1 edge enqueues.
   // A lost readiness signal would strand a QP, so the enqueue blocks when the
-  // queue is momentarily full; it cannot overrun in practice.
+  // queue is full.
   if (pending.fetch_add(1, std::memory_order_acq_rel) == 0) {
     arbiter.readyQueue_.blockingWrite(qpNum);
   }

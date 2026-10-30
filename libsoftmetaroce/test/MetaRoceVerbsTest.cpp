@@ -3302,8 +3302,7 @@ TEST_F(VerbsTest, PostZeroLengthSendWithImmIsAccepted) {
 
 /*
  * Tests that ibv_post_send accepts a zero-length IBV_WR_SEND_WITH_IMM posted
- * with num_sge=0 (no SGE list) — the more typical spelling of a zero-byte
- * SEND_WITH_IMM, where the immediate data carries the message meaning.
+ * with num_sge=0 (no SGE list), where the immediate data is the whole message.
  */
 TEST_F(VerbsTest, PostZeroLengthSendWithImmAndNoSgeIsAccepted) {
   struct ibv_qp* ibvqp = fixtureQp();

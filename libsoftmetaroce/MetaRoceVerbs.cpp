@@ -126,7 +126,7 @@ DEFINE_uint32(
     ">= 2 uses ConcurrentQpArbiter with that many parallel send consumers.");
 static bool validateSendingThreads(const char*, uint32_t value) {
   // Cap at the cgroup-aware CPU count (available_concurrency), floored at 8 so
-  // a 0/low-CPU/CI count still admits the default and typical values -- at the
+  // a 0/low-CPU/CI count still admits the default and counts up to 8 -- at the
   // cost of mild oversubscription there.
   const uint32_t maxThreads = std::max(folly::available_concurrency(), 8u);
   return value >= 1 && value <= maxThreads;

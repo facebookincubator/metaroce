@@ -27,9 +27,8 @@
 namespace libsoftmetaroce {
 
 QpArbiter::QpArbiter() {
-  // Since we increment the next Qp before selecting it, to ensure that at
-  // startup the first Qp (typically Qp 0) is chosen first, we need to set the
-  // initial next Qp to be "before" Qp 0.
+  // Selection takes the next ready Qp after this one, wrapping, so starting
+  // past every qp number selects the lowest-numbered ready Qp first.
   nextQpNumToSendOn_ = std::numeric_limits<uint32_t>::max();
 }
 

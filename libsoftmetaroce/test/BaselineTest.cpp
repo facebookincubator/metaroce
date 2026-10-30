@@ -55,7 +55,7 @@ TEST_F(BaselineTest, Basic) {
     EXPECT_GT(cc.getAvailableWindowSize(flowId), 0);
   }
 
-  // reuse the ack event for a typical, one packet ack. It carries a real
+  // reuse the ack event for a one-packet ack. It holds a real
   // sample below the average: an ack with none is not evidence of low delay.
   auto ackEventNoCE = CongestionController::AckEvent{
       .numAckedPackets = 1, .measuredRttNs = 1000, .smoothedQpRttNs = 2000};

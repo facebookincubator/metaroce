@@ -542,8 +542,8 @@ struct MetaRoceResources {
 // Configuration
 // ============================================================================
 
-// These would typically be command-line arguments or configuration parameters.
-// For this tutorial, they are defined as constants.
+// An application would take these from command-line arguments or a
+// configuration file; this tutorial fixes them as constants.
 const char* const kDeviceName = nullptr; // Use first device if nullptr
 const char* const kRemoteAddr = "fc00::2";
 const char* const kAlternateRemoteAddr = "fc00::4";

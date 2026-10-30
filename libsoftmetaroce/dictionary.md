@@ -375,3 +375,6 @@ damage at the sender, before the mcrc is computed (`calculate_new_icrc`), passes
 that check, and only parsing, a protocol check or payload verification can
 notice. A deliberate change to a named field, such as an rkey set to one never
 registered, makes a *modified* packet.
+
+**Typical**, **typically**, and *in practice* should not hedge a guarantee.
+State what the code does and under what conditions.
