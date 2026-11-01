@@ -169,9 +169,13 @@ uint32_t TxFlow::computeRtoIntervalUs() const {
   unsigned int exponent = std::min(
       kMaxRtoBackoffExponent, (unsigned int)consecutiveRtosWithoutAck_);
   // Allow up to 2s RTO for slow receivers; 1s initial.
-  const auto maxRtoNs = FLAGS_libsoftmetaroce_slow_receiver
-      ? kSlowReceiverMaxRtoNs
-      : kDefaultMaxRtoNs;
+  // Preserve the slow-receiver default unless max_rto_us was explicitly set.
+  const auto maxRtoNs =
+      FLAGS_libsoftmetaroce_slow_receiver &&
+              gflags::GetCommandLineFlagInfoOrDie(
+                  "libsoftmetaroce_max_rto_us").is_default
+          ? kSlowReceiverMaxRtoNs
+          : kDefaultMaxRtoNs;
   const auto rtoNs = std::max(
       (unsigned long)FLAGS_libsoftmetaroce_min_rto_us * kNsPerUs,
       std::min(

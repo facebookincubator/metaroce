@@ -35,6 +35,8 @@ DECLARE_bool(libsoftmetaroce_rfc6298_first_rtt_sample);
 DECLARE_uint32(libsoftmetaroce_initial_est_rtt_us);
 // NOLINTNEXTLINE(facebook-hte-PreventUseOfDeclareGflag)
 DECLARE_uint32(libsoftmetaroce_initial_mdev_rtt_us);
+// NOLINTNEXTLINE(facebook-hte-PreventUseOfDeclareGflag)
+DECLARE_uint32(libsoftmetaroce_max_rto_us);
 
 using namespace testing;
 namespace libsoftmetaroce {
@@ -224,6 +226,26 @@ TEST_F(RttEstimatorTest, ExplicitMdevFlagBeatsTheSlowReceiverPrior) {
       << "slow-receiver mode only supplies a prior for a deployment that set "
          "no mdev; silently replacing an operator's mdev with 250ms would make "
          "the flag inert in the one configuration that ships";
+}
+
+TEST_F(RttEstimatorTest, ExplicitMaxRtoFlagOverridesSlowReceiverCap) {
+  FLAGS_libsoftmetaroce_slow_receiver = true;
+
+  constexpr uint32_t kMaxRtoUs = 20'000;
+
+  // Mark max_rto_us as explicitly configured through gflags.
+  ASSERT_EQ(
+      gflags::SetCommandLineOption(
+          "libsoftmetaroce_max_rto_us",
+          std::to_string(kMaxRtoUs).c_str()),
+      std::to_string(kMaxRtoUs));
+
+  auto* flow = makeFlow();
+  ASSERT_NE(flow, nullptr);
+
+  EXPECT_EQ(flow->computeRtoIntervalUs(), kMaxRtoUs)
+      << "an explicitly configured max_rto_us must override the "
+         "slow-receiver 2-second cap";
 }
 
 TEST_F(RttEstimatorTest, InitialRttFlagsRejectValuesThatOverflowNanoseconds) {
