@@ -343,6 +343,9 @@ class Tag {
   [[nodiscard]] uint32_t getMaxInlineData() const {
     return maxInlineData_;
   }
+  [[nodiscard]] bool getSqSigAll() const {
+    return sqSigAll_;
+  }
   // Read under no lock, so it can lag a transition another thread has made.
   // The load is atomic and the error state is terminal, so a stale read says
   // "not yet" and never "no".

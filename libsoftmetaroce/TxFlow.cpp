@@ -43,7 +43,9 @@ DECLARE_uint32(libsoftmetaroce_min_rto_us);
 DEFINE_bool(
     libsoftmetaroce_slow_receiver,
     true,
-    "apply settings that accommodate a slow receiver: ignore staleness of acks and use long rto");
+    "apply settings that accommodate a slow receiver: ignore staleness of "
+    "acks, seed a 250ms RTT deviation prior, and cap RTO at 2s unless "
+    "--libsoftmetaroce_max_rto_us is explicitly set.");
 
 DEFINE_uint32(
     libsoftmetaroce_initial_est_rtt_us,
@@ -168,14 +170,7 @@ TxFlow::~TxFlow() {
 uint32_t TxFlow::computeRtoIntervalUs() const {
   unsigned int exponent = std::min(
       kMaxRtoBackoffExponent, (unsigned int)consecutiveRtosWithoutAck_);
-  // Allow up to 2s RTO for slow receivers; 1s initial.
-  // Preserve the slow-receiver default unless max_rto_us was explicitly set.
-  const auto maxRtoNs =
-      FLAGS_libsoftmetaroce_slow_receiver &&
-              gflags::GetCommandLineFlagInfoOrDie(
-                  "libsoftmetaroce_max_rto_us").is_default
-          ? kSlowReceiverMaxRtoNs
-          : kDefaultMaxRtoNs;
+
   const auto rtoNs = std::max(
       (unsigned long)FLAGS_libsoftmetaroce_min_rto_us * kNsPerUs,
       std::min(
@@ -1555,12 +1550,50 @@ void TxFlow::applyRtoRepath() {
   try {
     socketId_ = qp_.getSender().getAlternateSocket(socketId_);
   } catch (const std::exception& ex) {
+    // A failed source-port change does not prevent moving to another
+    // configured pair.
     LOG_FIRST_N(WARNING, 10)
         << "QP " << qp_.getLocalQpNum() << " flow " << flowId_
         << ": could not change RTO source-port entropy: " << ex.what();
   }
   VLOG(2) << "QP " << qp_.getLocalQpNum() << " flow " << flowId_ << ": RTO "
           << rtoCount << " socket " << oldSocketId << " -> " << socketId_;
+
+  if (rtoCount > threshold) {
+    tryMoveToNextPortPair();
+  }
+}
+
+void TxFlow::tryMoveToNextPortPair() {
+  const auto numPairs = qp_.portPairs_.size();
+  // Every live flow retains at least one configured port pair.
+  CHECK_GT(numPairs, 0);
+  if (numPairs == 1) {
+    return;
+  }
+  const auto oldPairIdx = portPairIdx_;
+  const auto newPairIdx = static_cast<uint16_t>((oldPairIdx + 1) % numPairs);
+  const auto& oldPair = qp_.portPairs_.at(oldPairIdx);
+  const auto& newPair = qp_.portPairs_.at(newPairIdx);
+  if (newPair.localPortIdx != oldPair.localPortIdx) {
+    const auto& newLocalPort = qp_.localPorts_.at(newPair.localPortIdx);
+    try {
+      socketId_ = qp_.getSender().getSocketIdFromAddress(
+          newLocalPort.addr, newLocalPort.gid);
+    } catch (const std::exception& ex) {
+      LOG_FIRST_N(WARNING, 10)
+          << "QP " << qp_.getLocalQpNum() << " flow " << flowId_
+          << ": could not acquire a socket for RTO pair " << newPairIdx << ": "
+          << ex.what();
+      return;
+    }
+  }
+  portPairIdx_ = newPairIdx;
+  LOG(INFO) << "QP " << qp_.getLocalQpNum() << " flow " << flowId_
+            << ": RTO move from pair " << oldPairIdx << " (local "
+            << oldPair.localPortIdx << ", remote " << oldPair.remotePortIdx
+            << ") to " << newPairIdx << " (local " << newPair.localPortIdx
+            << ", remote " << newPair.remotePortIdx << ")";
 }
 
 uint16_t TxFlow::findAlternatePortPair(
@@ -1600,10 +1633,10 @@ void TxFlow::maybeFailoverRemotePort() {
   const auto remotePortIdx = pair.remotePortIdx;
   const bool portIsUp = qp_.isRemotePortActive(remotePortIdx, aps);
 
-  // If original remote port is back up and we're not on it, restore the
-  // complete configured pair.
   const auto& originalPair = qp_.portPairs_.at(originalPortPairIdx_);
-  if (pairIdx != originalPortPairIdx_ &&
+  // RTO-selected pairs take precedence over automatic restoration until an
+  // accepted ACK.
+  if (consecutiveRtosWithoutAck_ == 0 && pairIdx != originalPortPairIdx_ &&
       qp_.isRemotePortActive(originalPair.remotePortIdx, aps)) {
     portPairIdx_ = originalPortPairIdx_;
     socketId_ = originalSocketId_;

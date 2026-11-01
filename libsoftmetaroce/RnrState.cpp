@@ -17,6 +17,8 @@
 #include <ostream>
 #include <string>
 
+#include <fmt/format.h>
+
 #include <libsoftmetaroce/RnrState.h>
 #include <libsoftmetaroce/WrappingCompare.h>
 

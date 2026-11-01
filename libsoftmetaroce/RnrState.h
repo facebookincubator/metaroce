@@ -22,7 +22,6 @@
 #include <string>
 #include <string_view>
 
-#include <folly/Format.h>
 #include <glog/logging.h>
 
 namespace libsoftmetaroce {

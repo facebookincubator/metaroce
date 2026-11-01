@@ -33,7 +33,8 @@
 namespace libsoftmetaroce {
 
 struct StripedMessageWaveState {
-  using DelayedSend = folly::Function<void()>;
+  // Returns the packet's pacing timestamp on the getNowNs64() clock.
+  using DelayedSend = folly::Function<uint64_t()>;
   using DelayedSends = std::vector<std::unique_ptr<DelayedSend>>;
   using MessageKey = std::pair<uint32_t, uint32_t>;
   using FragmentKey = std::tuple<uint32_t, uint32_t, uint16_t>;
@@ -76,6 +77,8 @@ struct StripedMessageWaveState {
   std::mutex mutex;
   std::map<MessageKey, PendingMessage> pendingMessages;
   std::map<uint32_t, std::deque<uint32_t>> readyMessagesByQp;
+  // QPs with at least one complete message waiting for a wave.
+  size_t qpsWithReadyMessages{0};
   std::set<uint32_t> waveQps;
   std::map<MessageKey, size_t> scheduledMessages;
   std::set<MessageKey> completedMessages;

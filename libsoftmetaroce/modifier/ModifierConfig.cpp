@@ -19,6 +19,8 @@
 #include <cmath>
 #include <random>
 
+#include <folly/String.h>
+
 namespace libsoftmetaroce {
 
 namespace {

@@ -110,6 +110,7 @@ TEST(
                       const folly::SocketAddress&,
                       std::unique_ptr<Packet> packet,
                       std::optional<uint32_t>) {
+      const uint64_t callbackStartedAtNs = getNowNs64();
       const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
       if (dataPacket == nullptr) {
         wrongCallback = true;
@@ -124,7 +125,7 @@ TEST(
             packet->getBaseHeader().getSrcQp(),
             dataPacket->getDataHeader().getMsn(),
             dataPacket->getDataHeader().getPosn());
-        deliveredAtNs.push_back(getNowNs64());
+        deliveredAtNs.push_back(callbackStartedAtNs);
       }
       deliveredCv.notify_all();
       return static_cast<ssize_t>(packet->getSizeBytes());
@@ -231,6 +232,141 @@ TEST(
 
 TEST(
     StripedMessageWaveModifierTest,
+    QueuedMessagesCannotReplaceMissingWaveQps) {
+  using Fragment = std::tuple<uint32_t, uint32_t, uint16_t>;
+  std::vector<Fragment> delivered;
+  std::mutex deliveredMutex;
+  std::condition_variable deliveredCv;
+  SendPacketFn send = [&](const folly::SocketAddress&,
+                          std::unique_ptr<Packet> packet,
+                          std::optional<uint32_t>) {
+    const auto* data = dynamic_cast<const DataPacket*>(packet.get());
+    CHECK(data);
+    {
+      std::lock_guard<std::mutex> lock(deliveredMutex);
+      delivered.emplace_back(
+          packet->getBaseHeader().getSrcQp(),
+          data->getDataHeader().getMsn(),
+          data->getDataHeader().getPosn());
+    }
+    deliveredCv.notify_all();
+    return static_cast<ssize_t>(packet->getSizeBytes());
+  };
+  auto config = std::make_unique<StripedMessageWaveModifierConfig>(
+      ModifierConfig::ModifierFilter(
+          ModifierConfig::ModifierFilter::Direction::Tx,
+          ModifierConfig::ModifierFilter::PacketType::Data,
+          folly::F14FastMap<std::string, FieldConditions>{}),
+      std::nullopt,
+      2,
+      1,
+      8,
+      1000);
+  StripedMessageWaveModifier modifier(std::move(config));
+  const auto submit = [&](uint32_t qp, uint32_t msn, uint16_t posn) {
+    modifier.modifyTxPacketIfMatches(
+        send,
+        std::make_unique<Modifier::TxPacketWithMetadata>(
+            kDefaultRemoteAddr,
+            std::make_unique<DataPacket>(
+                createBaseHeader(BaseHeader::Opcode::OperationType::SEND, qp),
+                createDataHeader(msn * 2 + posn, msn, posn),
+                nullptr,
+                0)));
+  };
+  submit(1, 300, 0);
+  for (uint32_t msn : {100, 101}) {
+    submit(0, msn, 0);
+    submit(0, msn, 1);
+  }
+  {
+    std::lock_guard<std::mutex> lock(deliveredMutex);
+    EXPECT_TRUE(delivered.empty())
+        << "one QP's queued messages must not release another QP's partial wave";
+  }
+  submit(1, 300, 1);
+  {
+    std::unique_lock<std::mutex> lock(deliveredMutex);
+    ASSERT_TRUE(deliveredCv.wait_for(lock, std::chrono::seconds(2), [&] {
+      return delivered.size() == 4;
+    })) << "the first complete wave must release while another message waits";
+  }
+  submit(1, 301, 0);
+  submit(1, 301, 0);
+  submit(1, 301, 1);
+  ASSERT_TRUE(modifier.waitForDrainForTest(std::chrono::seconds(2)))
+      << "a QP that still has a ready message must join the next completed wave";
+  const std::vector<Fragment> expected = {
+      {0, 100, 0},
+      {1, 300, 0},
+      {0, 100, 1},
+      {1, 300, 1},
+      {0, 101, 0},
+      {1, 301, 0},
+      {0, 101, 1},
+      {1, 301, 1}};
+  EXPECT_EQ(delivered, expected)
+      << "staggered readiness and duplicate arrivals must preserve complete waves";
+}
+
+TEST(
+    StripedMessageWaveModifierTest,
+    SendCallbackWorkConsumesTheReleaseInterval) {
+  constexpr uint32_t kReleaseIntervalUs = 100'000;
+  constexpr uint64_t kCallbackWorkNs = 80'000'000;
+  constexpr size_t kPackets = 4;
+  std::vector<uint64_t> sendStarts;
+  SendPacketFn sendFn = [&sendStarts](
+                            const folly::SocketAddress&,
+                            std::unique_ptr<Packet> packet,
+                            std::optional<uint32_t>) {
+    sendStarts.push_back(getNowNs64());
+    const uint64_t workDeadlineNs = steadyNowNs() + kCallbackWorkNs;
+    while (steadyNowNs() < workDeadlineNs) {
+    }
+    return static_cast<ssize_t>(packet->getSizeBytes());
+  };
+  auto config = std::make_unique<StripedMessageWaveModifierConfig>(
+      ModifierConfig::ModifierFilter(
+          ModifierConfig::ModifierFilter::Direction::Tx,
+          ModifierConfig::ModifierFilter::PacketType::Data,
+          folly::F14FastMap<std::string, FieldConditions>{}),
+      std::nullopt,
+      2,
+      1,
+      kPackets,
+      kReleaseIntervalUs);
+  StripedMessageWaveModifier modifier(std::move(config));
+  for (uint32_t qp = 0; qp < 2; ++qp) {
+    for (uint16_t posn = 0; posn < 2; ++posn) {
+      modifier.modifyTxPacketIfMatches(
+          sendFn,
+          std::make_unique<Modifier::TxPacketWithMetadata>(
+              kDefaultRemoteAddr,
+              std::make_unique<DataPacket>(
+                  createBaseHeader(BaseHeader::Opcode::OperationType::SEND, qp),
+                  createDataHeader(posn, 1, posn),
+                  nullptr,
+                  0)));
+    }
+  }
+  ASSERT_TRUE(modifier.waitForDrainForTest(std::chrono::seconds(3)))
+      << "callback work must finish before reading the paced send times";
+  ASSERT_EQ(sendStarts.size(), kPackets)
+      << "the complete wave must deliver every fragment";
+  const uint64_t intervalNs = kReleaseIntervalUs * 1000;
+  for (size_t index = 1; index < sendStarts.size(); ++index) {
+    EXPECT_GE(sendStarts[index] - sendStarts[index - 1], intervalNs)
+        << "callback work must preserve the minimum start-to-start interval";
+  }
+  const uint64_t elapsedNs = sendStarts.back() - sendStarts.front();
+  EXPECT_LT(elapsedNs, (kPackets - 1) * (intervalNs + kCallbackWorkNs / 2))
+      << "start-to-start pacing must spend callback work out of the interval; "
+      << "elapsed_ns=" << elapsedNs;
+}
+
+TEST(
+    StripedMessageWaveModifierTest,
     RecoversSentHeadWhileTailsRemainScheduled) {
   const auto jsonStr = R"({
         "type": "striped_message_wave",
@@ -326,6 +462,7 @@ TEST(StripedMessageWaveModifierTest, RecoverySharesOriginalPacketPacing) {
   SendPacketFn sendFn = [&](const folly::SocketAddress&,
                             std::unique_ptr<Packet> packet,
                             std::optional<uint32_t>) {
+    const uint64_t callbackStartedAtNs = getNowNs64();
     const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
     CHECK(dataPacket);
     const auto& header = dataPacket->getDataHeader();
@@ -336,7 +473,7 @@ TEST(StripedMessageWaveModifierTest, RecoverySharesOriginalPacketPacing) {
           header.getMsn(),
           header.getPosn(),
           header.getIsRetransmit());
-      deliveredAtNs.push_back(getNowNs64());
+      deliveredAtNs.push_back(callbackStartedAtNs);
     }
     deliveredCv.notify_all();
     return static_cast<ssize_t>(packet->getSizeBytes());
@@ -424,6 +561,7 @@ TEST(StripedMessageWaveModifierTest, ShortTailsRetainFullFragmentSpacing) {
   SendPacketFn sendFn = [&](const folly::SocketAddress&,
                             std::unique_ptr<Packet> packet,
                             std::optional<uint32_t>) {
+    const uint64_t callbackStartedAtNs = getNowNs64();
     const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
     CHECK(dataPacket);
     {
@@ -431,7 +569,7 @@ TEST(StripedMessageWaveModifierTest, ShortTailsRetainFullFragmentSpacing) {
       delivered.emplace_back(
           packet->getBaseHeader().getSrcQp(),
           dataPacket->getDataHeader().getPosn());
-      deliveredAtNs.push_back(getNowNs64());
+      deliveredAtNs.push_back(callbackStartedAtNs);
     }
     deliveredCv.notify_all();
     return static_cast<ssize_t>(packet->getSizeBytes());

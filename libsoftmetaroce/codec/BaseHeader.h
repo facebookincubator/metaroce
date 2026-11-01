@@ -124,8 +124,7 @@ class BaseHeader : public Header {
 
     // Opcodes for which a zero-byte payload is forbidden, per spec 8.2.3
     // table "Zero-byte opcodes". A data packet for these opcodes that
-    // arrives with `getPayloadSizeBytes() == 0` must be rejected
-    // (typically with NAK_INVALID_REQUEST).
+    // arrives with `getPayloadSizeBytes() == 0` must be rejected.
     //
     // Spec-permitted (return false): SEND, SEND_IMM_P, SEND_LAST,
     // WRITE_IMM_P, READ_RESP (zero-length read confirms flush of prior

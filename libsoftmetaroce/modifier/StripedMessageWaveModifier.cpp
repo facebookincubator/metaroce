@@ -25,11 +25,11 @@ constexpr uint32_t kRecoveryIntervalMultiplier = 2;
 // Bounds both early timer arming and the final spin on the release thread.
 constexpr uint64_t kMaxPacingWakeLeadNs = 20'000;
 
-void sendWavePacketNoThrow(
+uint64_t sendWavePacketNoThrow(
     StripedMessageWaveState::DelayedSend& send,
     const char* queueName) noexcept {
   try {
-    send();
+    return send();
   } catch (const std::exception& ex) {
     LOG(ERROR) << "StripedMessageWaveModifier: " << queueName
                << " packet send failed: " << ex.what();
@@ -37,6 +37,7 @@ void sendWavePacketNoThrow(
     LOG(ERROR) << "StripedMessageWaveModifier: " << queueName
                << " packet send failed with an unknown exception";
   }
+  return getNowNs64();
 }
 } // namespace
 
@@ -183,6 +184,7 @@ void StripedMessageWaveModifier::enqueuePacket(
                                       packet = std::move(
                                           txPacketData->packet)]() mutable {
                   std::lock_guard<std::mutex> lock(sendTarget->mutex);
+                  const uint64_t sendStartedAtNs = getNowNs64();
                   if (sendTarget->sendPacketFn) {
                     (*sendTarget->sendPacketFn)(
                         address, std::move(packet), std::nullopt);
@@ -191,6 +193,7 @@ void StripedMessageWaveModifier::enqueuePacket(
                         << "StripedMessageWaveModifier: dropping recovery packet after "
                            "send target teardown";
                   }
+                  return sendStartedAtNs;
                 }),
                 static_cast<uint64_t>(config_->releaseIntervalUs) *
                     kRecoveryIntervalMultiplier});
@@ -239,6 +242,7 @@ void StripedMessageWaveModifier::enqueuePacket(
                                          packet = std::move(
                                              txPacketData->packet)]() mutable {
         std::lock_guard<std::mutex> lock(sendTarget->mutex);
+        const uint64_t sendStartedAtNs = getNowNs64();
         if (sendTarget->sendPacketFn) {
           (*sendTarget->sendPacketFn)(address, std::move(packet), std::nullopt);
         } else {
@@ -246,9 +250,14 @@ void StripedMessageWaveModifier::enqueuePacket(
               << "StripedMessageWaveModifier: dropping scheduled packet after send "
                  "target teardown";
         }
+        return sendStartedAtNs;
       }));
   if (message.received == message.packetIds.size()) {
-    state.readyMessagesByQp[qp].push_back(msn);
+    auto& ready = state.readyMessagesByQp[qp];
+    ready.push_back(msn);
+    if (ready.size() == 1) {
+      ++state.qpsWithReadyMessages;
+    }
   }
   releaseReadyMessageWaves();
   if (!state.bypass && state.packets.size() >= config_->maxPendingPackets) {
@@ -261,33 +270,38 @@ void StripedMessageWaveModifier::enqueuePacket(
 
 void StripedMessageWaveModifier::releaseReadyMessageWaves() {
   auto& state = *CHECK_NOTNULL(state_.get());
-  if (state.waveQps.size() != config_->qpCount) {
+  const auto& config = *CHECK_NOTNULL(config_);
+  if (state.waveQps.size() != config.qpCount) {
     return;
   }
-  while (std::all_of(
-      state.waveQps.begin(), state.waveQps.end(), [&state](uint32_t qp) {
-        auto it = state.readyMessagesByQp.find(qp);
-        return it != state.readyMessagesByQp.end() && !it->second.empty();
-      })) {
+  while (state.qpsWithReadyMessages == config.qpCount) {
     std::vector<MessageKey> wave;
     wave.reserve(state.waveQps.size());
     for (uint32_t qp : state.waveQps) {
-      wave.emplace_back(qp, state.readyMessagesByQp.at(qp).front());
+      const auto& ready = state.readyMessagesByQp.at(qp);
+      CHECK(!ready.empty());
+      wave.emplace_back(qp, ready.front());
     }
-    for (uint16_t posn = 0; posn < config_->tailPosn; ++posn) {
+    for (uint16_t posn = 0; posn < config.tailPosn; ++posn) {
       for (const auto& key : wave) {
         queueWavePacket(
             key,
             state.pendingMessages.at(key).packetIds[posn],
-            config_->releaseIntervalUs);
+            config.releaseIntervalUs);
       }
     }
     for (const auto& key : wave) {
       queueWavePacket(
           key,
-          state.pendingMessages.at(key).packetIds[config_->tailPosn],
-          config_->tailReleaseIntervalUs.value_or(config_->releaseIntervalUs));
-      state.readyMessagesByQp.at(key.first).pop_front();
+          state.pendingMessages.at(key).packetIds[config.tailPosn],
+          config.tailReleaseIntervalUs.value_or(config.releaseIntervalUs));
+      auto& ready = state.readyMessagesByQp.at(key.first);
+      CHECK(!ready.empty());
+      ready.pop_front();
+      if (ready.empty()) {
+        CHECK_GT(state.qpsWithReadyMessages, 0);
+        --state.qpsWithReadyMessages;
+      }
       state.pendingMessages.erase(key);
     }
     ++state.releasedWaves;
@@ -388,10 +402,9 @@ void StripedMessageWaveModifier::dispatchWavePacket(
       releaseIntervalUs = scheduled.releaseIntervalUs;
     }
   }
-  sendWavePacketNoThrow(
+  const uint64_t sendStartedAtNs = sendWavePacketNoThrow(
       isRecovery ? *recovery.send : *scheduled.send,
       isRecovery ? "recovery" : "scheduled");
-  const uint64_t sentAtNs = getNowNs64();
   if (isRecovery) {
     state->recoveryPackets.fetch_sub(1, std::memory_order_relaxed);
   } else {
@@ -408,7 +421,8 @@ void StripedMessageWaveModifier::dispatchWavePacket(
       state->releaseArmed = false;
       state->lastSendWasRecovery = false;
     } else {
-      const uint64_t nextNotBeforeNs = sentAtNs + releaseIntervalUs * 1000;
+      const uint64_t nextNotBeforeNs =
+          sendStartedAtNs + releaseIntervalUs * 1000;
       scheduleWavePacket(state, nextNotBeforeNs, releaseIntervalUs);
     }
     if (state->scheduledPackets.load(std::memory_order_relaxed) == 0 &&
@@ -458,6 +472,7 @@ StripedMessageWaveState::DelayedSends StripedMessageWaveModifier::enterBypass(
   state.packets.clear();
   state.pendingMessages.clear();
   state.readyMessagesByQp.clear();
+  state.qpsWithReadyMessages = 0;
   state.waveQps.clear();
   state.completedMessages.clear();
   state.completedMessageOrder.clear();

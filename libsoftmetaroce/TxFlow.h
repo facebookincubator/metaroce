@@ -223,6 +223,7 @@ class TxFlow : public Flow {
   void onRetransmissionTimeout();
 
   void applyRtoRepath();
+  void tryMoveToNextPortPair();
   [[nodiscard]] uint16_t findAlternatePortPair(
       uint16_t activePortSet,
       bool sameLocalOnly) const;

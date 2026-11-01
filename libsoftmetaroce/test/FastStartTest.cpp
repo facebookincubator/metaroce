@@ -45,7 +45,7 @@ TEST_F(FastStartTest, Basic) {
         << " must not stall the probe it is driving";
   }
 
-  // reuse the ack event for a typical, one packet ack.
+  // reuse the ack event for a one-packet ack.
   auto ackEventNoCE = CongestionController::AckEvent{.numAckedPackets = 1};
 
   // Process an ack.  On this ack, the cc will exit fast start,

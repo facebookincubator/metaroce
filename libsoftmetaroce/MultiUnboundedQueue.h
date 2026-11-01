@@ -23,7 +23,7 @@
 #include <set>
 #include <utility>
 
-#include <folly/Format.h>
+#include <fmt/format.h>
 #include <folly/Optional.h>
 #include <folly/concurrency/UnboundedQueue.h>
 #include <folly/coro/BlockingWait.h>
