@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <folly/io/Cursor.h>
+#include <folly/io/IOBufQueue.h>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
@@ -31,8 +33,10 @@
 #include <libsoftmetaroce/codec/Packet.h>
 #include <libsoftmetaroce/codec/ReadWriteHeader.h>
 
+#include <array>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -77,6 +81,31 @@ ReadWritePacket makeWriteImmPacket() {
       /*payloadAddress=*/nullptr,
       /*payloadSizeBytes=*/0,
       /*maybeImmData=*/0);
+}
+
+DataPacket makeSendLastPacket(const void* payload, uint32_t payloadSizeBytes) {
+  return DataPacket(
+      BaseHeader(
+          BaseHeader::Opcode(BaseHeader::Opcode::OperationType::SEND_LAST),
+          /*version=*/1,
+          /*flowId=*/0,
+          /*dstQp=*/1,
+          /*srcQp=*/1),
+      DataHeader(
+          /*fsn=*/0,
+          /*una=*/0,
+          /*tag=*/0,
+          /*ackRequest=*/false,
+          /*isRetransmit=*/false,
+          /*isTimeout=*/false,
+          /*posn=*/0,
+          /*csn=*/0,
+          /*msn=*/0,
+          /*rateHints=*/0,
+          /*timestamp=*/0,
+          /*padding=*/Packet::payloadPadBytes(payloadSizeBytes)),
+      payload,
+      payloadSizeBytes);
 }
 
 TEST(EsunProfileTest, EmptyFlagDoesNotRegisterRule) {
@@ -158,6 +187,33 @@ TEST(EsunProfileTest, EncapsulationMarksEct0) {
   EXPECT_EQ(esun->header().ecn(), kEcnECT0)
       << "spec 6.1 requires data packets to carry ECT(0) so switches can mark "
          "congestion";
+}
+
+TEST(EsunProfileTest, ShortSendKeepsItsLengthThroughEsunFraming) {
+  const auto profile = makeEsunProfile();
+  const auto codec = profile.makeCodec();
+  const auto encapsulation = profile.makeEncapsulation(
+      buildGidEntry(linkLocalCandidate(), kGidTypeEsun));
+  const std::array<uint8_t, 1> payload = {0xAB};
+  const auto packet = makeSendLastPacket(payload.data(), payload.size());
+  folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
+  folly::io::QueueAppender appender(&queue, codec->getSerializedSize(packet));
+  codec->serialize(packet, appender);
+  encapsulation->frameOutgoing(queue, std::nullopt);
+  auto frame = queue.move();
+  frame->coalesce();
+  ASSERT_EQ(frame->length(), kMinimumEthernetFrameSizeBytes)
+      << "precondition: a one-byte send needs minimum-frame fill over ESUN";
+
+  ASSERT_TRUE(encapsulation->deframeIncoming(frame).has_value())
+      << "precondition: the receiver accepts its own ESUN frame";
+  folly::io::Cursor cursor(frame.get());
+  const auto parsed = codec->parse(cursor, *encapsulation);
+  const auto* dataPacket = dynamic_cast<const DataPacket*>(parsed.get());
+  ASSERT_NE(dataPacket, nullptr);
+  EXPECT_EQ(dataPacket->getPayloadSizeBytes(), payload.size())
+      << "spec 5.2.5 makes fill that the Padding field does not count a "
+         "length error, so the sender must count the minimum-frame fill there";
 }
 
 TEST(EsunProfileTest, MtuIncludesEsunFraming) {

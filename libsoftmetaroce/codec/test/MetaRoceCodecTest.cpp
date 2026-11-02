@@ -297,6 +297,110 @@ TEST(MetaRoceCodecTest, SerializationMatchesPacketSerializationForEveryKind) {
   }
 }
 
+TEST(MetaRoceCodecTest, ShortDataPacketCountsMinimumFrameFillInPadding) {
+  constexpr size_t kMinimumPacketSizeBytes = 38;
+  const std::array<uint8_t, 1> payload = {0xAB};
+  const DataPacket packet(
+      makeBaseHeader(BaseHeader::Opcode::OperationType::SEND_LAST),
+      makeDataHeaderWithPadding(Packet::payloadPadBytes(payload.size())),
+      payload.data(),
+      payload.size());
+  ASSERT_LT(packet.getSizeBytes(), kMinimumPacketSizeBytes)
+      << "precondition: the packet must be shorter than the minimum packet size";
+  const MetaRoceCodec codec(kMinimumPacketSizeBytes);
+
+  auto buffer = serializeWithCodec(codec, packet);
+  ASSERT_NE(buffer, nullptr);
+  EXPECT_EQ(buffer->computeChainDataLength(), kMinimumPacketSizeBytes)
+      << "a data packet filled to the minimum leaves the encapsulation no fill "
+         "to add outside the Padding field";
+  EXPECT_EQ(codec.getSerializedSize(packet), buffer->computeChainDataLength())
+      << "the sender sizes its buffer from getSerializedSize, so it must count "
+         "the fill";
+  buffer->coalesce();
+  folly::io::Cursor cursor(buffer.get());
+  auto parsed = codec.parse(cursor, PayloadOnlyEncapsulation());
+  auto* dataPacket = dynamic_cast<DataPacket*>(parsed.get());
+  ASSERT_NE(dataPacket, nullptr);
+  EXPECT_EQ(dataPacket->getPayloadSizeBytes(), payload.size())
+      << "spec 8.2: the receiver derives the payload length from the Padding "
+         "field, so a send's delivered length is exact only if the fill is "
+         "counted there";
+}
+
+TEST(
+    MetaRoceCodecTest,
+    MinimumPacketSizeLeavesNonDataAndFullSizePacketsUnchanged) {
+  constexpr size_t kMinimumPacketSizeBytes = 38;
+  const std::array<uint8_t, 4> payload = {0x11, 0x22, 0x33, 0x44};
+  const AckPacket ack(
+      makeBaseHeader(BaseHeader::Opcode::OperationType::SEL_ACK),
+      AckHeader::AckHeaderBuilder()
+          .setCnpCE(0)
+          .setTag(0)
+          .setCumulativeFsn(1)
+          .setMaxRcvdFsn(2)
+          .setAckStatus(AckStatus::ACK)
+          .setCumulRespDeliveredMsn(3)
+          .setActivePortSet(0)
+          .setRateHints(0)
+          .setTimestamp(4)
+          .build());
+  const ReadWritePacket write(
+      makeBaseHeader(BaseHeader::Opcode::OperationType::WRITE),
+      makeDataHeader(),
+      ReadWriteHeader(0x1122334455667788, 0x99AA, 0xBBCC),
+      payload.data(),
+      payload.size());
+  ASSERT_LT(ack.getSizeBytes(), kMinimumPacketSizeBytes)
+      << "precondition: the ack must be shorter than the minimum packet size";
+  ASSERT_GE(write.getSizeBytes(), kMinimumPacketSizeBytes)
+      << "precondition: the write must already reach the minimum packet size";
+  const MetaRoceCodec codec(kMinimumPacketSizeBytes);
+
+  for (const Packet* packet :
+       {static_cast<const Packet*>(&ack), static_cast<const Packet*>(&write)}) {
+    auto expected = serializePacket(*packet);
+    auto actual = serializeWithCodec(codec, *packet);
+    ASSERT_NE(expected, nullptr);
+    ASSERT_NE(actual, nullptr);
+    EXPECT_EQ(expected->coalesce(), actual->coalesce())
+        << "only a short data packet has a Padding field to count fill in; "
+           "opcode "
+        << packet->getBaseHeader().getOpcode();
+  }
+}
+
+TEST(MetaRoceCodecTest, FilledPacketBytesOutliveSerialization) {
+  constexpr size_t kMinimumPacketSizeBytes = 46;
+  const std::array<uint8_t, 10> payload = {
+      0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19};
+  const DataPacket packet(
+      makeBaseHeader(BaseHeader::Opcode::OperationType::SEND_LAST),
+      makeDataHeaderWithPadding(Packet::payloadPadBytes(payload.size())),
+      payload.data(),
+      payload.size());
+  ASSERT_LT(packet.getSizeBytes(), kMinimumPacketSizeBytes)
+      << "precondition: the packet must be shorter than the minimum size";
+  const MetaRoceCodec codec(kMinimumPacketSizeBytes);
+  folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
+  // One-byte growth leaves too little tailroom to copy the payload into.
+  folly::io::QueueAppender appender(&queue, /*growth=*/1);
+
+  codec.serialize(packet, appender);
+  auto buffer = queue.move();
+  buffer->coalesce();
+  folly::io::Cursor cursor(buffer.get());
+  auto parsed = codec.parse(cursor, PayloadOnlyEncapsulation());
+  auto* dataPacket = dynamic_cast<DataPacket*>(parsed.get());
+  ASSERT_NE(dataPacket, nullptr);
+  std::array<uint8_t, 10> delivered{};
+  dataPacket->deliverPayload(delivered.data(), delivered.size());
+  EXPECT_EQ(delivered, payload)
+      << "the serialized bytes must stay valid after serialize() returns, "
+         "since the sender frames and sends them later";
+}
+
 TEST(MetaRoceCodecTest, FixedSizePacketsAcceptTrailingFrameBytes) {
   using OperationType = BaseHeader::Opcode::OperationType;
   std::vector<std::pair<std::string, std::unique_ptr<Packet>>> packets;

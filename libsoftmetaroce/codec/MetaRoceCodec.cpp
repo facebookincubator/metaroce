@@ -19,6 +19,7 @@
 #include <glog/logging.h>
 #include <libsoftmetaroce/Encapsulation.h>
 #include <libsoftmetaroce/codec/Packet.h>
+#include <cstring>
 
 namespace {
 
@@ -45,14 +46,62 @@ std::unique_ptr<folly::IOBuf> deepCopyPayloadFromCursor(
 
 namespace libsoftmetaroce {
 
+MetaRoceCodec::MetaRoceCodec(size_t minimumPacketSizeBytes)
+    : minimumPacketSizeBytes_{minimumPacketSizeBytes} {
+  CHECK_LE(
+      minimumPacketSizeBytes_,
+      BaseHeader::kBaseHeaderSizeBytes + DataHeader::kDataHeaderSizeBytes +
+          DataHeader::kPaddingMask)
+      << "the Padding field cannot count fill for an empty data packet";
+}
+
+size_t MetaRoceCodec::bytesNeededToFillMinimumFrame(
+    const Packet& packet) const {
+  const size_t sizeBytes = packet.getSizeBytes();
+  if (!packet.getBaseHeader().getOpcode().isData() ||
+      sizeBytes >= minimumPacketSizeBytes_) {
+    return 0;
+  }
+  return minimumPacketSizeBytes_ - sizeBytes;
+}
+
 size_t MetaRoceCodec::getSerializedSize(const Packet& packet) const {
-  return packet.getSizeBytes();
+  return packet.getSizeBytes() + bytesNeededToFillMinimumFrame(packet);
 }
 
 void MetaRoceCodec::serialize(
     const Packet& packet,
     folly::io::QueueAppender& appender) const {
-  packet.serialize(appender);
+  const size_t fillBytes = bytesNeededToFillMinimumFrame(packet);
+  if (fillBytes > 0) {
+    serializeToMinimumFrame(packet, fillBytes, appender);
+  } else {
+    packet.serialize(appender);
+  }
+}
+
+void MetaRoceCodec::serializeToMinimumFrame(
+    const Packet& packet,
+    size_t fillBytes,
+    folly::io::QueueAppender& appender) const {
+  auto filled = packet.clone();
+  auto& dataPacket = *CHECK_NOTNULL(dynamic_cast<DataPacket*>(filled.get()));
+  dataPacket.getDataHeader().setPadding(
+      static_cast<uint8_t>(
+          Packet::payloadPadBytes(dataPacket.getPayloadSizeBytes()) +
+          fillBytes));
+  // The clone's payload is freed on return, so its bytes are copied into the
+  // output.
+  folly::IOBufQueue filledBytes{folly::IOBufQueue::cacheChainLength()};
+  folly::io::QueueAppender filledAppender{
+      &filledBytes, minimumPacketSizeBytes_};
+  filled->serialize(filledAppender);
+  for (const auto range : *filledBytes.front()) {
+    appender.push(range.data(), range.size());
+  }
+  appender.ensure(fillBytes);
+  std::memset(appender.writableData(), 0, fillBytes);
+  appender.append(fillBytes);
 }
 
 std::unique_ptr<Packet> MetaRoceCodec::parse(

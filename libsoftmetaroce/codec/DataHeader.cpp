@@ -35,6 +35,12 @@ DataHeader::DataHeader(folly::io::Cursor& cursor) {
   timestamp_ = cursor.readBE<uint32_t>();
 }
 
+void DataHeader::setPadding(uint8_t padding) {
+  CHECK_LE(padding, kPaddingMask)
+      << "the Padding field is four bits wide on the wire";
+  padding_ = padding;
+}
+
 DataHeader::DataHeaderBuilder&& DataHeader::DataHeaderBuilder::setFsn(
     uint16_t fsn) {
   maybeFsn_ = fsn;

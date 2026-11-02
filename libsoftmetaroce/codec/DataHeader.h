@@ -145,6 +145,10 @@ class DataHeader : public Header {
     timestamp_ = timestamp;
   }
 
+  // Unlike the fields above, the Padding count depends on the output
+  // encapsulation's minimum frame.
+  void setPadding(uint8_t padding);
+
   void write(folly::io::QueueAppender& appender) const override;
 
   class DataHeaderBuilder {

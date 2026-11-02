@@ -75,7 +75,11 @@ std::unique_ptr<Encapsulation> makeEsunEncapsulation(
 EgressProfile makeEsunProfile() {
   EgressProfile profile{
       .socketKind = SocketKind::RAW,
-      .makeCodec = [] { return std::make_unique<MetaRoceCodec>(); },
+      .makeCodec =
+          [] {
+            return std::make_unique<MetaRoceCodec>(
+                EsunEncapsulation::kMinimumPacketSizeBytes);
+          },
       .makeEncapsulation = makeEsunEncapsulation,
       .validateMtu =
           [](const ibv_gid_entry& entry, uint16_t qpMtuBytes) {
