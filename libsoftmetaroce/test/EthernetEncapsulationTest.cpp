@@ -18,8 +18,10 @@
 #include <folly/io/IOBufQueue.h>
 #include <gtest/gtest.h>
 #include <libsoftmetaroce/Constants.h>
+#include <libsoftmetaroce/EgressProfile.h>
 #include <libsoftmetaroce/EthernetEncapsulation.h>
 #include <libsoftmetaroce/codec/BaseHeader.h>
+#include <libsoftmetaroce/codec/Codec.h>
 #include <libsoftmetaroce/codec/DataHeader.h>
 #include <libsoftmetaroce/codec/Packet.h>
 #include <algorithm>
@@ -152,18 +154,12 @@ TEST_F(
     std::string_view payload;
     uint8_t paddingBeforeFraming;
     uint8_t expectedPadding;
-    size_t expectedFramingPadding;
   };
   constexpr std::array<TestCase, 2> kTestCases{{
-      {.payload = "",
-       .paddingBeforeFraming = 0,
-       .expectedPadding = 14,
-       .expectedFramingPadding = 14},
-      {.payload = "x",
-       .paddingBeforeFraming = 3,
-       .expectedPadding = 13,
-       .expectedFramingPadding = 10},
+      {.payload = "", .paddingBeforeFraming = 0, .expectedPadding = 14},
+      {.payload = "x", .paddingBeforeFraming = 3, .expectedPadding = 13},
   }};
+  const auto codec = makeMetaRoceEthernetProfile().makeCodec();
 
   for (const auto& testCase : kTestCases) {
     SCOPED_TRACE(
@@ -190,8 +186,8 @@ TEST_F(
         testCase.payload.data(),
         testCase.payload.size()};
     folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
-    folly::io::QueueAppender appender{&queue, packet.getSizeBytes()};
-    packet.serialize(appender);
+    folly::io::QueueAppender appender{&queue, codec->getSerializedSize(packet)};
+    codec->serialize(packet, appender);
 
     const size_t added = encap_.frameOutgoing(queue, std::nullopt);
     auto frame = queue.move();
@@ -199,8 +195,9 @@ TEST_F(
 
     EXPECT_EQ(frame->length(), kMinimumEthernetFrameSizeBytes)
         << "a short data frame should reach the Ethernet minimum";
-    EXPECT_EQ(added, kEthernetHeaderSize + testCase.expectedFramingPadding)
-        << "framing should report the Ethernet header and added padding";
+    EXPECT_EQ(added, kEthernetHeaderSize)
+        << "the profile's codec fills the packet to the minimum, leaving "
+           "framing no fill to add outside the Padding field";
 
     folly::io::Cursor cursor{frame.get()};
     cursor.skip(kEthernetHeaderSize);
@@ -216,6 +213,16 @@ TEST_F(
     EXPECT_EQ(
         std::count(padding.begin(), padding.end(), uint8_t{0}), padding.size())
         << "minimum-frame padding should be zero-filled";
+
+    ASSERT_TRUE(encap_.deframeIncoming(frame).has_value())
+        << "precondition: the receiver accepts its own Ethernet frame";
+    folly::io::Cursor parseCursor{frame.get()};
+    const auto parsed = codec->parse(parseCursor, encap_);
+    const auto* dataPacket = dynamic_cast<const DataPacket*>(parsed.get());
+    ASSERT_NE(dataPacket, nullptr);
+    EXPECT_EQ(dataPacket->getPayloadSizeBytes(), testCase.payload.size())
+        << "the receiver derives the payload length from the Padding field, so "
+           "a short send keeps its exact length";
   }
 }
 
