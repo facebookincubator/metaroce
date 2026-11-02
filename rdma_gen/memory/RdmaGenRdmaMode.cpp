@@ -21,7 +21,7 @@
 
 #include <glog/logging.h>
 
-#include <fmt/core.h>
+#include <fmt/format.h>
 
 namespace facebook::neteng::ai::rdma_gen {
 

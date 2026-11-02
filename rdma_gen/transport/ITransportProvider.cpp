@@ -16,7 +16,7 @@
 
 #include "rdma_gen/transport/ITransportProvider.h"
 
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <glog/logging.h>
 
 namespace facebook::neteng::ai::rdma_gen {

@@ -25,7 +25,7 @@
 #include <string>
 #include <string_view>
 
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <folly/Synchronized.h>
 
 #ifdef RDMA_GEN_OSS
@@ -345,3 +345,13 @@ struct hash<facebook::neteng::ai::rdma_gen::StrongType<T, Parameter>> {
 };
 
 } // namespace std
+
+template <typename T, typename Parameter>
+struct fmt::formatter<facebook::neteng::ai::rdma_gen::StrongType<T, Parameter>>
+    : fmt::formatter<T> {
+  auto format(
+      const facebook::neteng::ai::rdma_gen::StrongType<T, Parameter>& s,
+      fmt::format_context& ctx) const {
+    return fmt::formatter<T>::format(s.getValue(), ctx);
+  }
+};

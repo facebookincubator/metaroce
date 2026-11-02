@@ -15,6 +15,7 @@
  */
 
 #include "rdma_gen/memory/GpuMemory.h"
+#include <fmt/format.h>
 
 namespace facebook::neteng::ai::rdma_gen {
 
@@ -32,13 +33,14 @@ void GpuMemory::initGpu() {
     return;
   }
   CUresult error = (CUresult)res;
-  CHECK_EQ(error, CUDA_SUCCESS) << fmt::format("cuInit(0) returned: {}", error);
+  CHECK_EQ(error, CUDA_SUCCESS)
+      << fmt::format("cuInit(0) returned: {}", fmt::underlying(error));
 
   int deviceCount = 0;
   error = cuDeviceGetCount(&deviceCount);
 
   CHECK_EQ(error, CUDA_SUCCESS)
-      << fmt::format("cuDeviceGetCount() returned: {}", error);
+      << fmt::format("cuDeviceGetCount() returned: {}", fmt::underlying(error));
   CHECK_NE(deviceCount, 0)
       << "There are no available device(s) that support CUDA";
   CHECK_LT(params_.gpu_idx, deviceCount) << fmt::format(
@@ -48,20 +50,20 @@ void GpuMemory::initGpu() {
   for (index = 0; index < deviceCount; index++) {
     error = cuDeviceGet(&cu_device, index);
     CHECK_EQ(error, CUDA_SUCCESS)
-        << fmt::format("cuDeviceGet() returned: {}", error);
+        << fmt::format("cuDeviceGet() returned: {}", fmt::underlying(error));
 
     error = cuDeviceGetAttribute(
         &cuda_pci_bus_id, CU_DEVICE_ATTRIBUTE_PCI_BUS_ID, cu_device);
     CHECK_EQ(error, CUDA_SUCCESS) << fmt::format(
         "cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_PCI_BUS_ID) returned: {} for cu_device={}",
-        error,
+        fmt::underlying(error),
         cu_device);
 
     error = cuDeviceGetAttribute(
         &cuda_pci_device_id, CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID, cu_device);
     CHECK_EQ(error, CUDA_SUCCESS) << fmt::format(
         "cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_PCI_DEVICE_ID) returned: {} for cuda_pci_device_id={}",
-        error,
+        fmt::underlying(error),
         cuda_pci_device_id);
     LOG(INFO) << fmt::format(
         "CUDA device: {} PCIe address is {}:{}",
@@ -73,12 +75,12 @@ void GpuMemory::initGpu() {
   LOG(INFO) << fmt::format("Picking device: {}", params_.gpu_idx);
   error = cuDeviceGet(&cuDevice_, params_.gpu_idx);
   CHECK_EQ(error, CUDA_SUCCESS)
-      << fmt::format("cuDeviceGet() returned: {}", error);
+      << fmt::format("cuDeviceGet() returned: {}", fmt::underlying(error));
 
   std::array<char, 128> name{};
   error = cuDeviceGetName(std::data(name), sizeof(name), params_.gpu_idx);
   CHECK_EQ(error, CUDA_SUCCESS)
-      << fmt::format("cuDeviceGetName() returned: {}", error);
+      << fmt::format("cuDeviceGetName() returned: {}", fmt::underlying(error));
 
   LOG(INFO) << fmt::format("Picking device: {}", params_.gpu_idx);
   LOG(INFO) << fmt::format(
@@ -95,11 +97,11 @@ void GpuMemory::initGpu() {
   error = cuCtxCreate(&ctx()->cuContext, CU_CTX_MAP_HOST, cuDevice_);
 #endif
   CHECK_EQ(error, CUDA_SUCCESS)
-      << fmt::format("cuCtxCreate() returned: {}", error);
+      << fmt::format("cuCtxCreate() returned: {}", fmt::underlying(error));
 
   error = cuCtxSetCurrent(ctx()->cuContext);
   CHECK_EQ(error, CUDA_SUCCESS)
-      << fmt::format("cuCtxCSetCurrent() returned: {}", error);
+      << fmt::format("cuCtxCSetCurrent() returned: {}", fmt::underlying(error));
   return;
 #else
   throw std::runtime_error("rdma_gen compiled without CUDA");
