@@ -110,6 +110,16 @@ WorkCompletionStatus ackStatusToWorkCompletionStatus(AckStatus ackStatus) {
   });
 }
 
+// Slow-receiver mode raises the RTO ceiling unless the operator set one.
+uint64_t resolveMaxRtoNs(uint64_t defaultMaxRtoNs) {
+  const bool maxRtoIsDefault =
+      gflags::GetCommandLineFlagInfoOrDie("libsoftmetaroce_max_rto_us")
+          .is_default;
+  return FLAGS_libsoftmetaroce_slow_receiver && maxRtoIsDefault
+      ? kSlowReceiverMaxRtoNs
+      : defaultMaxRtoNs;
+}
+
 } // namespace
 
 TxFlow::TxFlow(
@@ -121,7 +131,9 @@ TxFlow::TxFlow(
     SackRetransmissionConfig sackRetxConfig)
     : Flow(qp, flowId, socketId, portPairIdx),
       qpRetxTimer_{qpRetxTimer},
-      sackRetxConfig_{sackRetxConfig} {
+      sackRetxConfig_{sackRetxConfig},
+      minRtoNs_{uint64_t{FLAGS_libsoftmetaroce_min_rto_us} * kNsPerUs},
+      maxRtoNs_{resolveMaxRtoNs(kDefaultMaxRtoNs)} {
   retxTimerCallback_ = std::make_unique<HighResTimer::Callback>(
       [this]() { onRetransmissionTimeout(); });
   txState_.estRttNs = FLAGS_libsoftmetaroce_initial_est_rtt_us * kNsPerUs;
@@ -148,6 +160,8 @@ TxFlow::TxFlow(TxFlow&& other) noexcept
     : Flow(other),
       qpRetxTimer_{other.qpRetxTimer_},
       sackRetxConfig_{other.sackRetxConfig_},
+      minRtoNs_{other.minRtoNs_},
+      maxRtoNs_{other.maxRtoNs_},
       txState_{std::move(other.txState_)},
       consecutiveRtosWithoutAck_{other.consecutiveRtosWithoutAck_.load()},
       lastConsumedRtoCount_{other.lastConsumedRtoCount_} {
@@ -170,17 +184,12 @@ TxFlow::~TxFlow() {
 uint32_t TxFlow::computeRtoIntervalUs() const {
   unsigned int exponent = std::min(
       kMaxRtoBackoffExponent, (unsigned int)consecutiveRtosWithoutAck_);
-  const auto maxRtoNs = FLAGS_libsoftmetaroce_slow_receiver &&
-          gflags::GetCommandLineFlagInfoOrDie("libsoftmetaroce_max_rto_us")
-              .is_default
-      ? kSlowReceiverMaxRtoNs
-      : kDefaultMaxRtoNs;
   const auto rtoNs = std::max(
-      (unsigned long)FLAGS_libsoftmetaroce_min_rto_us * kNsPerUs,
+      minRtoNs_,
       std::min(
-          (unsigned long)(txState_.estRttNs + (txState_.mdevRttNs << 2))
+          static_cast<uint64_t>(txState_.estRttNs + (txState_.mdevRttNs << 2))
               << exponent,
-          maxRtoNs));
+          maxRtoNs_));
   // RTO timeout precision is in microseconds
   // @lint-ignore CLANGTIDY clang-diagnostic-shorten-64-to-32
   return rtoNs / kNsPerUs;

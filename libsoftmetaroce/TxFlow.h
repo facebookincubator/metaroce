@@ -295,6 +295,8 @@ class TxFlow : public Flow {
 
   // Configuration.
   const SackRetransmissionConfig sackRetxConfig_;
+  const uint64_t minRtoNs_;
+  const uint64_t maxRtoNs_;
 
   // Protocol / runtime state.
   TxState txState_;
