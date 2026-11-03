@@ -786,14 +786,14 @@ std::optional<AckHeader> RxFlow::processDataPacket(
   if (genAck) {
     const uint8_t ackTag =
         qp_.containsTag(dataHeader.getTag()) ? dataHeader.getTag() : 0;
-    auto ackTagPtr = qp_.getTag(ackTag);
+    const Tag& ackingTag = qp_.existingTag(ackTag);
     auto ackHeaderBuilder = AckHeader::AckHeaderBuilder()
                                 .setCnpCE(rxState_.getAndClearReceivedCeCount())
                                 .setTag(ackTag)
                                 .setCumulativeFsn(rxState_.rcvNxt - 1)
                                 .setMaxRcvdFsn(rxState_.maxRcvdFsn)
                                 .setTimestamp(dataHeader.getTimestamp())
-                                .setCumulRespDeliveredMsn(ackTagPtr->getCDMSN())
+                                .setCumulRespDeliveredMsn(ackingTag.getCDMSN())
                                 .setRateHints(qp_.getPerQpRateGbps());
 
     if (rxState_.rcvBitmap.empty()) {

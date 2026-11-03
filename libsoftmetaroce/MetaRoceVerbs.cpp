@@ -2218,13 +2218,13 @@ struct ibv_qp* FOLLY_NULLABLE MetaRoceVerbs::ibv_create_qp(
           sendQueueDepth,
           receiveQueueDepth,
           sharedReceiveQueue);
-      const auto tag = qp->getTag(kMetaRoceInitialTag);
+      const Tag& tag = qp->existingTag(kMetaRoceInitialTag);
       initialTagConfig = {
           .localQpNum = thisQpn,
           .tag = kMetaRoceInitialTag,
-          .sendCsn = tag->getNextCsn(),
-          .receiveCsn = tag->getNextRxCsn(),
-          .sendMsn = tag->getNextMsn()};
+          .sendCsn = tag.getNextCsn(),
+          .receiveCsn = tag.getNextRxCsn(),
+          .sendMsn = tag.getNextMsn()};
       lockedQpMap->insert({thisQpn, std::move(qp)});
     } catch (const std::bad_alloc&) {
       return nullSettingErrno(ENOMEM);
@@ -2462,7 +2462,7 @@ void MetaRoceVerbs::tearDownQp(std::unique_ptr<Qp> qp) {
   Qp& queuePair = *CHECK_NOTNULL(qp.get());
   std::vector<std::reference_wrapper<struct ibv_qp>> ibvQps;
   for (auto t : queuePair.getTagNums()) {
-    ibvQps.emplace_back(queuePair.getTag(t)->getIbvQp());
+    ibvQps.emplace_back(queuePair.existingTag(t).getIbvQp());
   }
   // Wait out any reader still holding a Qp* read before the erase. Drain off
   // receiversMutex_ (drainInFlightReceives() blocks cross-thread); the

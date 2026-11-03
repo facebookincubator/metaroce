@@ -205,6 +205,10 @@ class Qp {
     return tagSet_.getTagByNumber(tagNum);
   }
 
+  [[nodiscard]] Tag& existingTag(uint8_t tagNum) const {
+    return *CHECK_NOTNULL(tagSet_.getTagByNumber(tagNum).get());
+  }
+
   void addTag(
       uint8_t tagNum,
       CompletionQueue* sendCq,
