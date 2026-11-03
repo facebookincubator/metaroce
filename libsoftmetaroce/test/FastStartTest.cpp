@@ -212,6 +212,57 @@ TEST_F(FastStartTest, ACongestionMarkEndsFastStartWithNothingToSend) {
          "data left to send";
 }
 
+TEST_F(FastStartTest, FastStartEndsAtTheInitialQwndMax) {
+  gflags::FlagSaver flagSaver;
+  constexpr int kInitialQwndMax = 3;
+  FLAGS_libsoftmetaroce_initial_qwnd_max = kInitialQwndMax;
+  FastStart cc;
+  cc.onFlowAdded(0);
+
+  for (int i = 0; i < kInitialQwndMax - 1; ++i) {
+    sendNext(cc);
+  }
+  ASSERT_TRUE(cc.flowForNextSend().has_value())
+      << "precondition: fast start runs while qwnd is below the initial qwnd "
+         "max";
+
+  sendNext(cc);
+  EXPECT_FALSE(cc.flowForNextSend().has_value())
+      << "fast start should end once qwnd reaches the initial qwnd max; qwnd "
+         "is "
+      << cc.getQwnd();
+}
+
+/*
+ * A message of exactly the initial qwnd max fills the window, which stays
+ * closed until acks arrive. Once the message is fully acked, the next message
+ * must find window right away.
+ */
+TEST_F(FastStartTest, AMessageFillingTheInitialQwndMaxDoesNotStallTheNext) {
+  gflags::FlagSaver flagSaver;
+  constexpr int kInitialQwndMax = 4;
+  FLAGS_libsoftmetaroce_initial_qwnd_max = kInitialQwndMax;
+  FastStart cc;
+  cc.onFlowAdded(0);
+  for (int i = 0; i < kInitialQwndMax; ++i) {
+    cc.onPacketSent(0);
+  }
+  EXPECT_EQ(cc.getAvailableWindowSize(0), 0)
+      << "every packet of the initial qwnd max is in flight, so the flow "
+         "must wait for an ack before sending more; qwnd is "
+      << cc.getQwnd() << " and fwnd " << cc.getFwnd(0);
+
+  cc.onPacketAck(
+      0,
+      CongestionController::AckEvent{
+          .numAckedPackets = kInitialQwndMax, .sendPending = false});
+
+  EXPECT_GT(cc.getAvailableWindowSize(0), 0)
+      << "the acks free the whole window, so the next message can be sent "
+         "right away; qwnd is "
+      << cc.getQwnd() << " and fwnd " << cc.getFwnd(0);
+}
+
 /*
  * After the opening burst, runs are as long as the sender asked for -- so a
  * coalescing sender keeps a run together rather than having it spread a packet
