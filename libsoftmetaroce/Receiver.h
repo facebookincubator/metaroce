@@ -95,6 +95,10 @@ class Receiver : public PacketModifierSocket::ReadCallback,
   // from off the reader threads.
   void drainInFlightReceives();
 
+  [[nodiscard]] uint64_t getUnsupportedVersionDiscardCount() const {
+    return unsupportedVersionDiscards_.load(std::memory_order_relaxed);
+  }
+
   // Test-only: a reader's EventBase, so tests drive the receive path on the
   // thread that owns the reader sockets (matching production).
   folly::EventBase& readerEventBaseForTest(size_t index = 0) {
@@ -206,6 +210,9 @@ class Receiver : public PacketModifierSocket::ReadCallback,
   // A modifier's timer thread costs the reader threads their exclusion just as
   // a second reader would. Set per reader; multiReader_ short-circuits it.
   bool modifierDefersReceive_{false};
+
+  // Counters.
+  std::atomic<uint64_t> unsupportedVersionDiscards_{0};
 
   [[nodiscard]] uint16_t loadActivePortSet() const {
     return activePortSet_ ? activePortSet_->load(std::memory_order_relaxed) : 0;

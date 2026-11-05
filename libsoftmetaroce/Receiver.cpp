@@ -360,6 +360,13 @@ void Receiver::processIngress(
     return;
   }
 
+  if (rxBaseHeader.getVersion() != kMetaRoceProtocolVersion) {
+    unsupportedVersionDiscards_.fetch_add(1, std::memory_order_relaxed);
+    LOG_FIRST_N(WARNING, 10) << "discarding packet with version "
+                             << static_cast<int>(rxBaseHeader.getVersion());
+    return;
+  }
+
   const auto qpn = rxBaseHeader.getDstQp();
 
   // check for control packets and handle them early, as we may want to treat

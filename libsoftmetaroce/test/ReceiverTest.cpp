@@ -381,6 +381,10 @@ class MockHrnrReceiver {
         [&] { readCallback->onDataAvailable(std::move(ingressPacket)); });
   }
 
+  [[nodiscard]] const Receiver& receiver() const {
+    return *receiver_;
+  }
+
  private:
   std::unique_ptr<Receiver> receiver_;
 };
@@ -812,6 +816,54 @@ TEST_F(ReceiverTest, APacketFromAnotherSourceQpIsDiscardedSilently) {
          "the message's state";
   EXPECT_EQ(std::memcmp(recvBuffer, payload, kSize), 0)
       << "the responder should scatter the connected queue pair's data";
+}
+
+TEST_F(ReceiverTest, APacketWithANonzeroVersionIsDiscardedAndCounted) {
+  constexpr uint32_t kSize = 64;
+  char recvBuffer[kSize] = {};
+  postReceiveWqe(recvBuffer, kSize);
+  char payload[kSize];
+  std::memset(payload, 'V', kSize);
+
+  EXPECT_CALL(*mockSocket_, write(_, _)).Times(0);
+
+  auto versionedPacket = buildTestDataPacket(
+      srcQp, dstQp, flowId, fsn, msn, /*tag=*/0, /*posn=*/0, payload, kSize);
+  versionedPacket->getBaseHeader().setVersion(1);
+  mockReceiver_->simulateReceivePacket(std::move(versionedPacket), kEcnECT0);
+
+  EXPECT_EQ(mockReceiver_->receiver().getUnsupportedVersionDiscardCount(), 1)
+      << "A packet with a nonzero version must be counted";
+  {
+    auto lockedMap = qpNumToQp_.rlock();
+    EXPECT_EQ(
+        lockedMap->at(dstQp)->getRxFlowById(flowId)->getNextAckToSend(),
+        nullptr)
+        << "the responder should not acknowledge a packet of a version it "
+           "does not implement";
+  }
+  EXPECT_EQ(cq->getNumCompletedWqes(), 0)
+      << "the responder should deliver nothing from that packet";
+  EXPECT_NE(ibvQpStorage.state, IBV_QPS_ERR)
+      << "the responder should leave the queue pair running";
+
+  mockReceiver_->simulateReceivePacket(
+      buildTestDataPacket(
+          srcQp,
+          dstQp,
+          flowId,
+          fsn,
+          msn,
+          /*tag=*/0,
+          /*posn=*/0,
+          payload,
+          kSize),
+      kEcnECT0);
+  EXPECT_EQ(cq->getNumCompletedWqes(), 1)
+      << "the same fsn at version zero should still be delivered, so the "
+         "discarded packet consumed none of the flow's or the message's state";
+  EXPECT_EQ(mockReceiver_->receiver().getUnsupportedVersionDiscardCount(), 1)
+      << "a version-zero packet should not be counted as discarded";
 }
 
 TEST_F(ReceiverTest, AReadOfARegionWithoutRemoteReadGetsAnAddressNak) {
