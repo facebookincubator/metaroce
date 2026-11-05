@@ -62,6 +62,7 @@ set(LSMR_TEST_SRCS
     PingControllerTest.cpp
     PingReceiverTest.cpp
     QpArbiterTest.cpp
+    QpPacerTest.cpp
     QpTest.cpp
     QpWithTagsTest.cpp
     RcnRateHintTest.cpp

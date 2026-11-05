@@ -201,6 +201,7 @@ set(LSMR_LIB_SRCS
     ProtocolCompatibility.cpp
     Qp.cpp
     QpArbiter.cpp
+    QpPacer.cpp
     RawEthernetSocket.cpp
     RawPacketSocket.cpp
     RcnRateHint.cpp
@@ -288,6 +289,7 @@ set(LSMR_LIB_SRCS
     Qp.h
     QpArbiter.h
     QpArbiterIface.h
+    QpPacer.h
     QpState.h
     ReceiveSequence.h
     RawEncapsulation.h
