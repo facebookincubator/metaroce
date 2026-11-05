@@ -37,15 +37,15 @@ class WrrScheduler {
  public:
   WrrScheduler() = default;
 
-  // Next entry holding visits over [begin, end), from after `cursor_` with
-  // wrap. Refills every entry first when none holds visits.
+  // Returns the next entry holding visits, starting after the entry last served
+  // or skipped. Refills every entry first when none holds visits.
   template <typename SchedProj>
   EntryIt select(EntryIt begin, EntryIt end, SchedProj proj) {
     return select(begin, end, proj, [](const auto&) { return false; });
   }
 
-  // The same, skipping each entry `excluded` matches: such an entry is neither
-  // chosen nor refilled. End when every entry is excluded.
+  // Skips each entry `excluded` matches, neither choosing nor refilling it.
+  // Returns end when every entry is excluded.
   template <typename SchedProj, typename Excluded>
   EntryIt
   select(EntryIt begin, EntryIt end, SchedProj proj, Excluded excluded) {
@@ -63,8 +63,8 @@ class WrrScheduler {
     return nextEligible(begin, end, proj, excluded).value_or(end);
   }
 
-  // The same choice without the refill, for readiness peeks: it identifies
-  // the next candidate even when the round is spent.
+  // This is a non-mutating select(): it returns the same entry while any entry
+  // holds visits, and the first entry otherwise.
   template <typename SchedProj>
   EntryIt peek(EntryIt begin, EntryIt end, SchedProj proj) const {
     if (begin == end) {
@@ -75,14 +75,12 @@ class WrrScheduler {
         .value_or(begin);
   }
 
-  // The entry must be live: callers pass only what select returned.
+  // The entry must be one select() returned and still in the collection.
   template <typename SchedProj>
   void noteServed(EntryIt it, SchedProj proj) {
     proj(*it).decrementVisits();
     cursor_ = it;
   }
-
-  // The entry must be live: callers pass only what select returned.
   template <typename SchedProj>
   void noteSkipped(EntryIt it, SchedProj proj) {
     proj(*it).forfeitVisits();
@@ -90,8 +88,6 @@ class WrrScheduler {
   }
 
  private:
-  // First eligible entry, holding visits and not matching `excluded`, from
-  // after `cursor_` with wrap.
   template <typename SchedProj, typename Excluded>
   std::optional<EntryIt> nextEligible(
       EntryIt begin,
