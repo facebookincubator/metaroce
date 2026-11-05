@@ -2012,6 +2012,13 @@ int MetaRoceVerbs::ibv_modify_qp(
   return 0;
 }
 
+int MetaRoceVerbs::ibv_modify_qp_rate_limit(
+    struct ibv_qp* /*ibvqp*/,
+    struct ibv_qp_rate_limit_attr* /*attr*/) {
+  LOG(ERROR) << "libsoftmetaroce does not support ibv_modify_qp_rate_limit";
+  return withErrno(EOPNOTSUPP);
+}
+
 namespace {
 ibv_qp_cap negotiatedCap(const Tag& tag) {
   return {

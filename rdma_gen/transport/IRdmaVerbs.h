@@ -98,6 +98,10 @@ class IRdmaVerbs {
   virtual int
   ibv_modify_qp(struct ibv_qp* qp, struct ibv_qp_attr* attr, int attr_mask) = 0;
 
+  virtual int ibv_modify_qp_rate_limit(
+      struct ibv_qp* qp,
+      struct ibv_qp_rate_limit_attr* attr) = 0;
+
   virtual int ibv_query_gid(
       struct ibv_context* context,
       uint8_t port_num,

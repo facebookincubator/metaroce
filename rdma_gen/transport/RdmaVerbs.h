@@ -134,6 +134,12 @@ class RdmaVerbs : public IRdmaVerbs {
     return ::ibv_modify_qp(qp, attr, attr_mask);
   }
 
+  int ibv_modify_qp_rate_limit(
+      struct ibv_qp* qp,
+      struct ibv_qp_rate_limit_attr* attr) override {
+    return ::ibv_modify_qp_rate_limit(qp, attr);
+  }
+
   int ibv_query_gid(
       struct ibv_context* context,
       uint8_t port_num,

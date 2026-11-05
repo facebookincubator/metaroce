@@ -164,6 +164,9 @@ class MetaRoceVerbs : public RdmaVerbs, public folly::NonCopyableNonMovable {
       int access) override;
   int ibv_modify_qp(struct ibv_qp* qp, struct ibv_qp_attr* attr, int attr_mask)
       override;
+  int ibv_modify_qp_rate_limit(
+      struct ibv_qp* qp,
+      struct ibv_qp_rate_limit_attr* attr) override;
   int ibv_query_qp(
       struct ibv_qp* qp,
       struct ibv_qp_attr* attr,
