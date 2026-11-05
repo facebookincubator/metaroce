@@ -34,17 +34,18 @@ struct QpAttributeDeadlines {
   std::chrono::milliseconds watchdogIntervalMs;
 };
 
-// The exponent and retry count that derive `intervalMs`, saturating where the
-// ceiling and IBTA's three-bit retry count cannot reach it.
 struct QpAttributesForInterval {
   uint8_t localAckTimeoutExponent;
   uint8_t retryCount;
 };
+
+// Returns a pair that deadlinesFromQpAttributes() maps to at least the
+// interval. Saturates where no legal pair reaches the interval.
 [[nodiscard]] QpAttributesForInterval qpAttributesForInterval(
     std::chrono::milliseconds intervalMs);
 
-// The deadline a QP tolerates without progress. The zero exponent asks for no
-// timeout and gets kDisabledTimeoutWatchdogMs rather than none at all.
+// Returns kDisabledTimeoutWatchdogMs for a zero exponent. Cuts an exponent
+// above kLocalAckTimeoutExponentCeiling to that ceiling.
 [[nodiscard]] QpAttributeDeadlines deadlinesFromQpAttributes(
     uint8_t localAckTimeoutExponent,
     uint8_t retryCount);
@@ -56,47 +57,33 @@ class WatchdogTimer {
  public:
   WatchdogTimer();
 
-  // Record that progress was made (e.g., when a packet is ACKed).
-  // Thread-safe.
   void recordProgress();
 
-  // Records progress as of a moment the caller specifies, so a caller keeping
-  // its own clock reaches expiry without waiting out the interval. Thread-safe.
+  // Replaces the last progress time even with an earlier moment.
   void recordProgressAt(std::chrono::steady_clock::time_point at);
 
-  // Returns true if the time since last progress exceeds the watchdog interval.
-  // Thread-safe.
   [[nodiscard]] bool hasExpired() const;
 
-  // Configures the interval hasExpired() measures against, instead of the
-  // libsoftmetaroce_qp_watchdog_interval_ms flag. Thread-safe.
+  // Overrides libsoftmetaroce_qp_watchdog_interval_ms for this watchdog.
   void configureInterval(std::chrono::milliseconds intervalMs);
 
-  // The interval hasExpired() measures against, floored and never below
-  // kMinWatchdogIntervalMs. Thread-safe.
+  // Returns at least kMinWatchdogIntervalMs.
   [[nodiscard]] std::chrono::milliseconds getIntervalMs() const;
 
-  // Try to claim the right to handle expiry. Returns true if this caller
-  // should handle the expiry, false if another caller already claimed it.
-  // This ensures only one expiry handler runs even if multiple timer callbacks
-  // detect the expiry simultaneously.
-  // Thread-safe.
+  // Returns true only to the first caller, which handles the expiry. Handling
+  // can take long enough for several timer callbacks to see the expiry.
   [[nodiscard]] bool tryClaimExpiry();
 
-  // Get the last progress time for debugging/logging.
-  // Thread-safe.
   [[nodiscard]] std::chrono::steady_clock::time_point getLastProgressTime()
       const;
 
  private:
-  // Convert time_point to int64_t nanoseconds for atomic storage
   static constexpr int64_t toNanos(std::chrono::steady_clock::time_point tp) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(
                tp.time_since_epoch())
         .count();
   }
 
-  // Convert int64_t nanoseconds back to time_point
   static constexpr std::chrono::steady_clock::time_point fromNanos(
       int64_t nanos) {
     return std::chrono::steady_clock::time_point(

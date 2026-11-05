@@ -31,8 +31,6 @@ namespace libsoftmetaroce {
 
 namespace {
 
-// Raises an interval to kMinWatchdogIntervalMs, the shortest deadline a
-// watchdog can hold without firing on scheduling delay.
 constexpr std::chrono::milliseconds flooredInterval(
     std::chrono::milliseconds intervalMs) {
   return std::max(intervalMs, kMinWatchdogIntervalMs);
