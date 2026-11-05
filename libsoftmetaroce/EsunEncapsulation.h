@@ -27,6 +27,11 @@ namespace libsoftmetaroce {
 
 class EsunEncapsulation : public RawEncapsulation {
  public:
+  // The shortest MetaRoCE packet whose frame reaches the Ethernet minimum.
+  static constexpr size_t kMinimumPacketSizeBytes =
+      kMinimumEthernetFrameSizeBytes -
+      (kEthernetHeaderSize + EsunHeader::kSizeBytes + kIcrcSize);
+
   EsunEncapsulation(
       folly::MacAddress srcMac,
       folly::MacAddress dstMac,

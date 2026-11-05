@@ -19,6 +19,7 @@
 
 #include <libsoftmetaroce/RenamedFlag.h>
 #include <libsoftmetaroce/congestion_control/CongestionControllerFactory.h>
+#include <libsoftmetaroce/congestion_control/FastStart.h>
 #include <libsoftmetaroce/congestion_control/Flags.h>
 
 namespace {
@@ -28,6 +29,15 @@ bool validateUint16Range(const char* flagname, uint32_t value) {
   }
   LOG(ERROR) << "Invalid value for --" << flagname << ": " << value
              << ". Must be in range [1, 65535] to fit in uint16_t.";
+  return false;
+}
+
+bool validatePositive(const char* flagname, int32_t value) {
+  if (value > 0) {
+    return true;
+  }
+  LOG(ERROR) << "Invalid value for --" << flagname << ": " << value
+             << ". Must be positive.";
   return false;
 }
 
@@ -78,6 +88,12 @@ DEFINE_int32(
     libsoftmetaroce_max_qwnd,
     0,
     "Maximum QWND value. 0 means unlimited (use computed value).");
+
+DEFINE_int32(
+    libsoftmetaroce_initial_qwnd_max,
+    libsoftmetaroce::FastStart::kDefaultQwndMax,
+    "QWND in packets at which fast start ends.");
+DEFINE_validator(libsoftmetaroce_initial_qwnd_max, &validatePositive);
 
 // Congestion-control selection, used to run the "raise the window above what it
 // needs" experiment: --libsoftmetaroce_cc_algorithm=static:<large> makes the

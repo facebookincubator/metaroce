@@ -30,6 +30,10 @@ namespace libsoftmetaroce {
 // FCS is unaltered end-to-end, the mCRC is omitted.
 class EthernetEncapsulation : public RawEncapsulation {
  public:
+  // The shortest MetaRoCE packet whose frame reaches the Ethernet minimum.
+  static constexpr size_t kMinimumPacketSizeBytes =
+      kMinimumEthernetFrameSizeBytes - kEthernetHeaderSize;
+
   EthernetEncapsulation(
       folly::MacAddress srcMac,
       folly::MacAddress dstMac,

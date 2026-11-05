@@ -58,7 +58,6 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DRDMA_GEN_OSS")
 # getdeps settings
 set(CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/build/fbcode_builder/CMake"
                       "${CMAKE_SOURCE_DIR}" ${CMAKE_MODULE_PATH})
-include(FBThriftCppLibrary)
 
 # Dependencies
 find_package(ibverbs REQUIRED)
@@ -109,7 +108,7 @@ find_package(fmt REQUIRED)
 find_package(folly REQUIRED)
 find_package(Re2 REQUIRED)
 find_library(RE2 re2)
-find_package(FBThrift REQUIRED)
+find_package(thrift CONFIG REQUIRED)
 find_package(wangle REQUIRED)
 
 # Add include directories for fmt and glog
@@ -264,14 +263,16 @@ set(LIBS_COMMON
     -lpthread)
 
 # Generate thrift interface
-add_fbthrift_cpp_library(
-  rdma_info_thrift
-  rdma_gen/if/RdmaInfo.thrift
-  SERVICES
-  RdmaGenControlService
-  OPTIONS
-  json
-  stack_arguments)
+add_library(rdma_info_thrift)
+thrift_generate(
+  rdma_info_thrift rdma_gen/if/RdmaInfo.thrift
+  LANGUAGE cpp2
+  SERVICES RdmaGenControlService
+  OPTIONS json stack_arguments
+  INCLUDE_DIRECTORIES ${PROJECT_SOURCE_DIR} ${THRIFT_INCLUDE_DIR})
+target_include_directories(rdma_info_thrift
+                           PUBLIC $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}>)
+target_link_libraries(rdma_info_thrift PUBLIC thrift::rpc)
 
 # The generated gen-cpp2 sources call deprecated thrift and folly APIs
 # while fbthrift migrates its codegen; the warnings are not actionable

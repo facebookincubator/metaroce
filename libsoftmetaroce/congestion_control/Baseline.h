@@ -117,7 +117,8 @@ class Baseline : public FastStart {
     // base class creates a flow state (fwnd, inflight) entry
     FastStart::onFlowAdded(flowId);
     // non-RCN method of defining maximum qwnd
-    qwnd_max_ = maxFwnd_ * numFlows();
+    qwnd_max_ =
+        std::min(maxFwnd_ * numFlows(), FLAGS_libsoftmetaroce_initial_qwnd_max);
     if (kMaxQwnd > 0) {
       qwnd_max_ = std::min(qwnd_max_, kMaxQwnd);
     }

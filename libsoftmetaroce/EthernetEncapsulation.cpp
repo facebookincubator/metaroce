@@ -19,8 +19,6 @@
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
 #include <glog/logging.h>
-#include <libsoftmetaroce/codec/BaseHeader.h>
-#include <libsoftmetaroce/codec/DataHeader.h>
 #include <array>
 
 namespace libsoftmetaroce {
@@ -30,32 +28,6 @@ size_t getBufferQueueLength(const folly::IOBufQueue& bufferQueue) {
   return bufferQueue.options().cacheChainLength
       ? bufferQueue.chainLength()
       : bufferQueue.front()->computeChainDataLength();
-}
-
-void addPaddingToSerializedDataHeader(
-    folly::IOBufQueue& bufferQueue,
-    size_t additionalPaddingBytes) {
-  if (getBufferQueueLength(bufferQueue) <
-      BaseHeader::kBaseHeaderSizeBytes + DataHeader::kDataHeaderSizeBytes) {
-    return;
-  }
-
-  folly::io::Cursor reader{&*bufferQueue.front()};
-  const BaseHeader baseHeader{reader};
-  if (!baseHeader.getOpcode().isData()) {
-    return;
-  }
-  reader.skip(DataHeader::kFlagsOffsetBytes);
-  const uint8_t flags = reader.read<uint8_t>();
-  const size_t totalPaddingBytes =
-      (flags & DataHeader::kPaddingMask) + additionalPaddingBytes;
-  CHECK_LE(totalPaddingBytes, DataHeader::kPaddingMask);
-
-  folly::io::RWPrivateCursor writer{bufferQueue};
-  writer.skip(BaseHeader::kBaseHeaderSizeBytes + DataHeader::kFlagsOffsetBytes);
-  writer.write<uint8_t>(
-      (flags & static_cast<uint8_t>(~DataHeader::kPaddingMask)) |
-      static_cast<uint8_t>(totalPaddingBytes));
 }
 
 } // namespace
@@ -83,7 +55,6 @@ size_t EthernetEncapsulation::frameOutgoing(
       ? kMinimumEthernetFrameSizeBytes - unpaddedFrameSize
       : 0;
   if (paddingSize > 0) {
-    addPaddingToSerializedDataHeader(bufferQueue, paddingSize);
     constexpr std::array<uint8_t, kMinimumEthernetFrameSizeBytes>
         kZeroPadding{};
     folly::io::QueueAppender paddingAppender{&bufferQueue, paddingSize};

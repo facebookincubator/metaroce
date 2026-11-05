@@ -23,6 +23,8 @@ namespace libsoftmetaroce {
 
 class MetaRoceCodec final : public Codec {
  public:
+  explicit MetaRoceCodec(size_t minimumPacketSizeBytes = 0);
+
   [[nodiscard]] size_t getSerializedSize(const Packet& packet) const override;
 
   void serialize(const Packet& packet, folly::io::QueueAppender& appender)
@@ -31,6 +33,17 @@ class MetaRoceCodec final : public Codec {
   [[nodiscard]] std::unique_ptr<Packet> parse(
       folly::io::Cursor& cursor,
       const Encapsulation& encapsulation) const override;
+
+ private:
+  [[nodiscard]] size_t bytesNeededToFillMinimumFrame(
+      const Packet& packet) const;
+
+  void serializeToMinimumFrame(
+      const Packet& packet,
+      size_t fillBytes,
+      folly::io::QueueAppender& appender) const;
+
+  const size_t minimumPacketSizeBytes_;
 };
 
 } // namespace libsoftmetaroce

@@ -306,20 +306,20 @@ Qp::Qp(
     bool newlyProbing = false;
     bool retryLimitExceeded = false;
     for (const auto tagNum : tagSet_.getTagNums()) {
-      auto tag = getTag(tagNum);
-      auto tagGuard = tag->scopedLock();
-      if (tag->getBrnrState() == BrnrState::BRNR_BLOCKED_TX) {
+      Tag& tag = existingTag(tagNum);
+      auto tagGuard = tag.scopedLock();
+      if (tag.getBrnrState() == BrnrState::BRNR_BLOCKED_TX) {
         // Each backoff expiry initiates one more probe (retry). A finite
         // rnr_retry limit enters the error state once its retries are spent
         // rather than probing forever -- on the expiry after the last probe: an
         // arriving BRNR is what arms this timer, so getting here again is the
         // responder refusing that probe too.
-        if (tag->hasSpentRnrRetries()) {
-          retryLimitExceeded |= !tag->isInErrorState();
+        if (tag.hasSpentRnrRetries()) {
+          retryLimitExceeded |= !tag.isInErrorState();
           // Already in error; the timer keeps firing for the other tags.
           continue;
         }
-        tag->brnr().beginProbe();
+        tag.brnr().beginProbe();
         newlyProbing = true;
       }
     }
@@ -440,9 +440,9 @@ Qp::~Qp() {
   // Safe without first clearing the tx trackers' raw Wqe* refs: teardown has
   // quiesced the timers, coroutines, and receives that would dereference them.
   for (const auto tagNum : tagSet_.getTagNums()) {
-    auto tag = getTag(tagNum);
-    auto retirementGuard = tag->lockForWqeRetirement();
-    tag->flushAllPendingWqesInError();
+    Tag& tag = existingTag(tagNum);
+    auto retirementGuard = tag.lockForWqeRetirement();
+    tag.flushAllPendingWqesInError();
   }
 
   // removeQp above quiesced the sender loop, so these sender-thread-only
@@ -704,9 +704,9 @@ void Qp::setupFlows(
   // than a tag, so one cancel releases it whichever tag it carries.
   if (rnrCancelPending_) {
     rnrCancelPending_ = false;
-    const auto tag = getTag(kMetaRoceInitialTag);
-    CHECK(tag) << "the initial tag lives as long as the queue pair";
-    scheduleRnrCancelPacket(kMetaRoceInitialTag, tag->getNextRxCsn() - 1);
+    scheduleRnrCancelPacket(
+        kMetaRoceInitialTag,
+        existingTag(kMetaRoceInitialTag).getNextRxCsn() - 1);
   }
 }
 
@@ -782,7 +782,7 @@ void Qp::checkRcnActiveOnWqeCompletion() {
   }
   // Stay active if any other receive WQE is still actively receiving data
   for (const auto tagNum : tagSet_.getTagNums()) {
-    if (getTag(tagNum)->hasPartiallyReceivedRWqe()) {
+    if (existingTag(tagNum).hasPartiallyReceivedRWqe()) {
       return;
     }
   }
@@ -800,12 +800,12 @@ bool Qp::checkForRxMessageCompletion(
     const uint8_t tagNum,
     const uint16_t msn,
     const uint16_t posn) {
-  auto tag = getTag(tagNum);
+  Tag& tag = existingTag(tagNum);
   if (opType == BaseHeader::Opcode::OperationType::READ ||
       opType == BaseHeader::Opcode::OperationType::ATOMIC_FETCH_ADD ||
       opType == BaseHeader::Opcode::OperationType::ATOMIC_CMP_SWP) {
     // rx packet is a read/atomic request: update cdmsn state and return
-    return tag->markDeliveredAndCompleteInOrder(msn);
+    return tag.markDeliveredAndCompleteInOrder(msn);
   }
 
   if (opType == BaseHeader::Opcode::OperationType::READ_IMM_P) {
@@ -841,7 +841,7 @@ bool Qp::checkForRxMessageCompletion(
       return false;
     }
     const bool everyCsnInSequence =
-        tag->handleRxWqeCompletion(*wqe, opType, msn);
+        tag.handleRxWqeCompletion(*wqe, opType, msn);
     // Every posn of the message has arrived, so it no longer counts as
     // partially received, even where its csn is out of sequence.
     checkRcnActiveOnWqeCompletion();
@@ -875,14 +875,14 @@ void Qp::checkForTxMessageCompletion(
   SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
   for (size_t tagNum = 0; tagNum < tagsAcked.size(); tagNum++) {
     if (tagsAcked.test(tagNum)) {
-      auto tag = getTag(static_cast<uint8_t>(tagNum));
-      auto tagGuard = tag->scopedLock();
+      Tag& tag = existingTag(static_cast<uint8_t>(tagNum));
+      auto tagGuard = tag.scopedLock();
       // Settling a request frame, or a read-with-immediate response completing
       // its paired receive, changes state the receive path consults; a batch of
       // plain sends and writes leaves that state undisturbed.
       std::unique_lock<folly::SharedMutex> retirementGuard;
       if (tagsNeedingRetirementGuard.test(tagNum)) {
-        retirementGuard = tag->lockForWqeRetirement();
+        retirementGuard = tag.lockForWqeRetirement();
       }
 
       std::vector<std::reference_wrapper<Wqe>> wqesToComplete;
@@ -894,7 +894,7 @@ void Qp::checkForTxMessageCompletion(
             // The response completes a read, so this ack can settle only a
             // failing work request, or one held back for the ack
             // alone.
-            tag->retireAfterRequestFrameSettled(wqe);
+            tag.retireAfterRequestFrameSettled(wqe);
           } else if (wqe.isCompletedByAcks()) {
             wqesToComplete.emplace_back(wqe);
           }
@@ -904,11 +904,11 @@ void Qp::checkForTxMessageCompletion(
       if (!wqesToComplete.empty()) {
         // Retiring frees WQEs the receive path may still be reading.
         if (!retirementGuard.owns_lock()) {
-          retirementGuard = tag->lockForWqeRetirement();
+          retirementGuard = tag.lockForWqeRetirement();
         }
-        if (!tag->handleTxWqesCompletion(wqesToComplete)) {
-          tagErrorWake |= enterTagErrorWithTagHeld(*tag);
-          tag->flushPendingReceiveWqesInError();
+        if (!tag.handleTxWqesCompletion(wqesToComplete)) {
+          tagErrorWake |= enterTagErrorWithTagHeld(tag);
+          tag.flushPendingReceiveWqesInError();
         }
       }
     }
@@ -957,13 +957,13 @@ void Qp::applyRnrCancel(
 
   // Clear this tag's BRNR block under its semaphore. The shared BRNR timer is
   // left to self-expire: its callback is a no-op once no tag is blocked.
-  auto tag = getTag(tagNum);
+  Tag& tag = existingTag(tagNum);
   {
-    auto tagGuard = tag->scopedLock();
+    auto tagGuard = tag.scopedLock();
     if (postedCsn.has_value()) {
-      tag->brnr().cancelThrough(*postedCsn, nowNs);
+      tag.brnr().cancelThrough(*postedCsn, nowNs);
     } else {
-      tag->brnr().resume();
+      tag.brnr().resume();
     }
   }
 
@@ -1352,10 +1352,10 @@ void Qp::retireTagsWithAbandonedFrames(
     if (!tagsWithAbandonedFrames.test(tagNum)) {
       continue;
     }
-    auto tag = getTag(static_cast<uint8_t>(tagNum));
-    auto tagGuard = tag->scopedLock();
-    auto retirementGuard = tag->lockForWqeRetirement();
-    tag->completeSettledFailedWqes();
+    Tag& tag = existingTag(static_cast<uint8_t>(tagNum));
+    auto tagGuard = tag.scopedLock();
+    auto retirementGuard = tag.lockForWqeRetirement();
+    tag.completeSettledFailedWqes();
   }
 }
 
@@ -1364,13 +1364,13 @@ void Qp::onEnteringRts() {
   // serves the QP, so the longest deadline any Tag sets wins.
   std::chrono::milliseconds longestIntervalMs{0};
   for (const auto tagNum : tagSet_.getTagNums()) {
-    const auto tag = getTag(tagNum);
-    const auto exponent = tag->getLocalAckTimeoutExponent();
+    const Tag& tag = existingTag(tagNum);
+    const auto exponent = tag.getLocalAckTimeoutExponent();
     // A retry count multiplies a wait, so a Tag setting one without a timeout
     // has set no wait for it to multiply and derives no deadline here.
     if (exponent.has_value()) {
       const auto deadlines = deadlinesFromQpAttributes(
-          exponent.value(), tag->getTransportRetryCount());
+          exponent.value(), tag.getTransportRetryCount());
       longestIntervalMs =
           std::max(longestIntervalMs, deadlines.watchdogIntervalMs);
     }
@@ -1397,13 +1397,13 @@ void Qp::processWatchdogExpiry() {
   // here -- one with a frame in flight is not settled, so it does not retire.
   SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
   for (const auto tagNum : tagSet_.getTagNums()) {
-    auto tag = getTag(tagNum);
-    auto tagGuard = tag->scopedLock();
-    auto retirementGuard = tag->lockForWqeRetirement();
+    Tag& tag = existingTag(tagNum);
+    auto tagGuard = tag.scopedLock();
+    auto retirementGuard = tag.lockForWqeRetirement();
 
     // A tag in BRNR_CANCELED is sending, so work failing on it reports the
     // transport retry timeout.
-    const BrnrState brnrState = tag->getBrnrState();
+    const BrnrState brnrState = tag.getBrnrState();
     const bool tagInBrnr = brnrState != BrnrState::NORMAL_TX &&
         brnrState != BrnrState::BRNR_CANCELED;
 
@@ -1411,10 +1411,10 @@ void Qp::processWatchdogExpiry() {
     // already failing, and the flush below frees them all.
     WorkCompletionStatus errorStatus =
         (isRnrState || tagInBrnr) ? kWcRnrRetryExcErr : kWcRetryExcErr;
-    subtractUnsentPosns(tag->markPendingWqesFailing(errorStatus));
-    tag->completeSettledFailedWqes();
+    subtractUnsentPosns(tag.markPendingWqesFailing(errorStatus));
+    tag.completeSettledFailedWqes();
 
-    tagErrorWake |= enterTagErrorWithTagHeld(*tag);
+    tagErrorWake |= enterTagErrorWithTagHeld(tag);
   }
 
   // Two: acks have stopped, so no ack is coming to resolve these frames.
@@ -1426,10 +1426,10 @@ void Qp::processWatchdogExpiry() {
   // finished with the receives it holds: it is in error as of the first pass,
   // so no arriving packet will fill them.
   for (const auto tagNum : tagSet_.getTagNums()) {
-    auto tag = getTag(tagNum);
-    auto tagGuard = tag->scopedLock();
-    auto retirementGuard = tag->lockForWqeRetirement();
-    tag->flushAllPendingWqesInError();
+    Tag& tag = existingTag(tagNum);
+    auto tagGuard = tag.scopedLock();
+    auto retirementGuard = tag.lockForWqeRetirement();
+    tag.flushAllPendingWqesInError();
   }
   // Every Tag guard above has closed by here. The flows are left in service:
   // no tag survives, so the sender takes them out at its next visit.
@@ -1442,38 +1442,38 @@ SenderWake Qp::processRnrRetryExceeded() {
   // receiver that has not yet run out of chances to post a buffer.
   SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
   for (const auto tagNum : tagSet_.getTagNums()) {
-    auto tag = getTag(tagNum);
-    auto tagGuard = tag->scopedLock();
+    Tag& tag = existingTag(tagNum);
+    auto tagGuard = tag.scopedLock();
     // The same fact the backoff timer acted on: spending an allowance is
     // arithmetic, and a zero one reads as spent before any receiver spoke.
-    if (tag->getBrnrState() != BrnrState::BRNR_BLOCKED_TX ||
-        !tag->hasSpentRnrRetries() || tag->isInErrorState()) {
+    if (tag.getBrnrState() != BrnrState::BRNR_BLOCKED_TX ||
+        !tag.hasSpentRnrRetries() || tag.isInErrorState()) {
       continue;
     }
-    auto retirementGuard = tag->lockForWqeRetirement();
-    LOG(ERROR) << "RNR retry limit (" << (int)tag->getRnrRetryLimit()
+    auto retirementGuard = tag.lockForWqeRetirement();
+    LOG(ERROR) << "RNR retry limit (" << (int)tag.getRnrRetryLimit()
                << ") exceeded for qp: " << localQpNum_
                << " tag: " << (uint32_t)tagNum;
     // Through the funnel even though this marks the work failing right here;
     // the sweep it asks for finds no work left.
-    tagErrorWake |= enterTagErrorWithTagHeld(*tag);
+    tagErrorWake |= enterTagErrorWithTagHeld(tag);
     // The receiver reported the message it had no buffer for, and that is the
     // one the error belongs to; it need not be the earliest still pending.
-    const auto blockedMsn = tag->getBrnrFirstBlockedMsn();
+    const auto blockedMsn = tag.getBrnrFirstBlockedMsn();
     Wqe* blockedWqe = blockedMsn.has_value()
-        ? tag->getPendingWqe(blockedMsn.value())
+        ? tag.getPendingWqe(blockedMsn.value())
         : nullptr;
     uint32_t abandonedCount = 0;
     if (blockedWqe != nullptr) {
       abandonedCount += blockedWqe->markFailing(kWcRnrRetryExcErr);
-      abandonedCount += tag->markPendingWqesFailing(kWrFlushErr);
+      abandonedCount += tag.markPendingWqesFailing(kWrFlushErr);
     } else {
       // Not pending any more, so the earliest that is reports it instead.
-      abandonedCount += tag->markPendingWqesFailing(kWcRnrRetryExcErr);
+      abandonedCount += tag.markPendingWqesFailing(kWcRnrRetryExcErr);
     }
     tagSet_.subtractUnsentPosns(abandonedCount);
-    tag->flushPendingReceiveWqesInError();
-    tag->completeSettledFailedWqes();
+    tag.flushPendingReceiveWqesInError();
+    tag.completeSettledFailedWqes();
   }
   // Handed back rather than signalled here: every Tag guard above has closed,
   // but the sender may be the caller, and a signal to itself calls in nobody.

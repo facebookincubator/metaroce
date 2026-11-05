@@ -29,6 +29,7 @@ class VerbsMode {
     RdmaCore = 0,
     // libsoftmetaroce, used for MetaRoCE testing
     LibSoftMetaRoCE,
+    Last,
   };
 };
 

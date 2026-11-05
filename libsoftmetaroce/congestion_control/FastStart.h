@@ -26,6 +26,7 @@
 #include <stdexcept>
 
 DECLARE_uint32(libsoftmetaroce_fast_start_burst);
+DECLARE_int32(libsoftmetaroce_initial_qwnd_max);
 
 namespace libsoftmetaroce {
 
@@ -35,6 +36,8 @@ namespace libsoftmetaroce {
    other control (ecn response) is applied here. */
 class FastStart : public CongestionController {
  public:
+  static constexpr int kDefaultQwndMax = 2 << 16;
+
   FastStart() {}
   ~FastStart() override = default;
 
@@ -167,7 +170,6 @@ class FastStart : public CongestionController {
   // Configuration.
   const uint16_t kFastStartBurst{
       static_cast<uint16_t>(FLAGS_libsoftmetaroce_fast_start_burst)};
-  static constexpr int kDefaultQwndMax = 2 << 16;
   uint16_t maxFwnd_{0};
 
   // Consecutive packets the sender wants per visit to a flow; applies only
@@ -178,7 +180,7 @@ class FastStart : public CongestionController {
   // Runtime state.
   bool inFastStart_{true};
   int qwnd_{0};
-  int qwnd_max_{kDefaultQwndMax};
+  int qwnd_max_{FLAGS_libsoftmetaroce_initial_qwnd_max};
 
  private:
   // Runtime state.

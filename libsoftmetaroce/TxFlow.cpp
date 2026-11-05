@@ -110,6 +110,16 @@ WorkCompletionStatus ackStatusToWorkCompletionStatus(AckStatus ackStatus) {
   });
 }
 
+// Slow-receiver mode raises the RTO ceiling unless the operator set one.
+uint64_t resolveMaxRtoNs(uint64_t defaultMaxRtoNs) {
+  const bool maxRtoIsDefault =
+      gflags::GetCommandLineFlagInfoOrDie("libsoftmetaroce_max_rto_us")
+          .is_default;
+  return FLAGS_libsoftmetaroce_slow_receiver && maxRtoIsDefault
+      ? kSlowReceiverMaxRtoNs
+      : defaultMaxRtoNs;
+}
+
 } // namespace
 
 TxFlow::TxFlow(
@@ -121,7 +131,9 @@ TxFlow::TxFlow(
     SackRetransmissionConfig sackRetxConfig)
     : Flow(qp, flowId, socketId, portPairIdx),
       qpRetxTimer_{qpRetxTimer},
-      sackRetxConfig_{sackRetxConfig} {
+      sackRetxConfig_{sackRetxConfig},
+      minRtoNs_{uint64_t{FLAGS_libsoftmetaroce_min_rto_us} * kNsPerUs},
+      maxRtoNs_{resolveMaxRtoNs(kDefaultMaxRtoNs)} {
   retxTimerCallback_ = std::make_unique<HighResTimer::Callback>(
       [this]() { onRetransmissionTimeout(); });
   txState_.estRttNs = FLAGS_libsoftmetaroce_initial_est_rtt_us * kNsPerUs;
@@ -148,6 +160,8 @@ TxFlow::TxFlow(TxFlow&& other) noexcept
     : Flow(other),
       qpRetxTimer_{other.qpRetxTimer_},
       sackRetxConfig_{other.sackRetxConfig_},
+      minRtoNs_{other.minRtoNs_},
+      maxRtoNs_{other.maxRtoNs_},
       txState_{std::move(other.txState_)},
       consecutiveRtosWithoutAck_{other.consecutiveRtosWithoutAck_.load()},
       lastConsumedRtoCount_{other.lastConsumedRtoCount_} {
@@ -170,13 +184,12 @@ TxFlow::~TxFlow() {
 uint32_t TxFlow::computeRtoIntervalUs() const {
   unsigned int exponent = std::min(
       kMaxRtoBackoffExponent, (unsigned int)consecutiveRtosWithoutAck_);
-
   const auto rtoNs = std::max(
-      (unsigned long)FLAGS_libsoftmetaroce_min_rto_us * kNsPerUs,
+      minRtoNs_,
       std::min(
-          (unsigned long)(txState_.estRttNs + (txState_.mdevRttNs << 2))
+          static_cast<uint64_t>(txState_.estRttNs + (txState_.mdevRttNs << 2))
               << exponent,
-          maxRtoNs));
+          maxRtoNs_));
   // RTO timeout precision is in microseconds
   // @lint-ignore CLANGTIDY clang-diagnostic-shorten-64-to-32
   return rtoNs / kNsPerUs;
@@ -316,12 +329,10 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetRetransmissionPacket() {
     const auto& trackerId = trackerEntry.id;
     bool stopRetransmitting = false;
     {
-      // A frame in the tracker was built from a Tag of this QP, and a Tag is
-      // never taken out of the set while the QP lives, so this resolves.
-      auto tag = qp_.getTag(trackerId.tagNum);
-      auto tagGuard = tag->scopedLock();
+      Tag& tag = qp_.existingTag(trackerId.tagNum);
+      auto tagGuard = tag.scopedLock();
       stopRetransmitting =
-          tag->mustStopRetransmitting(*CHECK_NOTNULL(trackerId.wqe));
+          tag.mustStopRetransmitting(*CHECK_NOTNULL(trackerId.wqe));
     }
     if (stopRetransmitting) {
       VLOG(2) << "Dropping queued retx packet for qp: " << qp_.getLocalQpNum()
@@ -543,9 +554,7 @@ void TxFlow::processBrnrPacket(
   const uint32_t rnrBackoffTime = brnr.computeRnrBackoffTimeUs();
 
   for (const auto& [tagNum, minBrnrMsn] : minBrnrMsnByTag) {
-    // Tracker entries identify Tags retained until whole-QP teardown.
-    const auto tagHandle = qp_.getTag(tagNum);
-    Tag& tag = *CHECK_NOTNULL(tagHandle.get());
+    Tag& tag = qp_.existingTag(tagNum);
     auto tagGuard = tag.scopedLock();
     tag.brnr().blockAt(minBrnrMsn);
     VLOG(1) << "Received BRNR, pausing qp: " << qp_.getLocalQpNum()
@@ -579,7 +588,7 @@ void TxFlow::processNakFlowIdError() {
       const auto& trackerId = trackerEntry.id;
       // The work request's failing state, and the frame status it decides,
       // are written under the Tag, so read and act on them under it.
-      auto tagGuard = qp_.getTag(trackerId.tagNum)->scopedLock();
+      auto tagGuard = qp_.existingTag(trackerId.tagNum).scopedLock();
       Wqe& wqe = *CHECK_NOTNULL(trackerId.wqe);
       if (!wqe.isFrameAllocated(trackerId.posn)) {
         continue;
@@ -685,20 +694,20 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
                            << "; blaming the msn the responder sent";
   }
 
-  auto tag = qp_.getTag(ack.getTag());
+  Tag& tag = qp_.existingTag(ack.getTag());
 
   // The Tag semaphore is what excludes the tx path from the WQEs being marked.
   // No call here holds sndCur, so the lock order is respected.
   SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
   {
-    auto tagGuard = tag->scopedLock();
-    auto retirementGuard = tag->lockForWqeRetirement();
+    auto tagGuard = tag.scopedLock();
+    auto retirementGuard = tag.lockForWqeRetirement();
     const uint16_t failedMsn = ack.getCumulRespDeliveredMsn();
     const bool nackedFrameIsResponse = nackedMessage.has_value() &&
         nackedMessage->tagNum == ack.getTag() &&
         !nackedMessage->msn.has_value();
     const bool msnWasNeverIssued =
-        !nackedFrameIsResponse && !before(failedMsn, tag->getNextMsn());
+        !nackedFrameIsResponse && !before(failedMsn, tag.getNextMsn());
     if (msnWasNeverIssued) {
       // Erroring on it would let one bad packet fail every work request the
       // tag holds.
@@ -706,11 +715,11 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
           << "qp " << qp_.getLocalQpNum() << " tag "
           << static_cast<uint32_t>(ack.getTag()) << " discarding a fatal NAK "
           << "for msn " << failedMsn << ", never issued; next is "
-          << tag->getNextMsn();
+          << tag.getNextMsn();
       return;
     }
     Wqe* failedWqe =
-        nackedFrameIsResponse ? nullptr : tag->getPendingWqe(failedMsn);
+        nackedFrameIsResponse ? nullptr : tag.getPendingWqe(failedMsn);
 
     const bool failureAlreadyMarked =
         failedWqe != nullptr && failedWqe->isFailing();
@@ -726,7 +735,7 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
                            << " tag: " << (uint32_t)ack.getTag();
     // The error state is published under the tag, so the wake it returns is
     // issued after this scope.
-    tagErrorWake = qp_.enterTagErrorWithTagHeld(*tag);
+    tagErrorWake = qp_.enterTagErrorWithTagHeld(tag);
     const auto nakStatus = ackStatusToWorkCompletionStatus(ack.getAckStatus());
 
     uint32_t abandonedCount = 0;
@@ -742,20 +751,20 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
           << failedMsn
           << " which cannot report it on qp: " << qp_.getLocalQpNum()
           << " tag: " << (uint32_t)ack.getTag();
-      abandonedCount += tag->markPendingWqesFailing(nakStatus);
+      abandonedCount += tag.markPendingWqesFailing(nakStatus);
     } else {
       abandonedCount += failedWqe->markFailing(nakStatus);
-      abandonedCount += tag->markPendingWqesFailing(kWrFlushErr);
+      abandonedCount += tag.markPendingWqesFailing(kWrFlushErr);
     }
     qp_.subtractUnsentPosns(abandonedCount);
 
     // No message will ever fill these now. The WQE-retirement guard above is
     // what serializes this against the other users of the bound-receive map.
-    tag->flushPendingReceiveWqesInError();
+    tag.flushPendingReceiveWqesInError();
 
     // A work request with no frame in flight is already fully accounted for and
     // has no ack coming to complete it.
-    tag->completeSettledFailedWqes();
+    tag.completeSettledFailedWqes();
   }
   qp_.wakeSenderAfterTagError(tagErrorWake);
 }
@@ -768,7 +777,7 @@ void TxFlow::abandonFramesOfFailingWqes(
     if (!trackerEntry.isResolved()) {
       const auto& trackerId = trackerEntry.id;
       // The states read below are written under the Tag.
-      auto tagGuard = qp_.getTag(trackerId.tagNum)->scopedLock();
+      auto tagGuard = qp_.existingTag(trackerId.tagNum).scopedLock();
       Wqe& wqe = *CHECK_NOTNULL(trackerId.wqe);
       const bool wqeIsDoneWithTheFrame = wqe.isFailing() || wqe.hasBeenServed();
       if (wqe.isFrameAllocated(trackerId.posn) && wqeIsDoneWithTheFrame) {
@@ -1040,8 +1049,8 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
         // This FSN is exlpicitly BRNR'd
         // The work request's failing state, and the frame status it decides,
         // are written under the Tag, so read and act on them under it.
-        auto brnrTag = qp_.getTag(trackerId.tagNum);
-        auto tagGuard = brnrTag->scopedLock();
+        Tag& brnrTag = qp_.existingTag(trackerId.tagNum);
+        auto tagGuard = brnrTag.scopedLock();
         Wqe& wqe = *CHECK_NOTNULL(trackerId.wqe);
         const bool frameIsAllocated = wqe.isFrameAllocated(trackerId.posn);
         const bool served = frameIsAllocated && wqe.hasBeenServed();
@@ -1068,7 +1077,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
               << "WQE in tracker does not have an MSN set.";
           uint16_t msn = wqe.getMsn().value();
           const bool coveredByCancel = wqe.getCsn().has_value() &&
-              brnrTag->brnr().cancelCovers(
+              brnrTag.brnr().cancelCovers(
                   wqe.getCsn().value(), nowNs, qp_.getEstQpRttNs());
           if (!coveredByCancel) {
             auto [it, inserted] =
@@ -1220,9 +1229,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     if (minBrnrMsnByTag.contains(tagNum)) {
       continue;
     }
-    // Tracker entries identify Tags retained until whole-QP teardown.
-    const auto tagHandle = qp_.getTag(tagNum);
-    Tag& tag = *CHECK_NOTNULL(tagHandle.get());
+    Tag& tag = qp_.existingTag(tagNum);
     // Checked and cleared under one hold: the BRNR timer moves this backoff
     // under the same Tag.
     auto tagGuard = tag.scopedLock();
@@ -1296,10 +1303,8 @@ uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
       uint16_t offsetInTracker = *lockedSndCur - txState_.sndUna;
       DCHECK_LT(offsetInTracker, kMaxTrackerSize);
       auto& ts = txState_.tracker.at(offsetInTracker);
-      // A frame in the tracker was built from a Tag of this QP, and a Tag is
-      // never taken out of the set while the QP lives, so this resolves.
-      auto tag = qp_.getTag(ts.id.tagNum);
-      auto tagGuard = tag->scopedLock();
+      Tag& tag = qp_.existingTag(ts.id.tagNum);
+      auto tagGuard = tag.scopedLock();
 
       // A tag marked for deletion keeps retransmitting its outstanding frames
       // so they complete; it is not removed until the whole QP is torn down.
@@ -1313,7 +1318,7 @@ uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
       // Unacknowledged, so this frame is unresolved and its WQE still alive.
       // Only the frame: a read's response posns have state of their own.
       Wqe& retxWqe = *CHECK_NOTNULL(ts.id.wqe);
-      if (tag->mustStopRetransmitting(retxWqe)) {
+      if (tag.mustStopRetransmitting(retxWqe)) {
         VLOG(1) << "Abandoning frame qp: " << qp_.getLocalQpNum()
                 << " fsn: " << *lockedSndCur
                 << " Tag: " << (uint32_t)ts.id.tagNum
@@ -1326,10 +1331,10 @@ uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
       }
 
       // A blocked msn still retransmits: either answer retires the frame.
-      if (isBlockedMsn(*tag, retxWqe.getMsn().value())) {
+      if (isBlockedMsn(tag, retxWqe.getMsn().value())) {
         // Sending it makes it a probe whatever the backoff was doing: a
         // verdict on this msn is now outstanding.
-        tag->brnr().probeSent();
+        tag.brnr().probeSent();
       }
       VLOG(1) << "Prepare retx packet qp: " << qp_.getLocalQpNum()
               << " fsn: " << *lockedSndCur << " Tag: " << (uint32_t)ts.id.tagNum
@@ -1338,7 +1343,7 @@ uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
               << " csn: " << retxWqe.getCsn().value_or(-1)
               << " flow: " << flowId_ << " isRTO: " << isRtoEvent
               << " HRNR state: " << qp_.getHrnrState()
-              << " BRNR state: " << tag->getBrnrState();
+              << " BRNR state: " << tag.getBrnrState();
 
       ++retxCount;
       retxPktsToSend_.wlock()->emplace_back(qp_.buildDataPacket(

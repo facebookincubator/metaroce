@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <fmt/core.h>
+#include <fmt/format.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <stdexcept>

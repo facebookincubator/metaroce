@@ -77,6 +77,11 @@ std::unique_ptr<Codec> makeMetaRoceCodec() {
   return std::make_unique<MetaRoceCodec>();
 }
 
+std::unique_ptr<Codec> makeMetaRoceEthernetCodec() {
+  return std::make_unique<MetaRoceCodec>(
+      EthernetEncapsulation::kMinimumPacketSizeBytes);
+}
+
 std::unique_ptr<Encapsulation> makeUdpEncapsulation(const ibv_gid_entry&) {
   return std::make_unique<UdpEncapsulation>();
 }
@@ -119,7 +124,7 @@ bool EgressProfile::isUsable() const noexcept {
 EgressProfile makeMetaRoceEthernetProfile() {
   EgressProfile profile{
       .socketKind = SocketKind::RAW,
-      .makeCodec = makeMetaRoceCodec,
+      .makeCodec = makeMetaRoceEthernetCodec,
       .makeEncapsulation = makeEthernetEncapsulation,
       .validateMtu =
           [](const ibv_gid_entry& entry, uint16_t qpMtuBytes) {
