@@ -50,31 +50,30 @@ class CompletionQueue {
   folly::coro::Task<Cqe> pollCq();
   [[nodiscard]] int getNumCompletedWqes() const;
 
-  // Takes the completion, or answers false and drops it where the queue holds
-  // the depth `ibv_create_cq` set. A dropped completion reaches a client as
-  // `IBV_EVENT_CQ_ERR`.
+  // Drops the completion and returns false when the queue is at the depth
+  // `ibv_create_cq` set. A client sees the drop as `IBV_EVENT_CQ_ERR`.
   [[nodiscard]] bool tryEnqueue(Cqe cqe);
 
   // Takes the completion without consulting the depth.
   void enqueue(Cqe cqe);
 
-  // Held by each work queue for as long as it can stage a completion here.
+  // Each work queue holds a reference while it can stage a completion here.
   void takeReference();
   void dropReference();
-  // `ibv_destroy_cq` answers `EBUSY` while this holds.
+  // `ibv_destroy_cq` fails with `EBUSY` while this returns true.
   [[nodiscard]] bool isReferenced() const;
 
-  // Held by an async event raised for this queue until the client acks it.
+  // Each async event raised for this queue holds a reference until acked.
   void takeEventReference();
   void releaseEventReferences(size_t count);
-  // Blocks until every event raised for this queue has been acked, which
-  // `ibv_get_async_event(3)` requires of the destroy that frees it.
+  // Blocks until every event raised for this queue has been acked.
+  // `ibv_get_async_event(3)` requires this before the queue is freed.
   void waitForEventsAcked();
 
   // Arms one completion event, as `ibv_req_notify_cq(3)` does.
   void requestNotification();
-  // Completion events a client has taken with `ibv_get_cq_event` and not yet
-  // acked; `ibv_destroy_cq` refuses while any are.
+  // Each completion event a client took with `ibv_get_cq_event` holds a
+  // reference until acked. `ibv_destroy_cq` refuses while any remain.
   void takeRetrievedCompletionEvent();
   void releaseRetrievedCompletionEvents(size_t count);
   [[nodiscard]] bool hasUnackedCompletionEvents() const;
