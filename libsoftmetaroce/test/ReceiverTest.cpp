@@ -797,6 +797,9 @@ TEST_F(ReceiverTest, APacketFromAnotherSourceQpIsDiscardedSilently) {
       << "the responder should deliver nothing from that packet";
   EXPECT_NE(ibvQpStorage.state, IBV_QPS_ERR)
       << "the responder should leave the queue pair running";
+  EXPECT_EQ(mockReceiver_->receiver().getSrcQpMismatchDiscardCount(), 1)
+      << "the responder discards this without a reply, so the count is how a "
+         "stale or misdirected peer sending here can be found";
 
   mockReceiver_->simulateReceivePacket(
       buildTestDataPacket(
@@ -816,6 +819,9 @@ TEST_F(ReceiverTest, APacketFromAnotherSourceQpIsDiscardedSilently) {
          "the message's state";
   EXPECT_EQ(std::memcmp(recvBuffer, payload, kSize), 0)
       << "the responder should scatter the connected queue pair's data";
+  EXPECT_EQ(mockReceiver_->receiver().getSrcQpMismatchDiscardCount(), 1)
+      << "a packet from the connected queue pair should not be counted as "
+         "discarded";
 }
 
 TEST_F(ReceiverTest, APacketWithANonzeroVersionIsDiscardedAndCounted) {

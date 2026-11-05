@@ -99,6 +99,10 @@ class Receiver : public PacketModifierSocket::ReadCallback,
     return unsupportedVersionDiscards_.load(std::memory_order_relaxed);
   }
 
+  [[nodiscard]] uint64_t getSrcQpMismatchDiscardCount() const {
+    return srcQpMismatchDiscards_.load(std::memory_order_relaxed);
+  }
+
   // Test-only: a reader's EventBase, so tests drive the receive path on the
   // thread that owns the reader sockets (matching production).
   folly::EventBase& readerEventBaseForTest(size_t index = 0) {
@@ -213,6 +217,7 @@ class Receiver : public PacketModifierSocket::ReadCallback,
 
   // Counters.
   std::atomic<uint64_t> unsupportedVersionDiscards_{0};
+  std::atomic<uint64_t> srcQpMismatchDiscards_{0};
 
   [[nodiscard]] uint16_t loadActivePortSet() const {
     return activePortSet_ ? activePortSet_->load(std::memory_order_relaxed) : 0;

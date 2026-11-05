@@ -431,6 +431,7 @@ void Receiver::processIngress(
   const uint32_t srcQp = rxBaseHeader.getSrcQp();
   const uint32_t expectedRemoteQp = qp.getRemoteQpNum();
   if (srcQp != expectedRemoteQp) {
+    srcQpMismatchDiscards_.fetch_add(1, std::memory_order_relaxed);
     LOG_FIRST_N(WARNING, 10)
         << "discarding packet on qp " << qpn << " with source qp " << srcQp
         << " not matching expected remote qp " << expectedRemoteQp;
