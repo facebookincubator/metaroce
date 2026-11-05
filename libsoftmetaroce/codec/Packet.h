@@ -44,13 +44,13 @@ class Packet {
     return *this;
   }
 
-  // Clone method to create a deep copy
+  // Returns a copy that owns its payload and so outlives the source buffer.
   virtual std::unique_ptr<Packet> clone() const {
     return std::make_unique<Packet>(*this);
   }
 
-  // Deep-copy the payload so the packet outlives its source buffer. Packet
-  // types that carry no payload inherit this no-op default.
+  // Deep-copy the payload so the packet outlives its source buffer. A packet
+  // type with a payload must override this no-op.
   virtual void ownPayload() {}
 
   static void writePayload(
@@ -63,19 +63,16 @@ class Packet {
     appender.insert(folly::IOBuf::wrapBuffer(address, payloadSizeBytes));
   }
 
-  // Zero bytes needed to align n to the next 4-byte boundary.
+  // Returns how many bytes pad a length of n to a 4-byte boundary.
   static constexpr uint32_t padBytesFor(uint32_t n) {
     return (4 - (n & 3u)) & 3u;
   }
 
-  // Trailing pad a wire payload needs to reach a 4-byte boundary, or 0 when
-  // padding is disabled.
   static uint32_t payloadPadBytes(uint32_t payloadSizeBytes) {
     return FLAGS_libsoftmetaroce_omit_padding ? 0u
                                               : padBytesFor(payloadSizeBytes);
   }
 
-  // Append the 4-byte-boundary padding for a payload of payloadSizeBytes.
   static void writePayloadPadding(
       uint32_t payloadSizeBytes,
       folly::io::QueueAppender& appender) {
@@ -243,9 +240,8 @@ class DataPacket : public Packet {
     payloadAddress_ = ownedPayloadBuf_->data();
   }
 
-  // This mutator is for packet modifiers: shrink the payload (default to none)
-  // so a shorter or header-only packet goes on the wire. Only shrinks -- a size
-  // at or above the current payload is a no-op.
+  // This mutator is for packet modifiers. A size at or above the current
+  // payload leaves the payload unchanged.
   void truncatePayload(uint32_t newSizeBytes = 0) {
     if (newSizeBytes >= payloadSizeBytes_) {
       return;
@@ -282,8 +278,8 @@ class UnsupportedPacket : public DataPacket {
     return copy;
   }
 
-  // Receive-only: the real header layout is unknown, so re-serializing would
-  // emit a malformed frame.
+  // An unsupported packet is received but never sent: its header layout is
+  // unknown. This override of Packet::serialize is fatal.
   void serialize(folly::io::QueueAppender& /*appender*/) const override {
     LOG(FATAL) << "UnsupportedPacket must never be serialized";
   }
