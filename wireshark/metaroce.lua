@@ -479,7 +479,7 @@ local opcode_name = {
    [0xd2] = "Atomic Ack (Response)",
    [0xd3] = "CmpSWap",
    [0xd4] = "FetchAdd",
-   [0xd5] = "Reserved for Atomics",
+   [0xd5] = "CmpSWap",
    [0xd6] = "Reserved for Atomics 2",
    [0xd7] = "Reserved for Atomics 3",
    [0xd8] = "Reserved", [0xd9] = "Reserved", [0xda] = "Reserved",
@@ -580,7 +580,7 @@ local opcode_abbr = {
    [0xd2] = "AtA",
    [0xd3] = "C&S",
    [0xd4] = "F&A",
-   [0xd5] = "Res",
+   [0xd5] = "C&S",
    [0xd6] = "Res",
    [0xd7] = "Res",
    [0xd8] = "Rsv", [0xd9] = "Rsv", [0xda] = "Rsv",
@@ -613,7 +613,8 @@ local opcode_value = {
    RNR_CANCEL = 0xd0,
    SEL_ACK = 0xd1,
    ATOMIC_ACK = 0xd2,
-   CMP_SWAP = 0xd3,
+   CMP_SWAP = 0xd5,
+   CMP_SWAP_ALT = 0xd3,
    FETCH_ADD = 0xd4,
    RELIABLE_CTRL= 0xde,
    UNRELIABLE_CTRL = 0xdf,
@@ -1475,14 +1476,15 @@ function metaroce.dissector(tvbuf, pktinfo, root)
    elseif opcode_type == opcode_value.ATOMIC_ACK then
       headers.METH = true
       headers.AtomicAckETH = true
-   elseif opcode_type == opcode_value.CMP_SWAP then
+   elseif opcode_type == opcode_value.CMP_SWAP or
+          opcode_type == opcode_value.CMP_SWAP_ALT then
       headers.METH = true
       headers.AtomicETH = true
    elseif opcode_type == opcode_value.FETCH_ADD then
       headers.METH = true
       headers.AtomicETH = true
-   elseif opcode_type >= 0xd5 and opcode_type <= 0xd7 then
-      -- Atomics Reserved in the range 0xd5 - 0xd7
+   elseif opcode_type >= 0xd6 and opcode_type <= 0xd7 then
+      -- Atomics Reserved in the range 0xd6 - 0xd7
       headers.METH = true
       headers.AtomicETH = true
    elseif opcode_type == opcode_value.RELIABLE_CTRL then
