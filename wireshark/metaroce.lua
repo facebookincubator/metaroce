@@ -1809,7 +1809,8 @@ function metaroce.dissector(tvbuf, pktinfo, root)
 
       pos = pos + mr_header.SAETH_LEN
 
-      if pktlen >= (pos + mr_header.SAETH_FSN_LEN) then
+      local crc_len = pktlen == wire_len and U32_LEN or 0
+      if pktlen >= (pos + mr_header.SAETH_FSN_LEN + crc_len) then
          -- FSN bit vectors
          ack_tree:add(pf_mr_saeth_fsn_bit_vec0, tvbuf:range(
                          pos + mr_saeth_fsn_offset.VEC0, U32_LEN))
@@ -1829,10 +1830,26 @@ function metaroce.dissector(tvbuf, pktinfo, root)
                          pos + mr_saeth_fsn_offset.VEC7, U32_LEN))
 
          pos = pos + mr_header.SAETH_FSN_LEN
+      elseif ack_type:uint() == 1 and pktlen == wire_len then
+         -- Selective ACKs may carry fewer than eight FSN words. The last
+         -- word is the mCRC, so leave it for the common CRC check below.
+         local vector_len = pktlen - pos - U32_LEN
+         if vector_len >= U32_LEN and vector_len % U32_LEN == 0 then
+            local vector_fields = {
+               pf_mr_saeth_fsn_bit_vec0, pf_mr_saeth_fsn_bit_vec1,
+               pf_mr_saeth_fsn_bit_vec2, pf_mr_saeth_fsn_bit_vec3,
+               pf_mr_saeth_fsn_bit_vec4, pf_mr_saeth_fsn_bit_vec5,
+               pf_mr_saeth_fsn_bit_vec6, pf_mr_saeth_fsn_bit_vec7,
+            }
+            for word = 1, vector_len / U32_LEN do
+               ack_tree:add(vector_fields[word], tvbuf:range(pos, U32_LEN))
+               pos = pos + U32_LEN
+            end
+         end
       end
 
       if has_brnr then
-         if pktlen >= (pos + mr_header.SAETH_RNR_LEN) then
+         if pktlen >= (pos + mr_header.SAETH_RNR_LEN + crc_len) then
             -- RNR bit vectors
             ack_tree:add(pf_mr_saeth_fsn_rnr_vec0, tvbuf:range(
                            pos + mr_saeth_rnr_offset.RNR0, U32_LEN))
@@ -1852,7 +1869,7 @@ function metaroce.dissector(tvbuf, pktinfo, root)
                            pos + mr_saeth_rnr_offset.RNR7, U32_LEN))
 
             pos = pos + mr_header.SAETH_RNR_LEN
-         elseif pktlen >= (pos + U32_LEN) then
+         elseif pktlen >= (pos + U32_LEN + crc_len) then
             -- RNR bit vectors, special case with one word only.
             ack_tree:add(pf_mr_saeth_fsn_rnr_vec0, tvbuf:range(
                            pos + mr_saeth_rnr_offset.RNR0, U32_LEN))
