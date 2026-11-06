@@ -35,6 +35,8 @@ DECLARE_bool(libsoftmetaroce_rfc6298_first_rtt_sample);
 DECLARE_uint32(libsoftmetaroce_initial_est_rtt_us);
 // NOLINTNEXTLINE(facebook-hte-PreventUseOfDeclareGflag)
 DECLARE_uint32(libsoftmetaroce_initial_mdev_rtt_us);
+// NOLINTNEXTLINE(facebook-hte-PreventUseOfDeclareGflag)
+DECLARE_uint32(libsoftmetaroce_max_rto_us);
 
 using namespace testing;
 namespace libsoftmetaroce {
@@ -251,7 +253,7 @@ TEST_F(RttEstimatorTest, ExplicitMaxRtoFlagBeatsTheSlowReceiverCap) {
       << "an explicit maximum must bound retransmission delays even in "
          "slow-receiver mode; substituting the 2s cap makes operator "
          "configuration ineffective";
-}
+}}
 
 TEST_F(RttEstimatorTest, InitialRttFlagsRejectValuesThatOverflowNanoseconds) {
   constexpr uint32_t kMaxUs = std::numeric_limits<uint32_t>::max() / kNsPerUs;
