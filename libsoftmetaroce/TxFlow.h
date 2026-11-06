@@ -195,6 +195,11 @@ class TxFlow : public Flow {
     return retxPktsToSend_.rlock()->size();
   }
 
+  // For testing.
+  [[nodiscard]] HighResTimer::Callback* getRetxTimerCallback() const {
+    return retxTimerCallback_.get();
+  }
+
   void purgeRetxPktsToSend() {
     retxPktsToSend_.wlock()->clear();
   }

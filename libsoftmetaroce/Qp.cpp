@@ -337,6 +337,12 @@ Qp::Qp(
       signalReadyAsync();
     }
   });
+  pacingTimerCallback_ = std::make_unique<HighResTimer::Callback>([&]() {
+    if (isTearingDown()) {
+      return;
+    }
+    signalReadyAsync();
+  });
   removeFromArbiter.dismiss();
 }
 
@@ -434,6 +440,9 @@ Qp::~Qp() {
   }
   if (brnrTimerCallback_) {
     retxTimer_.cancelCallback(brnrTimerCallback_.get());
+  }
+  if (pacingTimerCallback_) {
+    retxTimer_.cancelCallback(pacingTimerCallback_.get());
   }
 
   // Complete outstanding WQEs with a flush error (verbs contract on destroy).
@@ -653,6 +662,11 @@ void Qp::setupFlows(
     sender_ = sender;
   }
   maxHeldSendsPerFlow_ = sender_->getSendBatch();
+  // A limit installed before the flows takes its default burst from the send
+  // batch and the path MTU, both final here.
+  if (isRateLimited()) {
+    refreshPacerRate();
+  }
   const auto maxFlowCount = std::max(txFlowCount, rxFlowCount);
   const auto portMap = buildFlowIdToPortPairIdxMap(maxFlowCount);
   if (congestionController_) {
@@ -1225,6 +1239,11 @@ std::unique_ptr<struct EgressPacket> Qp::getNextPacketToSend() {
     }
   }
 
+  // Read once before any build: a build consumes sequence, so a held packet
+  // is never built. Flows with queued retransmissions are exempt but charged.
+  const uint64_t visitNowNs = getNowNs64();
+  const std::optional<uint64_t> pacerWaitNs =
+      pacer_.lock()->nsUntilSendDue(visitNowNs);
   // The for-loop checks each flow at most once. However, the flow currently
   // being checked is determined not by the loop variable i, but by
   // nextFlowIdToSendOn_.
@@ -1237,6 +1256,13 @@ std::unique_ptr<struct EgressPacket> Qp::getNextPacketToSend() {
       if (txFlow.hasUnackedData()) {
         txFlow.prepareRetxPacketsIfAny(true /*isRTOEvent*/);
       }
+    }
+    if (pacerWaitNs && txFlow.getNumPendingRetxPackets() == 0) {
+      // The hold is the QP's, so the visit still rotates: loss recovery on
+      // a later flow must not wait for the pacer's wake.
+      nextFlowIdToSendOn_ = (nextFlowIdToSendOn_ + 1) % txFlows_.size();
+      sendsOnHeldFlow_ = 0;
+      continue;
     }
     auto egressPacket = txFlow.getNextPacketToSend();
     const bool hasPacket = egressPacket && egressPacket->packet;
@@ -1266,9 +1292,27 @@ std::unique_ptr<struct EgressPacket> Qp::getNextPacketToSend() {
       if (probing) {
         enterHrnrBlock(txFlow.computeRtoIntervalUs());
       }
+      // Exempt sends charge too, from the later of now and the next send time,
+      // so their bytes push back the next gated send.
+      const auto wireBytes =
+          static_cast<uint32_t>(egressPacket->packet->getSizeBytes());
+      {
+        auto pacer = pacer_.lock();
+        pacer->onPacketSent(
+            std::max(visitNowNs, pacer->getNextSendTimeNs()), wireBytes);
+      }
       foldQwndBlockedTime(/*windowBlocked=*/false);
       return egressPacket;
     };
+  }
+  if (pacerWaitNs) {
+    // Fully held: no send means no ack will revisit, so arm a wake for the
+    // release. A paced hold is not a window stall.
+    retxTimer_.scheduleTimeout(
+        std::chrono::microseconds((*pacerWaitNs + 999) / 1000),
+        pacingTimerCallback_.get());
+    foldQwndBlockedTime(/*windowBlocked=*/false);
+    return std::unique_ptr<struct EgressPacket>();
   }
   // Only the single-owner ring makes the sender the sole writer of TX state;
   // otherwise a receiver-thread ACK races this read.
@@ -1379,6 +1423,34 @@ void Qp::onEnteringRts() {
   if (longestIntervalMs > std::chrono::milliseconds::zero()) {
     configureWatchdogInterval(longestIntervalMs);
   }
+}
+
+void Qp::setRateLimit(QpPacer::RateLimit rateLimit) {
+  {
+    auto inputs = pacingInputs_.lock();
+    inputs->verbsLimit = rateLimit;
+  }
+  refreshPacerRate();
+}
+
+void Qp::refreshPacerRate() {
+  auto inputs = pacingInputs_.lock();
+  QpPacer::RateLimit rateLimit = inputs->verbsLimit;
+  if (rateLimit.burstBytes == 0) {
+    rateLimit.burstBytes = maxHeldSendsPerFlow_ * mtu_;
+  }
+  auto pacer = pacer_.lock();
+  pacer->setRateLimit(rateLimit, getNowNs64());
+}
+
+bool Qp::isRateLimited() const {
+  auto pacer = pacer_.lock();
+  return !pacer->isUnlimited();
+}
+
+QpPacer::RateLimit Qp::getEffectiveRateLimit() const {
+  auto pacer = pacer_.lock();
+  return pacer->getRateLimit();
 }
 
 void Qp::processWatchdogExpiry() {

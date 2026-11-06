@@ -167,6 +167,8 @@ class MetaRoceVerbs : public RdmaVerbs, public folly::NonCopyableNonMovable {
   int ibv_modify_qp_rate_limit(
       struct ibv_qp* qp,
       struct ibv_qp_rate_limit_attr* attr) override;
+  // The lowest rate limit installed; a nonzero request below it gets it.
+  [[nodiscard]] static uint64_t minRateLimitBytesPerSec();
   int ibv_query_qp(
       struct ibv_qp* qp,
       struct ibv_qp_attr* attr,

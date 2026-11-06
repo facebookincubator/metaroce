@@ -39,6 +39,7 @@
 #include <libsoftmetaroce/MemoryRegions.h>
 #include <libsoftmetaroce/PacketId.h>
 #include <libsoftmetaroce/QpArbiter.h>
+#include <libsoftmetaroce/QpPacer.h>
 #include <libsoftmetaroce/RcnRateHint.h>
 #include <libsoftmetaroce/RnrState.h>
 #include <libsoftmetaroce/Tag.h>
@@ -564,6 +565,10 @@ class Qp {
     return brnrTimerCallback_.get();
   }
 
+  [[nodiscard]] HighResTimer::Callback* getPacingTimerCallback() const {
+    return pacingTimerCallback_.get();
+  }
+
   void incrementHrnrPacketsReceived() {
     hrnrPacketsReceived_++;
   }
@@ -655,6 +660,15 @@ class Qp {
   }
   void updateRcnActiveState(uint32_t incomingRateHint);
   void checkRcnActiveOnWqeCompletion();
+
+  // A zero rate lifts the limit and a zero burst takes the default, as in
+  // ibv_qp_rate_limit_attr. Accepts any rate; callers enforce a floor.
+  void setRateLimit(QpPacer::RateLimit rateLimit);
+
+  [[nodiscard]] bool isRateLimited() const;
+
+  // For testing: the rate currently programmed into the pacer.
+  [[nodiscard]] QpPacer::RateLimit getEffectiveRateLimit() const;
 
   [[nodiscard]] RxFlow* FOLLY_NULLABLE getRxFlowById(uint16_t flowId);
 
@@ -840,6 +854,9 @@ class Qp {
 
   // RCN rate hinting.
   void deactivateRcn();
+  // Programs the pacer with the verbs-installed limit; a zero burst takes one
+  // send batch of full-size frames.
+  void refreshPacerRate();
 
   // Instrumentation.
   // Accumulate per-QP window-blocked time: open a stall while windowBlocked,
@@ -910,6 +927,16 @@ class Qp {
   // hint, switch from data-arrival activation to peer-driven activation for
   // this QP.
   bool usingPeerDrivenActivation_{false};
+  // A leaf lock, taken by the send-path gate and by refreshPacerRate. Starts
+  // unlimited.
+  folly::Synchronized<QpPacer, std::mutex> pacer_{
+      QpPacer{QpPacer::RateLimit{}}};
+  // Inputs to the pacer's rate; a zero burst stands for the default. Lock
+  // order: pacingInputs_ before pacer_.
+  struct PacingInputs {
+    QpPacer::RateLimit verbsLimit;
+  };
+  folly::Synchronized<PacingInputs, std::mutex> pacingInputs_;
 
   // QP-level smoothed RTT
   static constexpr uint16_t kDefaultInverseLog2QpRttAlpha = 4;
@@ -943,6 +970,7 @@ class Qp {
   std::unique_ptr<Sender> uniqueSender_;
   std::unique_ptr<HighResTimer::Callback> hrnrTimerCallback_;
   std::unique_ptr<HighResTimer::Callback> brnrTimerCallback_;
+  std::unique_ptr<HighResTimer::Callback> pacingTimerCallback_;
   TagSet tagSet_;
   // Thread-safe watchdog timer for detecting stalls (no ACKs for too long).
   WatchdogTimer watchdog_;

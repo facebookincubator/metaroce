@@ -748,6 +748,328 @@ INSTANTIATE_TEST_SUITE_P(
         65536 // max message size of 256MB
         ));
 
+namespace {
+// Drive the QP until it offers no packet, returning the data packets admitted.
+std::vector<std::unique_ptr<struct EgressPacket>> collectAdmittedPackets(
+    Qp& qp) {
+  auto nextPacket = [&qp]() -> std::unique_ptr<struct EgressPacket> {
+    auto egressPacket = qp.getNextPacketToSend();
+    if (egressPacket == nullptr || egressPacket->packet == nullptr) {
+      return nullptr;
+    }
+    return egressPacket;
+  };
+  std::vector<std::unique_ptr<struct EgressPacket>> admitted;
+  for (auto egressPacket = nextPacket(); egressPacket != nullptr;
+       egressPacket = nextPacket()) {
+    if (egressPacket->packet->getBaseHeader().getOpcode().isData()) {
+      admitted.push_back(std::move(egressPacket));
+    }
+  }
+  return admitted;
+}
+
+// The bytes the send path charges the pacer for one packet: its encoded size.
+uint64_t chargedWireBytes(const struct EgressPacket& egressPacket) {
+  return egressPacket.packet->getSizeBytes();
+}
+} // namespace
+
+TEST_F(SenderTest, PacingHoldsNewDataPastBurst) {
+  // Keep all TxFlow state on the test thread: no send loop, and the transmit
+  // timers pinned so the retransmission timer never fires mid-transfer.
+  ScopedSuppressedTxTimers suppressTimers;
+
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100000));
+  auto sender = createTestSenderWithFlows(
+      mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
+
+  constexpr uint64_t kRateBytesPerSec = 1250;
+  constexpr uint32_t kBurstBytes = 4096;
+  qp->setRateLimit(
+      QpPacer::RateLimit{
+          .rateBytesPerSec = kRateBytesPerSec, .burstBytes = kBurstBytes});
+
+  constexpr int kFrames = 32;
+  auto wqePayload = createAndPostTestWqe(kFrames);
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the send must reach its Tag, or there is no work to "
+         "hold";
+
+  auto admitted = collectAdmittedPackets(*qp);
+  ASSERT_FALSE(admitted.empty())
+      << "precondition: the burst must admit packets, or the hold below is "
+         "vacuous";
+  // The burst admits floor(burst / packet) packets plus one, since the check
+  // runs before the build. At ~825 ms per packet, no pacing time passes during
+  // the loop above.
+  EXPECT_EQ(
+      admitted.size(), kBurstBytes / chargedWireBytes(*admitted.front()) + 1)
+      << "the burst plus the one packet admitted before its size is known is the "
+         "most the ceiling allows at once";
+
+  for (int i = 0; i < 10; ++i) {
+    auto egressPacket = qp->getNextPacketToSend();
+    EXPECT_TRUE(egressPacket == nullptr || egressPacket->packet == nullptr)
+        << "the hold must persist: no time has passed for the clock to "
+           "advance";
+  }
+
+  EXPECT_TRUE(retxTimer.isScheduled(qp->getPacingTimerCallback()))
+      << "a fully held visit must arm the wake timer, or idleness after a "
+         "hold waits on unrelated work";
+}
+
+TEST_F(SenderTest, PacingTimerReleasesHeldNewData) {
+  // Keep all TxFlow state on the test thread: no send loop, and the transmit
+  // timers pinned so the retransmission timer never fires mid-transfer.
+  ScopedSuppressedTxTimers suppressTimers;
+
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100000));
+  auto sender = createTestSenderWithFlows(
+      mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
+
+  qp->setRateLimit(
+      QpPacer::RateLimit{.rateBytesPerSec = 1250, .burstBytes = 4096});
+
+  constexpr int kFrames = 32;
+  auto wqePayload = createAndPostTestWqe(kFrames);
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the send must reach its Tag, or there is no work to "
+         "hold";
+
+  auto admitted = collectAdmittedPackets(*qp);
+  ASSERT_FALSE(admitted.empty())
+      << "precondition: the burst must admit packets, or the hold below is "
+         "vacuous";
+  auto held = qp->getNextPacketToSend();
+  ASSERT_TRUE(held == nullptr || held->packet == nullptr)
+      << "precondition: the burst must be exhausted, or the release below "
+         "releases no hold";
+
+  // Tests cannot move the protocol clock, so raise the rate: the rescaled wait
+  // ends the hold without a sleep.
+  qp->setRateLimit(
+      QpPacer::RateLimit{.rateBytesPerSec = 1'000'000'000, .burstBytes = 4096});
+
+  // Fire the wake the held visit armed, then read: the visit it triggers must
+  // release new data.
+  (*qp->getPacingTimerCallback())();
+  std::unique_ptr<struct EgressPacket> released;
+  for (int i = 0; i < 10000 && released == nullptr; ++i) {
+    auto egressPacket = qp->getNextPacketToSend();
+    if (egressPacket != nullptr && egressPacket->packet != nullptr) {
+      released = std::move(egressPacket);
+    }
+  }
+  ASSERT_TRUE(released != nullptr)
+      << "a held queue pair with no other traffic relies on this wake to "
+         "send again; the raised rate must have expired the hold";
+  EXPECT_EQ(released->rxmitType, EgressPacket::RxmitType::None)
+      << "no frame was lost, so the released packet must be new data rather "
+         "than a retransmission";
+}
+
+TEST_F(SenderTest, ZeroBurstTakesOneSendBatch) {
+  ScopedSuppressedTxTimers suppressTimers;
+
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100000));
+  constexpr uint32_t kSendBatch = 8;
+  auto sender = std::make_unique<LimitedTestSender>(
+      arbiter,
+      mockUDPSocketMaker,
+      kMetaRoceSendToPort,
+      LimitedTestSender::kDisableSendLoop,
+      kSendBatch);
+  qp->setupFlows(1, 1, sender.get());
+
+  qp->setRateLimit(
+      QpPacer::RateLimit{.rateBytesPerSec = 1250, .burstBytes = 0});
+
+  constexpr int kFrames = 96;
+  auto wqePayload = createAndPostTestWqe(kFrames);
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the send must reach its Tag, or there is no work to "
+         "hold";
+
+  auto admitted = collectAdmittedPackets(*qp);
+  ASSERT_FALSE(admitted.empty())
+      << "precondition: the default burst must admit packets, or the count "
+         "below is vacuous";
+  EXPECT_EQ(
+      admitted.size(),
+      kSendBatch * qp->getMtu() / chargedWireBytes(*admitted.front()) + 1)
+      << "a zero burst must take one send batch of full-size frames, so a "
+         "paced queue pair still fills a send batch rather than splitting it "
+         "across pacer wakes";
+}
+
+TEST_F(SenderTest, ARateLimitSetBeforeTheFlowsTakesTheirSendBatch) {
+  qp->setRateLimit(
+      QpPacer::RateLimit{.rateBytesPerSec = 1250, .burstBytes = 0});
+  constexpr uint32_t kSendBatch = 8;
+  auto sender = std::make_unique<LimitedTestSender>(
+      arbiter,
+      mockUDPSocketMaker,
+      kMetaRoceSendToPort,
+      LimitedTestSender::kDisableSendLoop,
+      kSendBatch);
+  qp->setupFlows(1, 1, sender.get());
+
+  EXPECT_EQ(qp->getEffectiveRateLimit().burstBytes, kSendBatch * qp->getMtu())
+      << "a limit installed before the flows must take its default burst from "
+         "their send batch, or it keeps the burst of a one-packet batch";
+}
+
+TEST_F(SenderTest, PacingHoldDoesNotGateLossRecovery) {
+  ScopedSuppressedTxTimers suppressTimers;
+
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100000));
+  auto sender = createTestSenderWithFlows(
+      mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
+
+  qp->setRateLimit(
+      QpPacer::RateLimit{.rateBytesPerSec = 1250, .burstBytes = 4096});
+
+  constexpr int kFrames = 8;
+  auto wqePayload = createAndPostTestWqe(kFrames);
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the send must reach its Tag, or the RTO below has no "
+         "frame to recover";
+
+  auto admitted = collectAdmittedPackets(*qp);
+  ASSERT_EQ(admitted.size(), 4u)
+      << "precondition: the burst must admit four frames and hold the other "
+         "four, so the RTO below fires while new data is held";
+  auto* flow = qp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  const uint16_t socketBefore = flow->getSocketId();
+
+  // Close the window: with it open, the RTO sends new data instead of
+  // retransmitting, and this test needs the retransmission.
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(0));
+  auto* rtoCallback = flow->getRetxTimerCallback();
+  ASSERT_NE(rtoCallback, nullptr);
+
+  (*rtoCallback)();
+  EXPECT_GT(flow->getNumPendingRetxPackets(), 0u)
+      << "the RTO must queue the unacked frames for retransmission";
+  EXPECT_TRUE(retxTimer.isScheduled(rtoCallback))
+      << "frames are still outstanding, so the RTO must re-arm rather than "
+         "stop";
+
+  auto egressPacket = qp->getNextPacketToSend();
+  ASSERT_TRUE(egressPacket && egressPacket->packet)
+      << "a retransmission held behind new data would stall loss recovery; it "
+         "is charged instead, so the average rate still holds";
+  EXPECT_EQ(egressPacket->rxmitType, EgressPacket::RxmitType::Rto)
+      << "the released packet must be the retransmission; new data stays held "
+         "until the pacer's next send time";
+  EXPECT_FALSE(qp->getTag(kMetaRoceInitialTag)->isInErrorState())
+      << "a paced hold must not fail the work it is holding";
+  EXPECT_EQ(flow->getSocketId(), socketBefore)
+      << "a single RTO must not repath the flow";
+
+  // Ack the retransmission, so the next expiry starts a new run rather than
+  // counting a second consecutive RTO.
+  auto* dataPacket = dynamic_cast<DataPacket*>(egressPacket->packet.get());
+  ASSERT_NE(dataPacket, nullptr);
+  const auto& dataHeader = dataPacket->getDataHeader();
+  flow->processAckPacket(
+      AckHeader::AckHeaderBuilder()
+          .setTag(kMetaRoceInitialTag)
+          .setCumulativeFsn(dataHeader.getFsn())
+          .setMaxRcvdFsn(dataHeader.getFsn())
+          .setAckStatus(AckStatus::ACK)
+          .setTimestamp(dataHeader.getTimestamp())
+          .build());
+
+  (*rtoCallback)();
+  EXPECT_GT(flow->getNumPendingRetxPackets(), 0u)
+      << "the ack cleared the RTO run, so the next expiry retransmits rather "
+         "than failing the work";
+  EXPECT_EQ(flow->getSocketId(), socketBefore)
+      << "the ack reset the RTO run, so this expiry must not repath the flow "
+         "either";
+
+  // Drain with the window open: every packet emitted while new data is held
+  // must be loss recovery, and the drain must end where the pacer holds.
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100000));
+  int retxEmitted = 0;
+  for (int i = 0; i < 10; ++i) {
+    auto drained = qp->getNextPacketToSend();
+    if (drained == nullptr || drained->packet == nullptr) {
+      break;
+    }
+    EXPECT_EQ(drained->rxmitType, EgressPacket::RxmitType::Rto)
+        << "while the pacer holds, only retransmissions may leave";
+    ++retxEmitted;
+  }
+  EXPECT_GT(retxEmitted, 0)
+      << "the second RTO's retransmissions bypass the hold the same way";
+  auto held = qp->getNextPacketToSend();
+  EXPECT_TRUE(held == nullptr || held->packet == nullptr)
+      << "with loss recovery drained and the window open, only the pacer "
+         "holds new data";
+}
+
+TEST_F(SenderTest, PacingReachesRetransmissionsOnOtherFlows) {
+  ScopedSuppressedTxTimers suppressTimers;
+
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100000));
+  // Rotation is the controller's default: each send advances to the next
+  // flow, spreading the burst across both flows, two frames each.
+  auto sender = std::make_unique<LimitedTestSender>(
+      arbiter,
+      mockUDPSocketMaker,
+      kMetaRoceSendToPort,
+      LimitedTestSender::kDisableSendLoop);
+  qp->setupFlows(2, 2, sender.get());
+
+  qp->setRateLimit(
+      QpPacer::RateLimit{.rateBytesPerSec = 1250, .burstBytes = 4096});
+
+  constexpr int kFrames = 8;
+  auto wqePayload = createAndPostTestWqe(kFrames);
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the send must reach its Tag, or the RTO below has no "
+         "frame to recover";
+
+  auto admitted = collectAdmittedPackets(*qp);
+  ASSERT_EQ(admitted.size(), 4u)
+      << "precondition: the burst must admit four frames and hold the rest, "
+         "so the RTO below fires while new data is held";
+  auto* flow1 = qp->getTxFlowById(1);
+  ASSERT_NE(flow1, nullptr);
+
+  // Close the window: with it open, the RTO sends new data instead of
+  // retransmitting, and this test needs the retransmission.
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(0));
+
+  (*flow1->getRetxTimerCallback())();
+  EXPECT_GT(flow1->getNumPendingRetxPackets(), 0u)
+      << "the RTO must queue flow 1's unacked frames for retransmission";
+
+  auto egressPacket = qp->getNextPacketToSend();
+  ASSERT_TRUE(egressPacket && egressPacket->packet)
+      << "the pacer holds the QP's new data, so the visit must rotate past "
+         "flow 0 to flow 1's exempt retransmission";
+  EXPECT_EQ(egressPacket->rxmitType, EgressPacket::RxmitType::Rto);
+}
+
 TEST_F(SenderTest, SendLoopWithDropModifier) {
   const auto mockUDPSocketMakerWModifier = [](folly::EventBase* evb) {
     // modification_times = 1000 to ensure all the retx will be dropped as well

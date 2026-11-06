@@ -37,6 +37,7 @@
 #include <libsoftmetaroce/RenamedFlag.h>
 #include <libsoftmetaroce/SequenceNumbers.h>
 #include <libsoftmetaroce/SgeList.h>
+#include <libsoftmetaroce/WatchdogTimer.h>
 #include <libsoftmetaroce/WireProfiles.h>
 #include <libsoftmetaroce/Wqe.h>
 #include <libsoftmetaroce/congestion_control/Flags.h>
@@ -2012,11 +2013,44 @@ int MetaRoceVerbs::ibv_modify_qp(
   return 0;
 }
 
+uint64_t MetaRoceVerbs::minRateLimitBytesPerSec() {
+  // Four maximum-size packets per shortest watchdog interval; slower, a queue
+  // pair could see no ack for a whole interval and the watchdog would fail it.
+  constexpr uint64_t kAckJitterHeadroom = 4;
+  constexpr uint64_t kLargestFramedPacketBytes = 8192;
+  return kAckJitterHeadroom * kLargestFramedPacketBytes * 1000 /
+      kMinWatchdogIntervalMs.count();
+}
+
 int MetaRoceVerbs::ibv_modify_qp_rate_limit(
-    struct ibv_qp* /*ibvqp*/,
-    struct ibv_qp_rate_limit_attr* /*attr*/) {
-  LOG(ERROR) << "libsoftmetaroce does not support ibv_modify_qp_rate_limit";
-  return withErrno(EOPNOTSUPP);
+    struct ibv_qp* ibvqp,
+    struct ibv_qp_rate_limit_attr* attr) {
+  if (ibvqp == nullptr || attr == nullptr) {
+    return withErrno(EINVAL);
+  }
+  if (ibvqp->handle != kQueuePairMagic) {
+    return withErrno(ENOENT);
+  }
+  if (attr->comp_mask != 0) {
+    return withErrno(EINVAL);
+  }
+  auto qp = getQpByNum(qpAndTagToQp(ibvqp->qp_num));
+  if (qp == nullptr) {
+    return withErrno(ENOENT);
+  }
+  if (!qp->containsTag(qpAndTagToTag(ibvqp->qp_num))) {
+    return withErrno(ENOENT);
+  }
+  // attr->typical_pkt_sz is unused; the pacer charges actual packet sizes.
+  uint64_t rateBytesPerSec = uint64_t{attr->rate_limit} * 1000 / 8;
+  if (rateBytesPerSec != 0) {
+    rateBytesPerSec = std::max(rateBytesPerSec, minRateLimitBytesPerSec());
+  }
+  qp->setRateLimit(
+      QpPacer::RateLimit{
+          .rateBytesPerSec = rateBytesPerSec,
+          .burstBytes = attr->max_burst_sz});
+  return 0;
 }
 
 namespace {

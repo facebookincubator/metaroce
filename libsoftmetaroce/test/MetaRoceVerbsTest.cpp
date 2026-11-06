@@ -926,6 +926,125 @@ TEST_F(VerbsTest, ANullAttributeSetIsRefusedAsAMalformedArgument) {
       << "and the same code reaches a caller reading errno";
 }
 
+TEST_F(VerbsTest, ANullRateLimitIsRefusedAsAMalformedArgument) {
+  struct ibv_qp* ibvqp = fixtureQp();
+  ASSERT_NE(ibvqp, nullptr);
+  struct ibv_qp_rate_limit_attr attr{};
+
+  errno = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(nullptr, &attr), EINVAL)
+      << "the rate verb reads its queue pair first, so a null one is refused "
+         "there";
+  EXPECT_EQ(errno, EINVAL)
+      << "and the same code reaches a caller reading errno";
+
+  errno = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(ibvqp, nullptr), EINVAL)
+      << "the rate verb reads the attributes it is told to apply, so a null "
+         "set is refused before that read";
+  EXPECT_EQ(errno, EINVAL)
+      << "and the same code reaches a caller reading errno";
+}
+
+TEST_F(VerbsTest, ARateLimitOnAnUnheldQueuePairIsRefused) {
+  struct ibv_qp* ibvqp = fixtureQp();
+  ASSERT_NE(ibvqp, nullptr);
+  struct ibv_qp_rate_limit_attr attr{.rate_limit = 8000, .max_burst_sz = 4096};
+
+  struct ibv_qp unheld{};
+  errno = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(&unheld, &attr), ENOENT)
+      << "a zeroed handle matches no queue pair lsmr holds";
+  EXPECT_EQ(errno, ENOENT)
+      << "and the same code reaches a caller reading errno";
+
+  struct ibv_qp unknown = *ibvqp;
+  unknown.qp_num = libsoftmetaroce::MetaRoceVerbs::combineQpAndTag(
+      9999, kMetaRoceInitialTag);
+  errno = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(&unknown, &attr), ENOENT)
+      << "a well-formed handle for a queue pair lsmr never created matches no "
+         "queue pair either";
+  EXPECT_EQ(errno, ENOENT)
+      << "and the same code reaches a caller reading errno";
+
+  struct ibv_qp unheldTag = *ibvqp;
+  unheldTag.qp_num = libsoftmetaroce::MetaRoceVerbs::combineQpAndTag(
+      libsoftmetaroce::MetaRoceVerbs::qpAndTagToQp(ibvqp->qp_num),
+      kMetaRoceInitialTag + 1);
+  errno = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(&unheldTag, &attr), ENOENT)
+      << "the fixture holds only the initial Tag, so a handle naming another "
+         "Tag matches no Tag lsmr holds";
+  EXPECT_EQ(errno, ENOENT)
+      << "and the same code reaches a caller reading errno";
+}
+
+TEST_F(VerbsTest, ARateLimitInstallsThroughTheVerb) {
+  struct ibv_qp* ibvqp = fixtureQp();
+  ASSERT_NE(ibvqp, nullptr);
+  auto* qp = verbs_.getQpByNum(
+      libsoftmetaroce::MetaRoceVerbs::qpAndTagToQp(ibvqp->qp_num));
+  ASSERT_NE(qp, nullptr)
+      << "precondition: the fixture queue pair must resolve, or there is no "
+         "queue pair to limit";
+
+  struct ibv_qp_rate_limit_attr attr{.rate_limit = 80000, .max_burst_sz = 4096};
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(ibvqp, &attr), 0)
+      << "a valid request must take effect, or a caller cannot limit a queue "
+         "pair";
+  EXPECT_TRUE(qp->isRateLimited())
+      << "a success that leaves the queue pair unlimited would silently "
+         "ignore the caller";
+
+  attr.rate_limit = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(ibvqp, &attr), 0)
+      << "a zero rate is how a caller removes a limit";
+  EXPECT_FALSE(qp->isRateLimited())
+      << "a queue pair still paced after the caller lifted its limit would keep "
+         "sending slowly";
+}
+
+TEST_F(VerbsTest, ARateLimitBelowTheFloorTakesTheFloor) {
+  struct ibv_qp* ibvqp = fixtureQp();
+  ASSERT_NE(ibvqp, nullptr);
+  auto* qp = verbs_.getQpByNum(
+      libsoftmetaroce::MetaRoceVerbs::qpAndTagToQp(ibvqp->qp_num));
+  ASSERT_NE(qp, nullptr);
+
+  // 8 kbps is far below the lowest rate limit installed.
+  struct ibv_qp_rate_limit_attr attr{.rate_limit = 8, .max_burst_sz = 4096};
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(ibvqp, &attr), 0)
+      << "a request below the floor still asks for a limit, so it is "
+         "installed rather than refused or lifted";
+  EXPECT_EQ(
+      qp->getEffectiveRateLimit().rateBytesPerSec,
+      libsoftmetaroce::MetaRoceVerbs::minRateLimitBytesPerSec())
+      << "a slower rate would starve the watchdog and fail healthy work as "
+         "lost, so the pacer holds the slowest rate it can serve";
+}
+
+TEST_F(VerbsTest, ANonzeroCompMaskIsRefused) {
+  struct ibv_qp* ibvqp = fixtureQp();
+  ASSERT_NE(ibvqp, nullptr);
+  auto* qp = verbs_.getQpByNum(
+      libsoftmetaroce::MetaRoceVerbs::qpAndTagToQp(ibvqp->qp_num));
+  ASSERT_NE(qp, nullptr);
+
+  // No compatibility bits are defined: a set bit is an extension the verbs
+  // layer does not implement.
+  struct ibv_qp_rate_limit_attr attr{
+      .rate_limit = 80000, .max_burst_sz = 4096, .comp_mask = 1};
+  errno = 0;
+  EXPECT_EQ(verbs_.ibv_modify_qp_rate_limit(ibvqp, &attr), EINVAL)
+      << "unknown compatibility bits must refuse the call instead of "
+         "installing a limit that ignores them";
+  EXPECT_EQ(errno, EINVAL)
+      << "and the same code reaches a caller reading errno";
+  EXPECT_FALSE(qp->isRateLimited())
+      << "a refused rate must leave the pacer unlimited";
+}
+
 /*
  * The verbs that take a queue pair dereference it, so a null one has to be
  * refused before any of them reads a field.
