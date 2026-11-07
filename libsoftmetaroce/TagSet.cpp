@@ -87,7 +87,7 @@ void TagSet::add(
       sharedReceiveQueue);
 }
 
-std::shared_ptr<Tag> TagSet::addIfAllTagsInReset(
+Tag* FOLLY_NULLABLE TagSet::addIfAllTagsInReset(
     uint8_t tagNum,
     CompletionQueue* sendCq,
     CompletionQueue* recvCq,
@@ -114,7 +114,7 @@ std::shared_ptr<Tag> TagSet::addIfAllTagsInReset(
       sharedReceiveQueue);
 }
 
-std::shared_ptr<Tag> TagSet::addWithLockHeld(
+Tag* TagSet::addWithLockHeld(
     uint8_t tagNum,
     CompletionQueue* sendCq,
     CompletionQueue* recvCq,
@@ -126,7 +126,7 @@ std::shared_ptr<Tag> TagSet::addWithLockHeld(
     SharedReceiveQueue* FOLLY_NULLABLE sharedReceiveQueue) {
   auto [it, inserted] = tagNumToTag_.emplace(
       tagNum,
-      std::make_shared<Tag>(
+      std::make_unique<Tag>(
           qpNum_,
           tagNum,
           sendCq,
@@ -143,7 +143,7 @@ std::shared_ptr<Tag> TagSet::addWithLockHeld(
     CHECK(!wqeQueue_.containsQueue(tagNum));
     wqeQueue_.addQueue(tagNum);
     rollback.dismiss();
-    return it->second;
+    return it->second.get();
   } else {
     throw std::invalid_argument(
         fmt::format(
@@ -176,20 +176,20 @@ size_t TagSet::size() const {
   return tagNumToTag_.size();
 }
 
-std::shared_ptr<Tag> TagSet::at(uint8_t tagNum) const {
+Tag& TagSet::at(uint8_t tagNum) const {
   std::shared_lock lock(mutex_);
   auto tagIt = tagNumToTag_.find(tagNum);
   if (tagIt == tagNumToTag_.end()) {
     throw std::out_of_range(
         fmt::format("Tag: {} not found for QP: {}", (uint32_t)tagNum, qpNum_));
   }
-  return tagIt->second;
+  return *tagIt->second;
 }
 
-std::shared_ptr<Tag> TagSet::getTagByNumber(uint8_t tagNum) const {
+Tag* FOLLY_NULLABLE TagSet::getTagByNumber(uint8_t tagNum) const {
   std::shared_lock lock(mutex_);
   auto tagIt = tagNumToTag_.find(tagNum);
-  return tagIt == tagNumToTag_.end() ? nullptr : tagIt->second;
+  return tagIt == tagNumToTag_.end() ? nullptr : tagIt->second.get();
 }
 
 struct ibv_pd* TagSet::protectionDomain() const {
@@ -256,13 +256,13 @@ folly::coro::Task<void> TagSet::processWqes(
     // A Tag lives in the set until the whole QP is torn down, so a WQE the
     // queue accepted still has one; at() says so by throwing if it does not.
     // The map lock is not held past this: it guards the map.
-    auto tag = at(tagNum);
+    Tag& tag = at(tagNum);
 
     // Only this coroutine assigns msns, so room found here is still there
     // below.
     const bool isReceiveWqe = wqe->getWorkType() == Wqe::WorkType::kReceive;
     const bool takesAnMsn = !isReceiveWqe;
-    if (takesAnMsn && !tag->isMarkedForDeletion() && !tag->hasMsnSpanRoom()) {
+    if (takesAnMsn && !tag.isMarkedForDeletion() && !tag.hasMsnSpanRoom()) {
       // Once on entering the stall rather than once per wake, so one stall
       // does not spend the whole bound and hide the next.
       LOG_FIRST_N(WARNING, 10)
@@ -270,34 +270,34 @@ folly::coro::Task<void> TagSet::processWqes(
           << " has a full msn-span of work held rather than retired; this "
           << "queue pair posts no further work, on any tag, until the retired "
           << "cursor moves";
-      co_await tag->co_waitForMsnSpanRoom();
+      co_await tag.co_waitForMsnSpanRoom();
     }
 
     const bool takesAReadAtomicSlot = wqe->hasRequestFrame();
     // Only this coroutine counts one in, and retirement only counts them out.
-    if (takesAReadAtomicSlot && !tag->postWillBeFlushed() &&
-        !tag->hasReadAtomicRoom()) {
+    if (takesAReadAtomicSlot && !tag.postWillBeFlushed() &&
+        !tag.hasReadAtomicRoom()) {
       LOG_FIRST_N(WARNING, 10)
           << "qp " << qpNum_ << " tag " << (uint32_t)tagNum
           << " holds its negotiated depth of reads and atomics; this queue "
           << "pair posts no further work, on any tag, until one of them "
           << "retires";
-      co_await tag->co_waitForReadAtomicRoom();
+      co_await tag.co_waitForReadAtomicRoom();
     }
 
     // Hold the tag across the post so that posting a wqe does not race a tag
     // error raised by a flow that owns the Tag. The client's own transition
     // owns no Tag; the flag it raises is what covers that one.
-    co_await tag->co_waitForFree();
+    co_await tag.co_waitForFree();
     {
-      auto tagGuard = folly::makeGuard([&tag] { tag->markFree(); });
-      const bool wasInError = tag->isInErrorState();
+      auto tagGuard = folly::makeGuard([&tag] { tag.markFree(); });
+      const bool wasInError = tag.isInErrorState();
       if (isReceiveWqe) {
         std::unique_ptr<ReceiveWqe> receiveWqe(
             static_cast<ReceiveWqe*>(wqe.release()));
-        maybeRnrCancelCsn = tag->processReceiveWqe(std::move(receiveWqe), mtu);
+        maybeRnrCancelCsn = tag.processReceiveWqe(std::move(receiveWqe), mtu);
       } else {
-        hasSendableWork = tag->processTransmitWqe(std::move(wqe));
+        hasSendableWork = tag.processTransmitWqe(std::move(wqe));
       }
       if (hasSendableWork) {
         // Under the same Tag hold as the post: a sweep that got in between
@@ -308,7 +308,7 @@ folly::coro::Task<void> TagSet::processWqes(
       }
       // Read under the guard the post was made beneath, so it reflects the
       // state this post left behind rather than a later thread's.
-      tagIsInError = tag->isInErrorState();
+      tagIsInError = tag.isInErrorState();
       // The one error transition with no owner to publish it. A tag already in
       // error needs none: that post reported its own work as it was made.
       postErroredTheTag = !wasInError && tagIsInError;
@@ -401,18 +401,17 @@ Tag& TagSet::asSchedulable(TagsByNum::value_type& entry) {
   return *entry.second;
 }
 
-std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>> TagSet::findNextWqe(
-    bool intendToSend) {
+std::optional<std::pair<Wqe*, Tag*>> TagSet::findNextWqe(bool intendToSend) {
   if (!intendToSend) {
     return peekNextWqe();
   }
   return findNextWqeToSend();
 }
 
-std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>> TagSet::peekNextWqe() {
+std::optional<std::pair<Wqe*, Tag*>> TagSet::peekNextWqe() {
   // A readiness peek changes no scheduler state. It snapshots the tags,
   // taking Tag semaphores without holding mutex_.
-  std::vector<std::shared_ptr<Tag>> tags;
+  std::vector<Tag*> tags;
   {
     std::scoped_lock lock(mutex_);
     auto start = scheduler_.peek(
@@ -422,10 +421,10 @@ std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>> TagSet::peekNextWqe() {
     }
     tags.reserve(tagNumToTag_.size());
     for (auto it = start; it != tagNumToTag_.end(); ++it) {
-      tags.push_back(it->second);
+      tags.push_back(it->second.get());
     }
     for (auto it = tagNumToTag_.begin(); it != start; ++it) {
-      tags.push_back(it->second);
+      tags.push_back(it->second.get());
     }
   }
   for (const auto& tag : tags) {
@@ -436,8 +435,7 @@ std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>> TagSet::peekNextWqe() {
   return std::nullopt;
 }
 
-std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>>
-TagSet::findNextWqeToSend() {
+std::optional<std::pair<Wqe*, Tag*>> TagSet::findNextWqeToSend() {
   // Each turn selects from the live map, so a tag added mid-scan joins at
   // once. The Tag semaphore waits outside mutex_.
   size_t numLive = 0;
@@ -456,7 +454,6 @@ TagSet::findNextWqeToSend() {
     // Iterator to the selected entry, held across the Tag semaphore wait
     // outside mutex_. Recorded entries are never erased, so it stays valid.
     TagsByNum::iterator selected;
-    std::shared_ptr<Tag> tag;
     // Claim this turn up front, so a hit costs one lock hold; a miss
     // forfeits the claimed visit with the rest below.
     {
@@ -469,10 +466,10 @@ TagSet::findNextWqeToSend() {
       tried.set(it->first);
       scheduler_.noteServed(it, asSchedulable);
       selected = it;
-      tag = it->second;
     }
-    if (auto* wqe = tag->findNextWqe()) {
-      return std::make_pair(wqe, tag);
+    Tag& tag = *selected->second;
+    if (auto* wqe = tag.findNextWqe()) {
+      return std::make_pair(wqe, &tag);
     }
     std::scoped_lock lock(mutex_);
     scheduler_.noteSkipped(selected, asSchedulable);
@@ -538,12 +535,12 @@ void TagSet::failWqesOfTagsInError() {
   // Snapshot under mutex_ and take each Tag outside it: waiting on a Tag
   // semaphore while holding mutex_ would close a cycle against the send path,
   // which owns a Tag and then takes mutex_ to find the next one.
-  std::vector<std::shared_ptr<Tag>> tags;
+  std::vector<Tag*> tags;
   {
     std::shared_lock lock(mutex_);
     tags.reserve(tagNumToTag_.size());
     for (const auto& [_, tag] : tagNumToTag_) {
-      tags.push_back(tag);
+      tags.push_back(tag.get());
     }
   }
   for (const auto& tag : tags) {

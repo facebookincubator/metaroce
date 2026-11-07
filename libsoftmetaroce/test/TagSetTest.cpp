@@ -135,8 +135,8 @@ class TagSetTest : public ::testing::Test {
   // loop is left running for the case's own posts.
   Wqe* admitAReadThatSpendsTheOnlySlot() {
     tagSet_->add(1, cqs_[0].get(), ibvQp_);
-    auto tag = tagSet_->at(1);
-    tag->setMaxRdAtomic(1);
+    Tag& tag = tagSet_->at(1);
+    tag.setMaxRdAtomic(1);
     auto readWqe = makeReadWqe(kWorkReqId);
     Wqe* read = readWqe.get();
     if (!tagSet_->postWqe(1, std::move(readWqe))) {
@@ -147,7 +147,7 @@ class TagSetTest : public ::testing::Test {
     }
     startAdmissionLoop();
     admissionExecutor_.drain();
-    if (tag->hasReadAtomicRoom()) {
+    if (tag.hasReadAtomicRoom()) {
       ADD_FAILURE() << "precondition: the read spends the only slot the client "
                        "negotiated, so a second read waits for one";
       return nullptr;
@@ -163,7 +163,7 @@ class TagSetTest : public ::testing::Test {
   }
 
   // Adds `count` tags in INIT, each with its own ibv_qp.
-  std::vector<std::shared_ptr<Tag>> addInitTags(int count);
+  std::vector<Tag*> addInitTags(int count);
 
   // Runs the dequeue loop a post crosses, so a case can drive admission itself.
   void startAdmissionLoop() {
@@ -190,7 +190,7 @@ class TagSetTest : public ::testing::Test {
     admissionExecutor_.drain();
     if (!admissionLoop_->isReady()) {
       for (const auto tagNum : tagSet_->getTagNums()) {
-        tagSet_->at(tagNum)->markForDeletion();
+        tagSet_->at(tagNum).markForDeletion();
       }
       admissionExecutor_.drain();
     }
@@ -236,14 +236,14 @@ struct ibv_qp makeMockQp(ibv_qp_state state, struct ibv_pd* pd = nullptr) {
   return qp;
 }
 
-std::vector<std::shared_ptr<Tag>> TagSetTest::addInitTags(int count) {
+std::vector<Tag*> TagSetTest::addInitTags(int count) {
   initTagStorage_.resize(count);
-  std::vector<std::shared_ptr<Tag>> tags;
+  std::vector<Tag*> tags;
   tags.reserve(count);
   for (int i = 0; i < count; ++i) {
     initTagStorage_[i] = makeMockQp(IBV_QPS_INIT);
     tagSet_->add(i + 1, cqs_[i].get(), &initTagStorage_[i]);
-    tags.push_back(tagSet_->at(i + 1));
+    tags.push_back(&tagSet_->at(i + 1));
   }
   return tags;
 }
@@ -264,21 +264,18 @@ TEST_F(TagSetTest, AddTag) {
   EXPECT_EQ(tagSet_->size(), 1);
 
   // Verify tag was added
-  auto tag = tagSet_->at(1);
-  ASSERT_NE(tag, nullptr);
-  EXPECT_EQ(tag->getTagNum(), 1);
+  EXPECT_EQ(tagSet_->at(1).getTagNum(), 1)
+      << "the Tag added as 1 must be the one at() finds for 1";
 
   // Add second tag
   tagSet_->add(2, cqs_[1].get(), ibvQp_);
   EXPECT_EQ(tagSet_->size(), 2);
 
   // Verify both tags exist
-  auto tag1 = tagSet_->at(1);
-  auto tag2 = tagSet_->at(2);
-  ASSERT_NE(tag1, nullptr);
-  ASSERT_NE(tag2, nullptr);
-  EXPECT_EQ(tag1->getTagNum(), 1);
-  EXPECT_EQ(tag2->getTagNum(), 2);
+  EXPECT_EQ(tagSet_->at(1).getTagNum(), 1)
+      << "adding a second Tag must leave the first where at() finds it";
+  EXPECT_EQ(tagSet_->at(2).getTagNum(), 2)
+      << "the second Tag must be found under its own number";
 }
 
 TEST_F(TagSetTest, AddMultipleTags) {
@@ -290,9 +287,8 @@ TEST_F(TagSetTest, AddMultipleTags) {
 
   // Verify all tags exist and have correct tag numbers
   for (uint8_t i = 0; i < kMaxTags; ++i) {
-    auto tag = tagSet_->at(i);
-    ASSERT_NE(tag, nullptr);
-    EXPECT_EQ(tag->getTagNum(), i);
+    EXPECT_EQ(tagSet_->at(i).getTagNum(), i)
+        << "every tag number up to the limit must find its own Tag";
   }
 }
 
@@ -376,16 +372,16 @@ TEST_F(TagSetTest, GetNumPendingWqes) {
       kWorkReqId + 2, oneSge(buffer_->data(), 1500), kMtu);
 
   // Process WQEs directly in tags
-  auto tag1 = tagSet_->at(1);
-  auto tag2 = tagSet_->at(2);
+  Tag& tag1 = tagSet_->at(1);
+  Tag& tag2 = tagSet_->at(2);
 
-  postToTag(*tag1, std::move(sendWqe1), kMtu);
+  postToTag(tag1, std::move(sendWqe1), kMtu);
   EXPECT_EQ(tagSet_->getNumPendingWqes(), 1);
 
-  postToTag(*tag2, std::move(sendWqe2), kMtu);
+  postToTag(tag2, std::move(sendWqe2), kMtu);
   EXPECT_EQ(tagSet_->getNumPendingWqes(), 2);
 
-  postToTag(*tag1, std::move(sendWqe3), kMtu);
+  postToTag(tag1, std::move(sendWqe3), kMtu);
   EXPECT_EQ(tagSet_->getNumPendingWqes(), 3);
 }
 
@@ -406,13 +402,13 @@ TEST_F(TagSetTest, GetNumPendingRWqes) {
       kWorkReqId + 1, oneSge(buffer_->data(), 2000), kMtu);
 
   // Process WQEs directly in tags
-  auto tag1 = tagSet_->at(1);
-  auto tag2 = tagSet_->at(2);
+  Tag& tag1 = tagSet_->at(1);
+  Tag& tag2 = tagSet_->at(2);
 
-  postToTag(*tag1, std::move(receiveWqe1), kMtu);
+  postToTag(tag1, std::move(receiveWqe1), kMtu);
   EXPECT_EQ(tagSet_->getNumPendingRWqes(), 1);
 
-  postToTag(*tag2, std::move(receiveWqe2), kMtu);
+  postToTag(tag2, std::move(receiveWqe2), kMtu);
   EXPECT_EQ(tagSet_->getNumPendingRWqes(), 2);
 }
 
@@ -426,9 +422,9 @@ TEST_F(TagSetTest, FindNextWqeRoundRobin) {
   EXPECT_FALSE(tagSet_->findNextWqe(false).has_value());
 
   // Add WQEs to tags
-  auto tag1 = tagSet_->at(1);
-  auto tag2 = tagSet_->at(2);
-  auto tag3 = tagSet_->at(3);
+  Tag& tag1 = tagSet_->at(1);
+  Tag& tag2 = tagSet_->at(2);
+  Tag& tag3 = tagSet_->at(3);
 
   auto sendWqe1 = std::make_unique<SendWqe>(
       kWorkReqId, oneSge(buffer_->data(), 1000), kMtu);
@@ -438,9 +434,9 @@ TEST_F(TagSetTest, FindNextWqeRoundRobin) {
       kWorkReqId + 2, oneSge(buffer_->data(), 1500), kMtu);
 
   // Process WQEs in tags
-  postToTag(*tag1, std::move(sendWqe1), kMtu);
-  postToTag(*tag2, std::move(sendWqe2), kMtu);
-  postToTag(*tag3, std::move(sendWqe3), kMtu);
+  postToTag(tag1, std::move(sendWqe1), kMtu);
+  postToTag(tag2, std::move(sendWqe2), kMtu);
+  postToTag(tag3, std::move(sendWqe3), kMtu);
 
   // Find WQEs in round-robin order
   // The order should follow the tag number ordering (1, 2, 3, 1, 2, 3, ...)
@@ -476,19 +472,19 @@ TEST_F(TagSetTest, FindNextWqeSparseTagsStayInNumericOrder) {
   tagSet_->add(200, cqs_[2].get(), ibvQp_);
 
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(1),
+      tagSet_->at(1),
       std::make_unique<SendWqe>(
           kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
       kMtu))
       << "precondition: tag 1 holds work, or the order below is untested";
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(5),
+      tagSet_->at(5),
       std::make_unique<SendWqe>(
           kWorkReqId + 1, oneSge(buffer_->data(), 2000), kMtu),
       kMtu))
       << "precondition: tag 5 holds work, or the order below is untested";
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(200),
+      tagSet_->at(200),
       std::make_unique<SendWqe>(
           kWorkReqId + 2, oneSge(buffer_->data(), 1500), kMtu),
       kMtu))
@@ -514,13 +510,13 @@ TEST_F(TagSetTest, FindNextWqeSkipsTagsWithoutWork) {
   tagSet_->add(3, cqs_[2].get(), ibvQp_);
 
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(1),
+      tagSet_->at(1),
       std::make_unique<SendWqe>(
           kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
       kMtu))
       << "precondition: tag 1 holds work, or the skip below is untested";
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(3),
+      tagSet_->at(3),
       std::make_unique<SendWqe>(
           kWorkReqId + 2, oneSge(buffer_->data(), 1500), kMtu),
       kMtu))
@@ -546,13 +542,13 @@ TEST_F(TagSetTest, FindNextWqeProbesLeaveSelectionOrderUnchanged) {
   tagSet_->add(2, cqs_[1].get(), ibvQp_);
 
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(1),
+      tagSet_->at(1),
       std::make_unique<SendWqe>(
           kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
       kMtu))
       << "precondition: tag 1 holds work, or the order below is untested";
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(2),
+      tagSet_->at(2),
       std::make_unique<SendWqe>(
           kWorkReqId + 1, oneSge(buffer_->data(), 2000), kMtu),
       kMtu))
@@ -588,17 +584,17 @@ TEST_F(TagSetTest, FindNextWqeProbesLeaveSelectionOrderUnchanged) {
 TEST_F(TagSetTest, FindNextWqeServesSharesByServiceLevel) {
   tagSet_->add(1, cqs_[0].get(), ibvQp_);
   tagSet_->add(2, cqs_[1].get(), ibvQp_);
-  tagSet_->at(1)->setServiceLevel(1);
+  tagSet_->at(1).setServiceLevel(1);
 
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(1),
+      tagSet_->at(1),
       std::make_unique<SendWqe>(
           kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
       kMtu))
       << "precondition: tag 1 holds work, or the weight ratio below is "
          "untested";
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(2),
+      tagSet_->at(2),
       std::make_unique<SendWqe>(
           kWorkReqId + 1, oneSge(buffer_->data(), 2000), kMtu),
       kMtu))
@@ -630,11 +626,11 @@ TEST_F(TagSetTest, FindNextWqeReachesAnUntriedTagAfterARefill) {
   for (uint8_t tagNum = 1; tagNum <= 3; ++tagNum) {
     tagSet_->add(tagNum, cqs_[tagNum - 1].get(), ibvQp_);
   }
-  tagSet_->at(1)->setServiceLevel(1);
-  tagSet_->at(3)->setServiceLevel(1);
+  tagSet_->at(1).setServiceLevel(1);
+  tagSet_->at(3).setServiceLevel(1);
   for (const uint8_t tagNum : {1, 2, 2, 3}) {
     ASSERT_TRUE(postToTag(
-        *tagSet_->at(tagNum),
+        tagSet_->at(tagNum),
         std::make_unique<SendWqe>(
             kWorkReqId, oneSge(buffer_->data(), kMtu), kMtu),
         kMtu))
@@ -667,10 +663,10 @@ TEST_F(TagSetTest, FindNextWqeReachesAnUntriedTagAfterARefill) {
 
 TEST_F(TagSetTest, FindNextWqeCapsServiceLevelBelowOverflow) {
   tagSet_->add(1, cqs_[0].get(), ibvQp_);
-  tagSet_->at(1)->setServiceLevel(std::numeric_limits<uint8_t>::max());
+  tagSet_->at(1).setServiceLevel(std::numeric_limits<uint8_t>::max());
 
   ASSERT_TRUE(postToTag(
-      *tagSet_->at(1),
+      tagSet_->at(1),
       std::make_unique<SendWqe>(
           kWorkReqId, oneSge(buffer_->data(), 1000), kMtu),
       kMtu))
@@ -694,8 +690,8 @@ TEST_F(TagSetTest, FindNextWqeDoesNotDeadlockWithConcurrentTagHolder) {
   std::thread holder([&] {
     start.arrive_and_wait();
     for (int i = 0; i < kIterations; ++i) {
-      auto tag = tagSet_->at(static_cast<uint8_t>((i % kTags) + 1));
-      auto guard = tag->scopedLock();
+      Tag& tag = tagSet_->at(static_cast<uint8_t>((i % kTags) + 1));
+      auto guard = tag.scopedLock();
       std::this_thread::yield();
       (void)tagSet_->size();
     }
@@ -762,8 +758,8 @@ TEST_F(TagSetTest, ProcessWqesBasic) {
 TEST_F(TagSetTest, PostingToATagInErrorFlushesWithoutCountingItsPosns) {
   struct ibv_qp mockQp = makeMockQp(IBV_QPS_INIT);
   tagSet_->add(1, cqs_[0].get(), &mockQp);
-  auto tag = tagSet_->at(1);
-  enterTagError(*tag);
+  Tag& tag = tagSet_->at(1);
+  enterTagError(tag);
   ASSERT_EQ(tagSet_->getUnsentPosnCount(), 0u)
       << "nothing has been posted yet, so the count starts clean";
 
@@ -814,17 +810,15 @@ TEST_F(TagSetTest, BoundaryConditions) {
   tagSet_->add(255, cqs_[0].get(), ibvQp_);
   EXPECT_EQ(tagSet_->size(), 1);
 
-  auto tag = tagSet_->at(255);
-  ASSERT_NE(tag, nullptr);
-  EXPECT_EQ(tag->getTagNum(), 255);
+  EXPECT_EQ(tagSet_->at(255).getTagNum(), 255)
+      << "the largest tag number must find its own Tag";
 
   // Test with tag number 0
   tagSet_->add(0, cqs_[1].get(), ibvQp_);
   EXPECT_EQ(tagSet_->size(), 2);
 
-  auto tag0 = tagSet_->at(0);
-  ASSERT_NE(tag0, nullptr);
-  EXPECT_EQ(tag0->getTagNum(), 0);
+  EXPECT_EQ(tagSet_->at(0).getTagNum(), 0)
+      << "tag number 0 must find its own Tag beside 255";
 }
 
 TEST_F(TagSetTest, ErrorConditions) {
@@ -900,17 +894,17 @@ TEST_F(TagSetTest, ATagIsRefusedOnceTheQpHasLeftReset) {
 TEST_F(TagSetTest, TheSendersVisitFailsTheWqesOfATagInError) {
   struct ibv_qp mockQp = makeMockQp(IBV_QPS_INIT);
   tagSet_->add(1, cqs_[0].get(), &mockQp);
-  auto tag = tagSet_->at(1);
+  Tag& tag = tagSet_->at(1);
 
   auto sendWqe = std::make_unique<SendWqe>(kWorkReqId, oneSge(*buffer_), kMtu);
   Wqe* postedWqe = sendWqe.get();
-  postToTag(*tag, std::move(sendWqe), kMtu);
+  postToTag(tag, std::move(sendWqe), kMtu);
   tagSet_->addUnsentPosns(postedWqe->getNumPosn());
   // The first of its two packets is on the wire, so the work request cannot
   // drain where it is abandoned, and outlives the visit for the checks below.
   std::ignore = postedWqe->allocateNextPosn();
   tagSet_->decrementUnsentPosns();
-  enterTagError(*tag);
+  enterTagError(tag);
 
   // What the sender's visit does before it looks for a packet to send.
   tagSet_->failWqesOfTagsInError();
@@ -942,12 +936,12 @@ TEST_F(TagSetTest, TheSendersVisitFailsTheWqesOfATagInError) {
 TEST_F(TagSetTest, ErroringTheWholeQpLeavesItsWorkForTheSendersVisit) {
   struct ibv_qp mockQp = makeMockQp(IBV_QPS_INIT);
   tagSet_->add(1, cqs_[0].get(), &mockQp);
-  auto tag = tagSet_->at(1);
+  Tag& tag = tagSet_->at(1);
 
   auto sendWqe = std::make_unique<SendWqe>(
       kWorkReqId, oneSge(buffer_->data(), kMtu), kMtu);
-  postToTag(*tag, std::move(sendWqe), kMtu);
-  ASSERT_EQ(tag->getNumPendingWqes(), 1)
+  postToTag(tag, std::move(sendWqe), kMtu);
+  ASSERT_EQ(tag.getNumPendingWqes(), 1)
       << "precondition: the work request is pending before the transition, or "
          "the sweep below has nothing to find";
 
@@ -960,7 +954,7 @@ TEST_F(TagSetTest, ErroringTheWholeQpLeavesItsWorkForTheSendersVisit) {
       << "the transition errored the tag and nothing of its work reached the "
          "wire, so the sender's visit must find it and report it; leaving it "
          "pending strands the client's completion for good";
-  EXPECT_EQ(tag->getNumPendingWqes(), 0)
+  EXPECT_EQ(tag.getNumPendingWqes(), 0)
       << "and the work request must be retired rather than held to teardown";
 }
 
@@ -1009,10 +1003,10 @@ TEST_F(TagSetTest, TheSendersVisitLeavesTheWorkOfATagThatHasNotFailed) {
     auto sendWqe = std::make_unique<SendWqe>(
         kWorkReqId, oneSge(buffer_->data(), kMtu), kMtu);
     tagSet_->addUnsentPosns(sendWqe->getNumPosn());
-    postToTag(*tagSet_->at(tagNum), std::move(sendWqe), kMtu);
+    postToTag(tagSet_->at(tagNum), std::move(sendWqe), kMtu);
   }
 
-  enterTagError(*tagSet_->at(1));
+  enterTagError(tagSet_->at(1));
   tagSet_->failWqesOfTagsInError();
 
   EXPECT_EQ(cqs_[0]->getNumCompletedWqes(), 1)
@@ -1025,7 +1019,7 @@ TEST_F(TagSetTest, TheSendersVisitLeavesTheWorkOfATagThatHasNotFailed) {
          "one to send";
 
   // The second tag enters error after a sweep has already run.
-  enterTagError(*tagSet_->at(2));
+  enterTagError(tagSet_->at(2));
   tagSet_->failWqesOfTagsInError();
 
   EXPECT_EQ(cqs_[1]->getNumCompletedWqes(), 1)
@@ -1045,12 +1039,12 @@ TEST_F(TagSetTest, AbandoningAVirtualSendReturnsNoPosnsToTheUnsentCount) {
   // read response below is accepted and there is a virtual send to abandon.
   struct ibv_qp mockQp = makeMockQp(IBV_QPS_INIT, &pd_);
   tagSet_->add(1, cqs_[0].get(), &mockQp);
-  auto tag = tagSet_->at(1);
+  Tag& tag = tagSet_->at(1);
 
   ReadWriteHeader rwHeader(
       reinterpret_cast<uint64_t>(buffer_->data()), ibvMr_->rkey, 2 * kMtu);
   int addressError = -1;
-  tag->createVirtualSendWqeIfNeeded(
+  tag.createVirtualSendWqeIfNeeded(
       /*msn=*/1, rwHeader, &addressError, *memoryRegions_, kMtu);
   ASSERT_EQ(addressError, 0) << "the read response must be accepted for the "
                                 "test to have a virtual send to abandon";
@@ -1059,9 +1053,9 @@ TEST_F(TagSetTest, AbandoningAVirtualSendReturnsNoPosnsToTheUnsentCount) {
          "or the check below would pass for the wrong reason";
   // A found WQE comes back with its Tag still held, for the sender to send
   // under.
-  tag->markFree();
+  tag.markFree();
 
-  enterTagError(*tag);
+  enterTagError(tag);
   tagSet_->failWqesOfTagsInError();
 
   EXPECT_EQ(tagSet_->getUnsentPosnCount(), 0u)
@@ -1092,9 +1086,9 @@ TEST_F(TagSetTest, ErroringTheQpSucceedsWhenATagIsAlreadyInError) {
 
   tagSet_->setIbvQpState(IBV_QPS_ERR);
 
-  EXPECT_EQ(tagSet_->at(1)->getIbvQp().state, IBV_QPS_ERR)
+  EXPECT_EQ(tagSet_->at(1).getIbvQp().state, IBV_QPS_ERR)
       << "the Tag that was already in error stays in error";
-  EXPECT_EQ(tagSet_->at(2)->getIbvQp().state, IBV_QPS_ERR)
+  EXPECT_EQ(tagSet_->at(2).getIbvQp().state, IBV_QPS_ERR)
       << "and the transition must still reach the Tag that had not; leaving "
          "it running is a QP the client asked to error that keeps sending";
 }
@@ -1116,10 +1110,10 @@ TEST_F(TagSetTest, ATransitionDoesNotBringATagInErrorBackOutOfIt) {
 
   tagSet_->setIbvQpState(IBV_QPS_RTS);
 
-  EXPECT_EQ(tagSet_->at(1)->getIbvQp().state, IBV_QPS_ERR)
+  EXPECT_EQ(tagSet_->at(1).getIbvQp().state, IBV_QPS_ERR)
       << "the Tag in error must stay in error; sending on it again would put "
          "work on the wire for a client that has been told it failed";
-  EXPECT_EQ(tagSet_->at(2)->getIbvQp().state, IBV_QPS_RTS)
+  EXPECT_EQ(tagSet_->at(2).getIbvQp().state, IBV_QPS_RTS)
       << "the Tag that had not failed must still take the transition";
 }
 
@@ -1137,9 +1131,11 @@ TEST_F(TagSetTest, SetIbvQpStateMultipleTags) {
   tagSet_->setIbvQpState(IBV_QPS_RTS);
 
   // Verify all tags have the new state
-  EXPECT_EQ(tagSet_->at(1)->getIbvQp().state, IBV_QPS_RTS);
-  EXPECT_EQ(tagSet_->at(2)->getIbvQp().state, IBV_QPS_RTS);
-  EXPECT_EQ(tagSet_->at(3)->getIbvQp().state, IBV_QPS_RTS);
+  for (const uint8_t tagNum : {1, 2, 3}) {
+    EXPECT_EQ(tagSet_->at(tagNum).getIbvQp().state, IBV_QPS_RTS)
+        << "a QP's Tags move state together, so tag " << int{tagNum}
+        << " must follow the QP to RTS";
+  }
   EXPECT_TRUE(tagSet_->allTagsInState(IBV_QPS_RTS))
       << "setting the state must move every Tag, not just the first";
 }
@@ -1165,14 +1161,17 @@ TEST_F(TagSetTest, SetIbvQpStateTransitions) {
   EXPECT_TRUE(tagSet_->allTagsInState(IBV_QPS_RTS)) << "and RTR to RTS";
 
   // Verify both tags have the final state
-  EXPECT_EQ(tagSet_->at(1)->getIbvQp().state, IBV_QPS_RTS);
-  EXPECT_EQ(tagSet_->at(2)->getIbvQp().state, IBV_QPS_RTS);
+  for (const uint8_t tagNum : {1, 2}) {
+    EXPECT_EQ(tagSet_->at(tagNum).getIbvQp().state, IBV_QPS_RTS)
+        << "a QP's Tags move state together, so tag " << int{tagNum}
+        << " must end the walk in RTS";
+  }
 }
 
 TEST_F(TagSetTest, AReadPastTheNegotiatedDepthIsHeldAtAdmission) {
   tagSet_->add(1, cqs_[0].get(), ibvQp_);
-  auto tag = tagSet_->at(1);
-  tag->setMaxRdAtomic(1);
+  Tag& tag = tagSet_->at(1);
+  tag.setMaxRdAtomic(1);
 
   for (int i = 0; i < 2; ++i) {
     ASSERT_TRUE(tagSet_->postWqe(1, makeReadWqe(kWorkReqId + i)))
@@ -1187,8 +1186,8 @@ TEST_F(TagSetTest, AReadPastTheNegotiatedDepthIsHeldAtAdmission) {
       << "the first read spends the only slot the client negotiated, so the "
          "second is held here and never reaches the Tag";
 
-  tag->setMaxRdAtomic(2);
-  tag->signalReadAtomicRoom();
+  tag.setMaxRdAtomic(2);
+  tag.signalReadAtomicRoom();
   admissionExecutor_.drain();
 
   EXPECT_EQ(tagSet_->getNumPendingWqes(), 2)
@@ -1199,19 +1198,19 @@ TEST_F(TagSetTest, AReadPastTheNegotiatedDepthIsHeldAtAdmission) {
 // Admission and the wait both exempt a flushed post; either alone admits it.
 TEST_F(TagSetTest, AnErroredTagsReadIsAdmittedRatherThanHeld) {
   tagSet_->add(1, cqs_[0].get(), ibvQp_);
-  auto tag = tagSet_->at(1);
-  tag->setMaxRdAtomic(1);
+  Tag& tag = tagSet_->at(1);
+  tag.setMaxRdAtomic(1);
 
   startAdmissionLoop();
 
   ASSERT_TRUE(tagSet_->postWqe(1, makeReadWqe(kWorkReqId)))
       << "precondition: the queue accepts the read that spends the slot";
   admissionExecutor_.drain();
-  ASSERT_FALSE(tag->hasReadAtomicRoom())
+  ASSERT_FALSE(tag.hasReadAtomicRoom())
       << "precondition: the first read spends the only slot, so a second would "
          "be held if the tag were not in error";
 
-  enterTagError(*tag);
+  enterTagError(tag);
   ASSERT_EQ(tagSet_->getNumPendingWqes(), 1)
       << "precondition: the first read is the Tag's only work, so the count "
          "below rises by what the two posts add and no more";
@@ -1237,12 +1236,12 @@ TEST_F(TagSetTest, AnErroredTagsReadIsAdmittedRatherThanHeld) {
 TEST_F(TagSetTest, AMarkedForDeletionTagsReadIsAdmittedRatherThanHeld) {
   ASSERT_NE(admitAReadThatSpendsTheOnlySlot(), nullptr)
       << "precondition: a read holds the only slot the tag negotiated";
-  auto tag = tagSet_->at(1);
+  Tag& tag = tagSet_->at(1);
   ASSERT_EQ(cqs_[0]->getNumCompletedWqes(), 0)
       << "precondition: the admitted read has not reported, so the count "
          "below is the flushed post on its own";
 
-  tag->markForDeletion();
+  tag.markForDeletion();
 
   ASSERT_TRUE(tagSet_->postWqe(1, makeReadWqe(kWorkReqId + 1)))
       << "precondition: the queue accepts the second read";
@@ -1257,24 +1256,24 @@ TEST_F(TagSetTest, RetiringAReadReleasesTheReadHeldBehindIt) {
   Wqe* firstRead = admitAReadThatSpendsTheOnlySlot();
   ASSERT_NE(firstRead, nullptr)
       << "precondition: the read that spends the only slot reached its Tag";
-  auto tag = tagSet_->at(1);
+  Tag& tag = tagSet_->at(1);
 
   ASSERT_TRUE(tagSet_->postWqe(1, makeReadWqe(kWorkReqId + 1)))
       << "precondition: the queue accepts the second read";
   admissionExecutor_.drain();
 
-  answerTheOnlyFrame(*tag, *firstRead);
+  answerTheOnlyFrame(tag, *firstRead);
   // Reporting posts the baton without returning a slot. Draining consumes that
   // wake here, so retirement's is the only one left to reach the held read.
   admissionExecutor_.drain();
   ASSERT_EQ(tagSet_->getNumPendingWqes(), 0)
       << "precondition: the first read has reported and the second is still "
          "held, so the count below starts from nothing pending";
-  ASSERT_FALSE(tag->hasReadAtomicRoom())
+  ASSERT_FALSE(tag.hasReadAtomicRoom())
       << "precondition: a read that reported still holds its slot until the "
          "request frame settles, or retirement is not what releases it";
 
-  settleRequestFrame(*tag, *firstRead);
+  settleRequestFrame(tag, *firstRead);
   admissionExecutor_.drain();
 
   EXPECT_EQ(tagSet_->getNumPendingWqes(), 1)
@@ -1309,7 +1308,7 @@ TEST_F(TagSetTest, WorkThatSpendsNoSlotIsAdmittedWhileAReadHoldsTheDepth) {
 TEST_F(TagSetTest, ErroringATagReleasesAReadAlreadyHeldAtAdmission) {
   ASSERT_NE(admitAReadThatSpendsTheOnlySlot(), nullptr)
       << "precondition: a read holds the only slot the tag negotiated";
-  auto tag = tagSet_->at(1);
+  Tag& tag = tagSet_->at(1);
 
   ASSERT_TRUE(tagSet_->postWqe(1, makeReadWqe(kWorkReqId + 1)))
       << "precondition: the queue accepts the second read";
@@ -1318,7 +1317,7 @@ TEST_F(TagSetTest, ErroringATagReleasesAReadAlreadyHeldAtAdmission) {
       << "precondition: the second read is held at admission, so the error "
          "transition below is what lets it through";
 
-  enterTagError(*tag);
+  enterTagError(tag);
   admissionExecutor_.drain();
 
   EXPECT_EQ(tagSet_->getNumPendingWqes(), 2)
@@ -1330,34 +1329,34 @@ TEST_F(TagSetTest, ErroringATagReleasesAReadAlreadyHeldAtAdmission) {
 TEST_F(TagSetTest, AMarkedForDeletionTagHoldsNoOneBehindItsFullMsnSpan) {
   tagSet_->add(1, cqs_[0].get(), ibvQp_);
   tagSet_->add(2, cqs_[1].get(), ibvQp_);
-  auto stalled = tagSet_->at(1);
-  auto healthy = tagSet_->at(2);
+  Tag& stalled = tagSet_->at(1);
+  Tag& healthy = tagSet_->at(2);
 
   // One read holds the map head while a full send queue's worth of reported
   // work piles up behind it, which is what closes the msn window.
   auto readWqe = makeReadWqe(kWorkReqId);
   Wqe& read = *readWqe;
-  ASSERT_TRUE(postToTag(*stalled, std::move(readWqe), kMtu))
+  ASSERT_TRUE(postToTag(stalled, std::move(readWqe), kMtu))
       << "precondition: the tag accepts the read that blocks the head";
-  answerTheOnlyFrame(*stalled, read);
+  answerTheOnlyFrame(stalled, read);
   const uint32_t sendsHeldBehindTheRead = kMaxQpWorkRequests - 1;
   for (uint32_t i = 0; i < sendsHeldBehindTheRead; ++i) {
     auto sendWqe = std::make_unique<SendWqe>(
         kWorkReqId + 1 + i, oneSge(buffer_->data(), 1000), kMtu);
     Wqe& send = *sendWqe;
-    ASSERT_TRUE(postToTag(*stalled, std::move(sendWqe), kMtu))
+    ASSERT_TRUE(postToTag(stalled, std::move(sendWqe), kMtu))
         << "precondition: the send queue refused post " << i
         << ", so the span this case needs never forms";
-    answerTheOnlyFrame(*stalled, send);
+    answerTheOnlyFrame(stalled, send);
   }
-  ASSERT_FALSE(stalled->hasMsnSpanRoom())
+  ASSERT_FALSE(stalled.hasMsnSpanRoom())
       << "precondition: the tag has no room for another msn, or the posts "
          "below cross a span that was never full";
-  ASSERT_EQ(stalled->getAcceptedSendQueueEntries(), 0)
+  ASSERT_EQ(stalled.getAcceptedSendQueueEntries(), 0)
       << "precondition: a send returns its queue entry when it reports, so the "
          "depth admits the posts below; retirement keeps the map entry instead";
 
-  stalled->markForDeletion();
+  stalled.markForDeletion();
   startAdmissionLoop();
 
   ASSERT_TRUE(tagSet_->postWqe(
@@ -1380,7 +1379,7 @@ TEST_F(TagSetTest, AMarkedForDeletionTagHoldsNoOneBehindItsFullMsnSpan) {
       << "precondition: the queue accepts a post for the healthy tag";
   admissionExecutor_.drain();
 
-  EXPECT_EQ(healthy->getNumPendingWqes(), 1)
+  EXPECT_EQ(healthy.getNumPendingWqes(), 1)
       << "a tag being deleted holds no post behind its full msn span, so the "
          "dequeue loop they share moves on to the healthy tag's post";
 }

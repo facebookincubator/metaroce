@@ -241,7 +241,7 @@ std::optional<AckHeader> RxFlow::processNewDataPacket(
   const auto& opcode = packet.getBaseHeader().getOpcode();
   const auto opType = opcode.operationType();
 
-  auto tag = qp_.getTag(dataHeader.getTag());
+  Tag* const tag = qp_.getTag(dataHeader.getTag());
 
   // Declared before the acquisition below so that they outlive it: on every
   // path out of here the tag is released first, and only then does the guard
@@ -250,16 +250,15 @@ std::optional<AckHeader> RxFlow::processNewDataPacket(
   std::optional<FailedMessage> failedMessage;
   auto applyFailureOnceReleased = folly::makeGuard([&] {
     if (failTag) {
-      enterTagErrorAndFlushReceives(*tag, failedMessage);
+      enterTagErrorAndFlushReceives(*CHECK_NOTNULL(tag), failedMessage);
     }
   });
 
   // Spec 5.2.6 allows rate-limiting these responses: each NAK for a tag's
   // failure holds that tag's next one back for an interval.
   auto nakTagFailure = [&tag, &dataHeader](RequestValidationError error) {
-    DCHECK(tag != nullptr)
-        << "a packet for an unknown tag is BRNR'd, never NAKed as a tag failure";
-    tag->holdErrorNaks(getNowNs64());
+    // A packet for an unknown tag is BRNR'd, never NAKed as a tag failure.
+    CHECK_NOTNULL(tag)->holdErrorNaks(getNowNs64());
     return makeNakAck(dataHeader, error);
   };
 
@@ -274,10 +273,9 @@ std::optional<AckHeader> RxFlow::processNewDataPacket(
     }
   }
 
-  const bool invalidTag = (tag == nullptr);
   Wqe* wqe = nullptr;
   bool brnrTriggered = false;
-  if (invalidTag) {
+  if (tag == nullptr) {
     brnrTriggered = true;
     VLOG(1) << "data packet for unknown Tag: " << dataHeader.getTag()
             << " on qp: " << qp_.getLocalQpNum() << ", will trigger BRNR";
@@ -369,14 +367,15 @@ std::optional<AckHeader> RxFlow::processNewDataPacket(
     // local protection error with the buffer left untouched.
     DCHECK(dynamic_cast<ReadWriteWqe*>(wqe) != nullptr);
     const MemoryRegions& memoryRegions = qp_.getMemoryRegions();
+    struct ibv_pd* const localPd = CHECK_NOTNULL(tag)->getIbvQp().pd;
     if (expectedPayloadSize != 0 &&
         !(wqe->hasLocalSges() ? memoryRegions.isValidLocal(
-                                    tag->getIbvQp().pd,
+                                    localPd,
                                     wqe->getLocalSges(),
                                     wqe->getMessageSizeBytes(),
                                     IBV_ACCESS_LOCAL_WRITE)
                               : memoryRegions.isValidLocal(
-                                    tag->getIbvQp().pd,
+                                    localPd,
                                     static_cast<char*>(wqe->getBufferAddress()),
                                     wqe->getMessageSizeBytes(),
                                     static_cast<ReadWriteWqe*>(wqe)->getLkey(),
@@ -398,7 +397,7 @@ std::optional<AckHeader> RxFlow::processNewDataPacket(
     // it below, so avoid addressForPosnMtu's non-null assertion.
     void* localAddr = wqe->getBufferAddress();
     if (qp_.getMemoryRegions().isValidLocal(
-            tag->getIbvQp().pd,
+            CHECK_NOTNULL(tag)->getIbvQp().pd,
             static_cast<char*>(localAddr),
             kAtomicOperationSizeBytes,
             static_cast<AtomicWqe*>(wqe)->getLkey(),
@@ -525,7 +524,7 @@ std::optional<AckHeader> RxFlow::processNewDataPacket(
   // For non-READ operations, wqe must be non-null to track posn completion.
   // For READ and atomic request ops, checkForRxMessageCompletion updates
   // CDMSN state.
-  if (!requiresReceive(opcode) && !invalidTag && !brnrTriggered) {
+  if (!requiresReceive(opcode) && tag != nullptr && !brnrTriggered) {
     if (!qp_.checkForRxMessageCompletion(
             nullptr, opType, dataHeader.getTag(), msn, posn)) {
       failTag = true;
@@ -738,7 +737,7 @@ std::optional<AckHeader> RxFlow::processDataPacket(
     LOG_FIRST_N(ERROR, 10) << "Received unsupported opcode " << opcode
                            << " on qp: " << qp_.getLocalQpNum()
                            << ", sending NAK Invalid Request";
-    if (auto tag = qp_.getTag(dataHeader.getTag()); tag) {
+    if (Tag* const tag = qp_.getTag(dataHeader.getTag()); tag) {
       if (tag->isErrorNakHeld(getNowNs64())) {
         return std::nullopt;
       }
@@ -768,7 +767,7 @@ std::optional<AckHeader> RxFlow::processDataPacket(
   if (!isDuplicate) {
     // Only an error NAK holds a tag, so a held tag is already in error. A tag
     // that has never sent one keeps healthy traffic off the clock.
-    if (auto tag = qp_.getTag(dataHeader.getTag()); tag != nullptr &&
+    if (Tag* const tag = qp_.getTag(dataHeader.getTag()); tag != nullptr &&
         tag->hasSentErrorNak() && tag->isErrorNakHeld(getNowNs64())) {
       return std::nullopt;
     }

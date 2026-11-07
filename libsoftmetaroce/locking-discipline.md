@@ -237,8 +237,8 @@ thread so the reader observes the initialized entry.
 ## Rules
 
 1. **Do not hold `TagSet::mutex_` across a blocking Tag acquisition.** To scan the
-   Tags and then use one, *snapshot* the map under `mutex_` (copy the
-   `shared_ptr<Tag>`s), release `mutex_`, then acquire the Tag's `freeSem_` with
+   Tags and then use one, *snapshot* the map under `mutex_` (copy the Tag
+   pointers), release `mutex_`, then acquire the Tag's `freeSem_` with
    no map lock held. See `findNextWqe`.
 2. **Prefer separate intervals; when both are needed, take `sndCur` before the
    Tag.** Most paths need only one lock at a time (see the separate-intervals note

@@ -1412,7 +1412,7 @@ struct TrackedMessageFixture {
       QpArbiter& arbiter,
       Qp& qp,
       uint16_t mtu,
-      std::shared_ptr<Tag>& initialTag,
+      Tag*& initialTag,
       std::initializer_list<Flow::FsnState> frames,
       uint16_t sndCur,
       int messageFrames = 4)
@@ -6481,7 +6481,7 @@ struct BrnrPerCsnFixture {
       QpArbiter& arbiter,
       Qp& qp,
       uint16_t mtu,
-      std::shared_ptr<Tag>& tag,
+      Tag*& tag,
       int count)
       : mockSender(arbiter, mockUDPSocketMaker) {
     qp.setCongestionController(std::make_unique<MockCongestionController>());
@@ -9775,7 +9775,7 @@ struct SackRetxTestFixture {
       QpArbiter& arbiter,
       Qp& qp,
       uint16_t mtu,
-      std::shared_ptr<Tag>& initialTag,
+      Tag*& initialTag,
       SackRetransmissionConfig sackRetxConfig = {})
       : mockSender(arbiter, mockUDPSocketMaker) {
     auto congestionController = std::make_unique<MockCongestionController>();
@@ -10090,7 +10090,7 @@ TEST_F(QpTest, CountSackedPacketsDirectWrap) {
 void setupLargeTracker(
     SackRetxTestFixture& f,
     uint32_t mtu,
-    std::shared_ptr<Tag>& initialTag,
+    Tag*& initialTag,
     uint16_t numFsns = 48) {
   const uint32_t length = (numFsns + 1) * mtu;
   f.payload = std::make_unique<char[]>(length);

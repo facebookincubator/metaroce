@@ -89,7 +89,7 @@ class TagSet {
   // inserted under one lock: a transition landing between the two would leave
   // a RESET Tag on a running QP. Returns the added Tag, or nullptr without
   // inserting.
-  [[nodiscard]] std::shared_ptr<Tag> addIfAllTagsInReset(
+  [[nodiscard]] Tag* FOLLY_NULLABLE addIfAllTagsInReset(
       uint8_t tagNum,
       CompletionQueue* sendCq,
       CompletionQueue* recvCq,
@@ -99,10 +99,10 @@ class TagSet {
       uint32_t sendQueueDepth = kMaxQpWorkRequests,
       uint32_t receiveQueueDepth = kMaxQpWorkRequests,
       SharedReceiveQueue* FOLLY_NULLABLE sharedReceiveQueue = nullptr);
-  [[nodiscard]] std::shared_ptr<Tag> at(uint8_t tagNum) const;
+  [[nodiscard]] Tag& at(uint8_t tagNum) const;
   // Returns the Tag for tagNum, or nullptr if it does not exist.
   // Unlike at(), this does not throw on missing tags.
-  [[nodiscard]] std::shared_ptr<Tag> getTagByNumber(uint8_t tagNum) const;
+  [[nodiscard]] Tag* FOLLY_NULLABLE getTagByNumber(uint8_t tagNum) const;
   // The domain the Tags of this QP were created under. Every Tag shares it, so
   // any of them answers; empty only where the set is.
   [[nodiscard]] struct ibv_pd* protectionDomain() const;
@@ -141,8 +141,8 @@ class TagSet {
   // necessary. A returned Tag holds its semaphore; the caller must call
   // Tag::markFree() after it finishes using the WQE. Call without holding
   // mutex_.
-  [[nodiscard]] std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>>
-  findNextWqe(bool intendToSend);
+  [[nodiscard]] std::optional<std::pair<Wqe*, Tag*>> findNextWqe(
+      bool intendToSend);
   // Set the QP state of every Tag in this TagSet. A Tag already in
   // IBV_QPS_ERR is left there, and one that enters error mid-walk wins over
   // the compare-and-set: the state is terminal, and a Tag already in error
@@ -197,7 +197,7 @@ class TagSet {
   [[nodiscard]] bool allTagsInState(ibv_qp_state state) const;
 
  private:
-  using TagsByNum = std::map<uint8_t, std::shared_ptr<Tag>>;
+  using TagsByNum = std::map<uint8_t, std::unique_ptr<Tag>>;
 
   // Tells the sender a Tag has entered error with work still to be failed, so
   // its next visit sweeps. Any thread. Raising it for a Tag whose work is
@@ -206,7 +206,7 @@ class TagSet {
   void notifySenderTagEnteredError();
 
   // Both add paths, with mutex_ already held. Returns the inserted Tag.
-  std::shared_ptr<Tag> addWithLockHeld(
+  Tag* addWithLockHeld(
       uint8_t tagNum,
       CompletionQueue* sendCq,
       CompletionQueue* recvCq,
@@ -223,10 +223,8 @@ class TagSet {
       struct ibv_qp* ibvQp) const;
   // Whether every Tag is in this state. Caller holds mutex_.
   [[nodiscard]] bool allTagsInStateWithLockHeld(ibv_qp_state state) const;
-  [[nodiscard]] std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>>
-  peekNextWqe();
-  [[nodiscard]] std::optional<std::pair<Wqe*, std::shared_ptr<Tag>>>
-  findNextWqeToSend();
+  [[nodiscard]] std::optional<std::pair<Wqe*, Tag*>> peekNextWqe();
+  [[nodiscard]] std::optional<std::pair<Wqe*, Tag*>> findNextWqeToSend();
   static Tag& asSchedulable(TagsByNum::value_type& entry);
 
   // Injected dependency.

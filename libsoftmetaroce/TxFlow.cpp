@@ -672,7 +672,8 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
 
   // Ahead of the consistency check below, so a peer using a tag this QP does
   // not have is turned away on that alone rather than on the check's verdict.
-  if (!qp_.containsTag(ack.getTag())) {
+  Tag* const nackedTag = qp_.getTag(ack.getTag());
+  if (nackedTag == nullptr) {
     LOG(WARNING) << "discarding fatal NAK for unknown Tag: "
                  << (uint32_t)ack.getTag();
     return;
@@ -694,7 +695,7 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
                            << "; blaming the msn the responder sent";
   }
 
-  Tag& tag = qp_.existingTag(ack.getTag());
+  Tag& tag = *nackedTag;
 
   // The Tag semaphore is what excludes the tx path from the WQEs being marked.
   // No call here holds sndCur, so the lock order is respected.
@@ -841,10 +842,10 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
       status == AckStatus::ACK_OUT_OF_ORDER || status == AckStatus::BRNR) {
     // A tag this QP does not have scopes no cdmsn, and the per-flow fsn
     // acknowledgment below still applies.
-    if (const auto tag = qp_.getTag(ack.getTag()); tag != nullptr) {
-      const uint16_t nextMsn = [&tag] {
-        auto tagGuard = tag->scopedLock();
-        return tag->getNextMsn();
+    if (Tag* const tag = qp_.getTag(ack.getTag()); tag != nullptr) {
+      const uint16_t nextMsn = [&ackedTag = *tag] {
+        auto tagGuard = ackedTag.scopedLock();
+        return ackedTag.getNextMsn();
       }();
       if (const uint16_t cdmsn = ack.getCumulRespDeliveredMsn();
           !before(cdmsn, nextMsn)) {

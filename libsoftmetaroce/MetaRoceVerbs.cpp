@@ -1782,10 +1782,11 @@ int MetaRoceVerbs::ibv_modify_qp(
   }
   auto tagNum = qpAndTagToTag(ibvqp->qp_num);
   AppliedTagConfig tagConfig{.localQpNum = qpNum, .tag = tagNum};
-  if (!qp->containsTag(tagNum)) {
+  Tag* const maybeTag = qp->getTag(tagNum);
+  if (maybeTag == nullptr) {
     return withErrno(ENOENT);
   }
-  auto tag = qp->getTag(tagNum);
+  Tag& tag = *maybeTag;
   auto publishAppliedConfig = folly::makeGuard([&] {
     const int saved = errno;
     publishTagConfig(tagConfig);
@@ -1801,7 +1802,7 @@ int MetaRoceVerbs::ibv_modify_qp(
     // The service level freezes at RTR entry; an update repeating the stored
     // level configures only addresses.
     if (!isBeforeRtr(loadQpState(*ibvqp)) &&
-        serviceLevel != tag->getServiceLevel()) {
+        serviceLevel != tag.getServiceLevel()) {
       return withErrno(EINVAL);
     }
 
@@ -1853,7 +1854,7 @@ int MetaRoceVerbs::ibv_modify_qp(
     LOG(INFO) << "Added port pair with remote addr " << remoteAddr.str()
               << " and local gid idx " << (int)sgid_index << " ("
               << localAddr.str() << ") to QP " << qpNum;
-    tag->setServiceLevel(serviceLevel);
+    tag.setServiceLevel(serviceLevel);
   }
   if (attr_mask & IBV_QP_DEST_QPN) {
     // Both IBV_QP_DEST_QPN and IBV_QP_AV are set - do full setup
@@ -1867,11 +1868,11 @@ int MetaRoceVerbs::ibv_modify_qp(
       return withErrno(EINVAL);
     }
     if (!FLAGS_libsoftmetaroce_ignore_modify_psn &&
-        !tag->setSendSequenceNumbers(SequenceNumbers::fromPsn(attr->sq_psn))) {
+        !tag.setSendSequenceNumbers(SequenceNumbers::fromPsn(attr->sq_psn))) {
       return withErrno(EINVAL);
     }
-    tagConfig.sendCsn = tag->getNextCsn();
-    tagConfig.sendMsn = tag->getNextMsn();
+    tagConfig.sendCsn = tag.getNextCsn();
+    tagConfig.sendMsn = tag.getNextMsn();
   }
   if (attr_mask & IBV_QP_RQ_PSN) {
     // rq_psn is expected only on INIT -> RTR.
@@ -1879,12 +1880,12 @@ int MetaRoceVerbs::ibv_modify_qp(
       if (!isBeforeRtr(state)) {
         return withErrno(EINVAL);
       }
-    } else if (!tag->setReceiveSequenceNumbers(
+    } else if (!tag.setReceiveSequenceNumbers(
                    SequenceNumbers::fromPsn(attr->rq_psn))) {
       return withErrno(EINVAL);
     }
-    tagConfig.receiveCsn = tag->getNextRxCsn();
-    tagConfig.receiveMsn = tag->getCDMSN();
+    tagConfig.receiveCsn = tag.getNextRxCsn();
+    tagConfig.receiveMsn = tag.getCDMSN();
   }
   if (attr_mask & IBV_QP_RNR_RETRY) {
     // Accepted only on the way up, so the BRNR timer never sees it change: a
@@ -1894,7 +1895,7 @@ int MetaRoceVerbs::ibv_modify_qp(
     }
     // The attribute was set on this ibv_qp, which is one Tag of the QP, and it
     // is that Tag's retries it bounds.
-    tag->setRnrRetryLimit(attr->rnr_retry);
+    tag.setRnrRetryLimit(attr->rnr_retry);
   }
   if (attr_mask & (IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT)) {
     // Accepted only on the way up, as rnr_retry is, so every Tag's
@@ -1907,12 +1908,12 @@ int MetaRoceVerbs::ibv_modify_qp(
       if (attr->timeout > kMaxLocalAckTimeoutExponent) {
         return withErrno(EINVAL);
       }
-      tag->setLocalAckTimeoutExponent(attr->timeout);
+      tag.setLocalAckTimeoutExponent(attr->timeout);
     }
     if (attr_mask & IBV_QP_RETRY_CNT) {
       // A count past three bits is not portable: rxe collapses it to 7 and
       // retries forever, rdmavt refuses the modify.
-      tag->setTransportRetryCount(attr->retry_cnt);
+      tag.setTransportRetryCount(attr->retry_cnt);
     }
   }
   if (attr_mask & (IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_MAX_DEST_RD_ATOMIC)) {
@@ -1923,10 +1924,10 @@ int MetaRoceVerbs::ibv_modify_qp(
     }
   }
   if (attr_mask & IBV_QP_MAX_QP_RD_ATOMIC) {
-    tag->setMaxRdAtomic(attr->max_rd_atomic);
+    tag.setMaxRdAtomic(attr->max_rd_atomic);
   }
   if (attr_mask & IBV_QP_MAX_DEST_RD_ATOMIC) {
-    tag->setMaxDestRdAtomic(attr->max_dest_rd_atomic);
+    tag.setMaxDestRdAtomic(attr->max_dest_rd_atomic);
   }
   if (attr_mask & IBV_QP_PATH_MTU) {
     // path_mtu is expected on INIT -> RTR.
@@ -2079,8 +2080,7 @@ int MetaRoceVerbs::ibv_query_qp(
   if (qp == nullptr) {
     return withErrno(ENOENT);
   }
-  const std::shared_ptr<const Tag> tag =
-      qp->getTag(qpAndTagToTag(ibvqp->qp_num));
+  const Tag* const tag = qp->getTag(qpAndTagToTag(ibvqp->qp_num));
   if (tag == nullptr) {
     return withErrno(ENOENT);
   }
@@ -2399,7 +2399,7 @@ struct ibv_qp* FOLLY_NULLABLE MetaRoceVerbs::ibv_create_qp_ex(
       .mutex = pthread_mutex_t(),
       .cond = pthread_cond_t(),
       .events_completed = 0};
-  std::shared_ptr<Tag> addedTag;
+  Tag* addedTag = nullptr;
   try {
     addedTag = qp.addTagIfAllInReset(
         tagNum,
@@ -2469,8 +2469,8 @@ int MetaRoceVerbs::ibv_destroy_qp(struct ibv_qp* qp) {
     // An ibv_qp is really a Tag. Mark it, but leave it (and its ibv_qp handle)
     // in the table until the whole QP is destroyed -- readers may still ack its
     // WQEs, and the Tag dereferences the handle on its error paths.
-    auto tag = qpIt->second->getTag(tagNum);
-    if (!tag) {
+    Tag* const tag = qpIt->second->getTag(tagNum);
+    if (tag == nullptr) {
       return withErrno(ENOENT);
     }
     // Already marked: this is a double destroy of the ibv_qp.
@@ -2588,8 +2588,7 @@ int MetaRoceVerbs::postSendWr(
     const bool inlineOpcodeOk = wr.opcode == IBV_WR_SEND ||
         wr.opcode == IBV_WR_SEND_WITH_IMM || wr.opcode == IBV_WR_RDMA_WRITE ||
         wr.opcode == IBV_WR_RDMA_WRITE_WITH_IMM;
-    const std::shared_ptr<const Tag> tag =
-        qp.getTag(qpAndTagToTag(ibvqp.qp_num));
+    const Tag* const tag = qp.getTag(qpAndTagToTag(ibvqp.qp_num));
     if (tag == nullptr) {
       return EINVAL;
     }
@@ -2631,8 +2630,7 @@ int MetaRoceVerbs::postSendWr(
 
   const bool countsTowardMaxRdAtomic = isAtomic || isRead || isReadWithImm;
   if (countsTowardMaxRdAtomic) {
-    const std::shared_ptr<const Tag> tag =
-        qp.getTag(qpAndTagToTag(ibvqp.qp_num));
+    const Tag* const tag = qp.getTag(qpAndTagToTag(ibvqp.qp_num));
     if (tag == nullptr) {
       return EINVAL;
     }

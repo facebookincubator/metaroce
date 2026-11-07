@@ -202,12 +202,12 @@ class Qp {
     return tagSet_.contains(tagNum);
   }
 
-  [[nodiscard]] std::shared_ptr<Tag> getTag(uint8_t tagNum) const {
+  [[nodiscard]] Tag* FOLLY_NULLABLE getTag(uint8_t tagNum) const {
     return tagSet_.getTagByNumber(tagNum);
   }
 
   [[nodiscard]] Tag& existingTag(uint8_t tagNum) const {
-    return *CHECK_NOTNULL(tagSet_.getTagByNumber(tagNum).get());
+    return *CHECK_NOTNULL(tagSet_.getTagByNumber(tagNum));
   }
 
   void addTag(
@@ -256,7 +256,7 @@ class Qp {
   // The client path for adding a Tag to a QP that already exists; see
   // TagSet::addIfAllTagsInReset(). The QP's own first Tag uses addTag().
   // Returns the added Tag, or nullptr if a Tag had already left RESET.
-  [[nodiscard]] std::shared_ptr<Tag> addTagIfAllInReset(
+  [[nodiscard]] Tag* FOLLY_NULLABLE addTagIfAllInReset(
       uint8_t tagNum,
       CompletionQueue* sendCq,
       CompletionQueue* recvCq,

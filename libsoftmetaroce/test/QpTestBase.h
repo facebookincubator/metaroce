@@ -128,7 +128,7 @@ class QpTestBase : public ::testing::Test {
   // be gone by then.
   struct ibv_qp otherIbvQpStorage{.pd = &pd};
   Qp qp{10 /*qpNum*/, retxTimer, arbiter, mrs, &cq, ibvQp};
-  std::shared_ptr<Tag> initialTag{nullptr};
+  Tag* initialTag{nullptr};
   uint16_t mtu{4096};
 };
 
