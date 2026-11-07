@@ -58,9 +58,18 @@ static std::
       std::make_unique<NiceMock<MockUDPSocket>>(evb), nullptr);
 }
 
-class SenderTest : public TestWithParam<int> {
+class SenderTest : public Test {
  protected:
   void SetUp() override {
+    createQp();
+  }
+  void TearDown() override {
+    qp = nullptr;
+  }
+
+  void createQp() {
+    // The arbiter takes each QP number once, so the old QP must go first.
+    qp = nullptr;
     qp = std::make_unique<Qp>(10, retxTimer, arbiter, mrs, &cq, &ibvQpStorage);
     qp->addPortPair(localAddr, remoteAddr);
     qp->setRemoteQpNum(100);
@@ -69,9 +78,6 @@ class SenderTest : public TestWithParam<int> {
         std::make_unique<NiceMock<MockCongestionController>>();
     rawCongestionController = congestionController.get();
     qp->setCongestionController(std::move(congestionController));
-  }
-  void TearDown() override {
-    qp = nullptr;
   }
 
   // Helper function to create a test sender with paths already set up.
@@ -643,110 +649,104 @@ TEST_F(SenderTest, SendRetxPacketsDueToLoss) {
  * are synthesized. This is meant to confirm that all the packets are sent and
  * no sequence numbers (e.g., -1) are accidentally made special cases.
  */
-TEST_P(SenderTest, SendNFrames) {
-  const int frames = GetParam();
-  const auto mtu = 4096;
-  const auto flowId = 0;
+TEST_F(SenderTest, SendNFrames) {
+  for (const int frames : {1, 2, 65536 /* max message size of 256MB */}) {
+    SCOPED_TRACE(frames);
+    createQp();
+    const auto mtu = 4096;
+    const auto flowId = 0;
 
-  qp->setMtu(mtu);
+    qp->setMtu(mtu);
 
-  // Keep all TxFlow state on the test thread: no send loop, and the transmit
-  // timers pinned so the retransmission timer never fires mid-transfer.
-  ScopedSuppressedTxTimers suppressTimers;
+    // Keep all TxFlow state on the test thread: no send loop, and the transmit
+    // timers pinned so the retransmission timer never fires mid-transfer.
+    ScopedSuppressedTxTimers suppressTimers;
 
-  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
-      .WillByDefault(Return(1));
-  EXPECT_CALL(*rawCongestionController, onPacketSent(flowId)).Times(frames);
-  // unclear how many acks we'll get.
-  EXPECT_CALL(*rawCongestionController, onPacketAck(flowId, _))
-      .Times(AnyNumber());
-  EXPECT_CALL(*rawCongestionController, onFlowAdded(flowId)).Times(1);
-  EXPECT_CALL(*rawCongestionController, getAvailableWindowSize(flowId))
-      .Times(AnyNumber());
+    ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+        .WillByDefault(Return(1));
+    EXPECT_CALL(*rawCongestionController, onPacketSent(flowId)).Times(frames);
+    // unclear how many acks we'll get.
+    EXPECT_CALL(*rawCongestionController, onPacketAck(flowId, _))
+        .Times(AnyNumber());
+    EXPECT_CALL(*rawCongestionController, onFlowAdded(flowId)).Times(1);
+    EXPECT_CALL(*rawCongestionController, getAvailableWindowSize(flowId))
+        .Times(AnyNumber());
 
-  auto sender = createTestSenderWithFlows(
-      mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
+    auto sender = createTestSenderWithFlows(
+        mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
 
-  // qp->postWqe will set the first send wqe sequence numbers based on
-  // these initial sequence number values.
-  const uint16_t msn = 2;
-  const uint16_t csn = 1;
-  ASSERT_TRUE(qp->getTag(kMetaRoceInitialTag)->setNextMsn(msn))
-      << "precondition: the send must start from the test sequence numbers";
-  ASSERT_TRUE(qp->getTag(kMetaRoceInitialTag)->setNextCsn(csn))
-      << "precondition: the send must start from the test sequence numbers";
-  auto flow = qp->getTxFlowById(flowId);
+    // qp->postWqe will set the first send wqe sequence numbers based on
+    // these initial sequence number values.
+    const uint16_t msn = 2;
+    const uint16_t csn = 1;
+    ASSERT_TRUE(qp->getTag(kMetaRoceInitialTag)->setNextMsn(msn))
+        << "precondition: the send must start from the test sequence numbers";
+    ASSERT_TRUE(qp->getTag(kMetaRoceInitialTag)->setNextCsn(csn))
+        << "precondition: the send must start from the test sequence numbers";
+    auto flow = qp->getTxFlowById(flowId);
 
-  const uint32_t length = frames * qp->getMtu();
-  std::unique_ptr<char[]> payload(new char[length]);
-  auto wqe = std::make_unique<SendWqe>(
-      0 /*workReqId*/,
-      oneSge(
-          payload.get(), /*address*/
-          length),
-      mtu);
-  auto& txState = flow->getTxState();
-  ASSERT_TRUE(qp->postWqe(kMetaRoceInitialTag, std::move(wqe)));
-  EXPECT_EQ(txState.sndUna, 0) << "new txstate should have fsn 0 unacked";
-  EXPECT_EQ(txState.maxAckdFsn, UINT16_MAX) << "max acked should be -1";
+    const uint32_t length = frames * qp->getMtu();
+    std::unique_ptr<char[]> payload(new char[length]);
+    auto wqe = std::make_unique<SendWqe>(
+        0 /*workReqId*/,
+        oneSge(
+            payload.get(), /*address*/
+            length),
+        mtu);
+    auto& txState = flow->getTxState();
+    ASSERT_TRUE(qp->postWqe(kMetaRoceInitialTag, std::move(wqe)))
+        << "precondition: the queue pair accepts the send, or there are no "
+           "frames to pump";
+    EXPECT_EQ(txState.sndUna, 0) << "new txstate should have fsn 0 unacked";
+    EXPECT_EQ(txState.maxAckdFsn, UINT16_MAX) << "max acked should be -1";
 
-  qp->startProcessingWqes();
-  ASSERT_TRUE(qp->waitForWqesToBePosted(1));
+    qp->startProcessingWqes();
+    ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+        << "precondition: the send reaches its tag before the frames are "
+           "pumped";
 
-  // Pump each packet out and ack the fsn just produced, all on the test thread.
-  uint16_t lastAckFsn = 0xffff;
-  for (int sent = 0; sent < frames; ++sent) {
-    auto egressPacket = qp->getNextPacketToSend();
-    ASSERT_TRUE(egressPacket && egressPacket->packet)
-        << "expected packet " << sent + 1 << " of " << frames;
-    auto* packet = dynamic_cast<DataPacket*>(egressPacket->packet.get());
-    ASSERT_NE(packet, nullptr) << "sent packet should be a data packet";
-    const auto& baseHeader = packet->getBaseHeader();
-    EXPECT_EQ(baseHeader.getDstQp(), 100) << "Sent packet validation failure";
-    EXPECT_EQ(baseHeader.getSrcQp(), 10) << "Sent packet validation failure";
-    const auto& dataHeader = packet->getDataHeader();
-    EXPECT_EQ(dataHeader.getMsn(), msn) << "Sent packet validation failure";
-    EXPECT_EQ(dataHeader.getCsn(), csn) << "Sent packet validation failure";
+    // Pump each packet out and ack the fsn just produced, all on the test
+    // thread.
+    uint16_t lastAckFsn = 0xffff;
+    for (int sent = 0; sent < frames; ++sent) {
+      auto egressPacket = qp->getNextPacketToSend();
+      ASSERT_TRUE(egressPacket && egressPacket->packet)
+          << "expected packet " << sent + 1 << " of " << frames;
+      auto* packet = dynamic_cast<DataPacket*>(egressPacket->packet.get());
+      ASSERT_NE(packet, nullptr) << "sent packet should be a data packet";
+      const auto& baseHeader = packet->getBaseHeader();
+      EXPECT_EQ(baseHeader.getDstQp(), 100) << "Sent packet validation failure";
+      EXPECT_EQ(baseHeader.getSrcQp(), 10) << "Sent packet validation failure";
+      const auto& dataHeader = packet->getDataHeader();
+      EXPECT_EQ(dataHeader.getMsn(), msn) << "Sent packet validation failure";
+      EXPECT_EQ(dataHeader.getCsn(), csn) << "Sent packet validation failure";
 
-    const auto fsn = dataHeader.getFsn();
-    const auto timestamp = dataHeader.getTimestamp();
-    const AckHeader ackHeader = AckHeader::AckHeaderBuilder()
-                                    .setCumulativeFsn(fsn)
-                                    .setMaxRcvdFsn(fsn)
-                                    .setAckStatus(AckStatus::ACK)
-                                    .setTimestamp(timestamp)
-                                    .build();
-    const auto nowNs = getNowNs();
-    flow->processAckPacket(ackHeader, nowNs);
-    lastAckFsn = fsn;
+      const auto fsn = dataHeader.getFsn();
+      const auto timestamp = dataHeader.getTimestamp();
+      const AckHeader ackHeader = AckHeader::AckHeaderBuilder()
+                                      .setCumulativeFsn(fsn)
+                                      .setMaxRcvdFsn(fsn)
+                                      .setAckStatus(AckStatus::ACK)
+                                      .setTimestamp(timestamp)
+                                      .build();
+      const auto nowNs = getNowNs();
+      flow->processAckPacket(ackHeader, nowNs);
+      lastAckFsn = fsn;
 
-    auto rttNs = flow->computeRttNs(timestamp, nowNs);
-    if (rttNs < 64 * (txState.estRttNs + txState.mdevRttNs)) {
-      EXPECT_TRUE(after(txState.sndUna, fsn))
-          << "tx state should accept ack " << fsn << " and advance Una "
-          << txState.sndUna;
+      auto rttNs = flow->computeRttNs(timestamp, nowNs);
+      if (rttNs < 64 * (txState.estRttNs + txState.mdevRttNs)) {
+        EXPECT_TRUE(after(txState.sndUna, fsn))
+            << "tx state should accept ack " << fsn << " and advance Una "
+            << txState.sndUna;
+      }
     }
+    EXPECT_EQ(lastAckFsn, static_cast<uint16_t>(frames - 1))
+        << "all " << frames << " frames should have been produced and acked";
+
+    qp = nullptr;
+    sender = nullptr;
   }
-  EXPECT_EQ(lastAckFsn, static_cast<uint16_t>(frames - 1))
-      << "all " << frames << " frames should have been produced and acked";
-
-  qp = nullptr;
-  sender = nullptr;
 }
-
-INSTANTIATE_TEST_SUITE_P(
-    SenderTestSendNFramesSuite,
-    SenderTest,
-    Values(
-        1,
-        2,
-        10,
-        100,
-        1024,
-        16384,
-        32768,
-        65536 // max message size of 256MB
-        ));
 
 namespace {
 // Drive the QP until it offers no packet, returning the data packets admitted.
