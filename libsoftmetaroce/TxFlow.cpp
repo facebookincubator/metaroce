@@ -345,6 +345,7 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetRetransmissionPacket() {
     }
 
     setRetransmissionTimer();
+    retxPacket->getDataHeader().setTimestamp(getNowNs());
     VLOG(1) << "Sending retx packet for qp: " << qp_.getLocalQpNum()
             << " fsn: " << retxPacket->getDataHeader().getFsn()
             << " msn: " << retxPacket->getDataHeader().getMsn()

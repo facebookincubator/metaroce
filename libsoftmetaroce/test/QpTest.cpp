@@ -277,6 +277,37 @@ TEST_F(QpTest, GetNextPacketToSend) {
   EXPECT_EQ(msgSizeToSendBytes, 0);
 }
 
+TEST_F(QpTest, ARetransmissionCarriesTheTimeItIsSent) {
+  ScopedSuppressedTxTimers suppressTimers;
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 1, &mockSender);
+  auto flow = qp.getTxFlowById(0);
+  auto payload = std::make_unique<char[]>(mtu);
+  postWqeHelper(
+      &qp,
+      {.workType = Wqe::WorkType::kSend,
+       .msgSizeBytes = mtu,
+       .address = payload.get()});
+  ASSERT_TRUE(flow->getNextPacketToSend())
+      << "precondition: the original must be sent before it can time out";
+
+  flow->prepareRetxPacketsIfAny(true /*isRtoEvent*/);
+  const uint32_t queuedByNs = getNowNs();
+  uint32_t sendStartNs = getNowNs();
+  while (sendStartNs == queuedByNs) {
+    sendStartNs = getNowNs();
+  }
+  auto egressPacket = flow->getNextPacketToSend();
+  ASSERT_TRUE(egressPacket)
+      << "precondition: the timeout queues the unacked packet again";
+  auto* packet = dynamic_cast<DataPacket*>(egressPacket->packet.get());
+  ASSERT_NE(packet, nullptr);
+  EXPECT_TRUE(afterOrEqual(packet->getDataHeader().getTimestamp(), sendStartNs))
+      << "the receiver echoes this timestamp and the sender takes the RTT "
+         "from it, so a stamp from when the retransmission was queued counts "
+         "the wait to send as network delay";
+}
+
 TEST_F(QpTest, SendLastMarksFinalPacketAndRetransmission) {
   gflags::FlagSaver flagSaver;
   FLAGS_libsoftmetaroce_emit_send_last = true;
