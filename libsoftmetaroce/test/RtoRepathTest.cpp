@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <fmt/core.h>
 #include <folly/synchronization/Baton.h>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
@@ -33,6 +34,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -748,13 +750,7 @@ TEST_P(RtoRepathTest, RepeatedTimeoutsVisitEveryConfiguredPair) {
        {0, locals[0], 2, remotes[2]},
        {2, locals[2], 3, remotes[3]}},
       8);
-  const std::array<std::pair<folly::IPAddress, folly::IPAddress>, 4>
-      expectedEndpoints{{
-          {locals[1], remotes[1]},
-          {locals[0], remotes[2]},
-          {locals[2], remotes[3]},
-          {locals[0], remotes[0]},
-      }};
+  constexpr size_t kNumPairs = 4;
   auto* flow = testQp->getTxFlowById(0);
   ASSERT_NE(flow, nullptr);
   ASSERT_TRUE(sendFrames(1))
@@ -764,7 +760,7 @@ TEST_P(RtoRepathTest, RepeatedTimeoutsVisitEveryConfiguredPair) {
   ASSERT_EQ(
       std::make_pair(std::get<0>(original), std::get<1>(original)),
       initialEndpoints)
-      << "precondition: pair zero seeds the configured-pair traversal";
+      << "precondition: the flow starts on pair zero";
 
   ASSERT_TRUE(advanceTimeouts(2))
       << "the entropy threshold must follow two complete timer callbacks";
@@ -778,20 +774,116 @@ TEST_P(RtoRepathTest, RepeatedTimeoutsVisitEveryConfiguredPair) {
   expectPacketRoute(*entropyOnly, *flow, initialEndpoints);
   expectRepeatedVisitPreservesRoute(*flow);
 
-  for (size_t lap = 0; lap < 2; ++lap) {
-    SCOPED_TRACE(lap);
-    for (const auto& endpoints : expectedEndpoints) {
-      SCOPED_TRACE(endpoints.second.str());
-      const auto oldRoute = route(*flow);
-      ASSERT_TRUE(advanceTimeouts(1))
-          << "each configured-pair move must follow a complete timer callback";
-      EXPECT_EQ(route(*flow), oldRoute)
-          << "timer callbacks must leave configured-pair selection to the sender";
-      auto packet = flow->getNextPacketToSend();
-      ASSERT_TRUE(packet)
-          << "continued recovery must retransmit on every configured pair";
-      expectPacketRoute(*packet, *flow, endpoints);
-      expectRepeatedVisitPreservesRoute(*flow);
+  std::vector<std::pair<folly::IPAddress, folly::IPAddress>> visited{
+      initialEndpoints};
+  for (size_t priorMoves = 0; priorMoves < 2 * kNumPairs; ++priorMoves) {
+    SCOPED_TRACE(priorMoves);
+    const auto oldRoute = route(*flow);
+    ASSERT_TRUE(advanceTimeouts(1))
+        << "each configured-pair move must follow a complete timer callback";
+    EXPECT_EQ(route(*flow), oldRoute)
+        << "timer callbacks must leave configured-pair selection to the sender";
+    auto packet = flow->getNextPacketToSend();
+    ASSERT_TRUE(packet)
+        << "continued recovery must retransmit on every configured pair";
+    const auto endpoints = std::make_pair(
+        sender->getAddressFromSocketId(flow->getSocketId()),
+        packet->remoteAddr);
+    expectPacketRoute(*packet, *flow, endpoints);
+    EXPECT_NE(endpoints, visited.back())
+        << "an unanswered RTO past the threshold must move the flow off the "
+           "pair that is not answering";
+    visited.push_back(endpoints);
+    expectRepeatedVisitPreservesRoute(*flow);
+  }
+  for (size_t first = 0; first + kNumPairs <= visited.size(); ++first) {
+    const std::set<std::pair<folly::IPAddress, folly::IPAddress>> window(
+        visited.begin() + first, visited.begin() + first + kNumPairs);
+    EXPECT_EQ(window.size(), kNumPairs)
+        << "moves starting at " << first << " must try every configured pair "
+        << "before returning to one, or a working pair can go untried";
+  }
+}
+
+TEST(FailoverPairTest, AFlowTriesEveryPairBeforeRepeatingOne) {
+  for (uint32_t numPairs = 2; numPairs <= 8; ++numPairs) {
+    for (uint32_t firstChoice = 0; firstChoice < 8; ++firstChoice) {
+      for (uint16_t original = 0; original < numPairs; ++original) {
+        SCOPED_TRACE(
+            fmt::format(
+                "{} pairs, first choice {}, from pair {}",
+                numPairs,
+                firstChoice,
+                original));
+        std::vector<uint16_t> visited{original};
+        for (uint32_t priorMoves = 0; priorMoves < 3 * numPairs; ++priorMoves) {
+          const uint16_t next = TxFlow::selectFailoverPair(
+              original, visited.back(), priorMoves, numPairs, firstChoice);
+          EXPECT_NE(next, visited.back())
+              << "a move must leave the pair that is not answering";
+          visited.push_back(next);
+        }
+        for (size_t first = 0; first + numPairs <= visited.size(); ++first) {
+          const std::set<uint16_t> window(
+              visited.begin() + first, visited.begin() + first + numPairs);
+          EXPECT_EQ(window.size(), numPairs)
+              << "moves starting at " << first << " must try every pair "
+              << "before returning to one";
+        }
+      }
+    }
+  }
+}
+
+TEST(FailoverPairTest, FlowsLeavingOnePairFromSeveralQpsSpread) {
+  for (uint32_t numPairs = 3; numPairs <= 8; ++numPairs) {
+    for (uint16_t pair = 0; pair < numPairs; ++pair) {
+      // A QP whose pair rotation is base starts its flow (pair - base) on
+      // pair, and chooses with base plus that flow's index divided by the
+      // pair count, which is base here.
+      std::set<uint16_t> destinations;
+      for (uint32_t base = 0; base < numPairs; ++base) {
+        destinations.insert(
+            TxFlow::selectFailoverPair(pair, pair, 0, numPairs, base));
+      }
+      EXPECT_GT(destinations.size(), 1)
+          << numPairs << " pairs: flows leaving pair " << pair
+          << " from several QPs must not all fail over to one pair, which "
+             "would carry their load on top of its own";
+    }
+  }
+}
+
+TEST(FailoverPairTest, FlowsLeavingOnePairCanReachEveryOtherPair) {
+  for (uint32_t numPairs = 2; numPairs <= 8; ++numPairs) {
+    for (uint16_t pair = 0; pair < numPairs; ++pair) {
+      std::set<uint16_t> destinations;
+      for (uint32_t firstChoice = 0; firstChoice < numPairs; ++firstChoice) {
+        destinations.insert(
+            TxFlow::selectFailoverPair(pair, pair, 0, numPairs, firstChoice));
+      }
+      EXPECT_EQ(destinations.size(), numPairs - 1)
+          << numPairs << " pairs: traffic leaving pair " << pair
+          << " must be able to reach every other pair, or the pairs it never "
+             "reaches carry none of the failed pair's load";
+    }
+  }
+}
+
+TEST(FailoverPairTest, FlowsOfOneQpSharingAPairSpread) {
+  for (uint32_t numPairs = 3; numPairs <= 8; ++numPairs) {
+    for (uint32_t base = 0; base < numPairs; ++base) {
+      for (uint32_t flowId = 0; flowId < numPairs; ++flowId) {
+        // Flows flowId and flowId + numPairs start on the same pair, and
+        // their first choices differ by one.
+        const auto pair = static_cast<uint16_t>((base + flowId) % numPairs);
+        EXPECT_NE(
+            TxFlow::selectFailoverPair(pair, pair, 0, numPairs, base),
+            TxFlow::selectFailoverPair(pair, pair, 0, numPairs, base + 1))
+            << numPairs << " pairs, rotation " << base << ": flows " << flowId
+            << " and " << flowId + numPairs << " share pair " << pair
+            << " and must not fail over to the same pair";
+      }
     }
   }
 }

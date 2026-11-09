@@ -1566,19 +1566,24 @@ void TxFlow::applyRtoRepath() {
           << rtoCount << " socket " << oldSocketId << " -> " << socketId_;
 
   if (rtoCount > threshold) {
-    tryMoveToNextPortPair();
+    tryMoveToFailoverPortPair(rtoCount - threshold - 1);
   }
 }
 
-void TxFlow::tryMoveToNextPortPair() {
-  const auto numPairs = qp_.portPairs_.size();
+void TxFlow::tryMoveToFailoverPortPair(uint32_t priorMoves) {
+  const auto numPairs = static_cast<uint32_t>(qp_.portPairs_.size());
   // Every live flow retains at least one configured port pair.
   CHECK_GT(numPairs, 0);
   if (numPairs == 1) {
     return;
   }
   const auto oldPairIdx = portPairIdx_;
-  const auto newPairIdx = static_cast<uint16_t>((oldPairIdx + 1) % numPairs);
+  const auto newPairIdx = selectFailoverPair(
+      originalPortPairIdx_,
+      oldPairIdx,
+      priorMoves,
+      numPairs,
+      qp_.getPortPairRotation() + flowId_ / numPairs);
   const auto& oldPair = qp_.portPairs_.at(oldPairIdx);
   const auto& newPair = qp_.portPairs_.at(newPairIdx);
   if (newPair.localPortIdx != oldPair.localPortIdx) {
@@ -1600,6 +1605,28 @@ void TxFlow::tryMoveToNextPortPair() {
             << oldPair.localPortIdx << ", remote " << oldPair.remotePortIdx
             << ") to " << newPairIdx << " (local " << newPair.localPortIdx
             << ", remote " << newPair.remotePortIdx << ")";
+}
+
+uint16_t TxFlow::selectFailoverPair(
+    uint16_t originalPairIdx,
+    uint16_t currentPairIdx,
+    uint32_t priorMoves,
+    uint32_t numPairs,
+    uint32_t firstChoice) {
+  CHECK_GE(numPairs, 2u);
+  const uint32_t numAlternatives = numPairs - 1;
+  auto pairForMove = [originalPairIdx, numPairs, numAlternatives, firstChoice](
+                         uint32_t move) {
+    const uint32_t step = move % numPairs;
+    if (step == numAlternatives) {
+      return originalPairIdx;
+    }
+    const uint32_t distanceBelow = 1 + (firstChoice + step) % numAlternatives;
+    return static_cast<uint16_t>(
+        (originalPairIdx + numPairs - distanceBelow) % numPairs);
+  };
+  const uint16_t pairIdx = pairForMove(priorMoves);
+  return pairIdx == currentPairIdx ? pairForMove(priorMoves + 1) : pairIdx;
 }
 
 uint16_t TxFlow::findAlternatePortPair(

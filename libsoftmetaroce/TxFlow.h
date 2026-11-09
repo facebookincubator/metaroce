@@ -137,6 +137,16 @@ class TxFlow : public Flow {
 
   [[nodiscard]] uint32_t computeRtoIntervalUs() const;
 
+  // The pair an RTO move takes a flow to. Each lap of numPairs moves tries
+  // every other pair once, starting firstChoice pairs below the original, then
+  // returns to the original pair.
+  [[nodiscard]] static uint16_t selectFailoverPair(
+      uint16_t originalPairIdx,
+      uint16_t currentPairIdx,
+      uint32_t priorMoves,
+      uint32_t numPairs,
+      uint32_t firstChoice);
+
   // Return a retransmission or window-eligible new data packet, or nullptr if
   // none is ready. Caller must serialize TX visits and ACK application; hold
   // Qp::txStateLock_ when ACKs are applied inline.
@@ -228,7 +238,7 @@ class TxFlow : public Flow {
   void onRetransmissionTimeout();
 
   void applyRtoRepath();
-  void tryMoveToNextPortPair();
+  void tryMoveToFailoverPortPair(uint32_t priorMoves);
   [[nodiscard]] uint16_t findAlternatePortPair(
       uint16_t activePortSet,
       bool sameLocalOnly) const;
