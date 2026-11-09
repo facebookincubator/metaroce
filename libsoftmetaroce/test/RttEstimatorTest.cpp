@@ -35,6 +35,8 @@ DECLARE_bool(libsoftmetaroce_rfc6298_first_rtt_sample);
 DECLARE_uint32(libsoftmetaroce_initial_est_rtt_us);
 // NOLINTNEXTLINE(facebook-hte-PreventUseOfDeclareGflag)
 DECLARE_uint32(libsoftmetaroce_initial_mdev_rtt_us);
+// NOLINTNEXTLINE(facebook-hte-PreventUseOfDeclareGflag)
+DECLARE_uint32(libsoftmetaroce_rto_rho_us);
 
 using namespace testing;
 namespace libsoftmetaroce {
@@ -138,6 +140,19 @@ TEST_F(RttEstimatorTest, FirstSamplePutsRtoAtThreeTimesTheMeasurement) {
       << "rto is srtt + 4*mdev, so seeding R and R/2 must land on exactly 3R; "
          "anything shorter retransmits into a receiver already measured to be "
          "this slow";
+}
+
+TEST_F(RttEstimatorTest, RhoIsAddedToTheEstimate) {
+  constexpr uint32_t kRhoUs = 3'000;
+  FLAGS_libsoftmetaroce_rto_rho_us = kRhoUs;
+  auto* flow = makeFlow();
+  ASSERT_NE(flow, nullptr);
+
+  flow->updateRtt(kSentAtNs, kSentAtNs + kRttNs);
+
+  EXPECT_EQ(flow->computeRtoIntervalUs(), 3 * kRttNs / kNsPerUs + kRhoUs)
+      << "the timeout is srtt + 4*mdev plus the configured rho; leaving rho "
+         "out retransmits earlier than the operator configured";
 }
 
 TEST_F(RttEstimatorTest, LaterSamplesAreFilteredRatherThanAdopted) {
@@ -269,6 +284,22 @@ TEST_F(RttEstimatorTest, InitialRttFlagsRejectValuesThatOverflowNanoseconds) {
         gflags::SetCommandLineOption(flag, std::to_string(kMaxUs).c_str()), "")
         << flag << " must still accept the largest value that converts cleanly";
   }
+}
+
+TEST_F(RttEstimatorTest, RhoFlagRejectsAValueThatOverflowsNanoseconds) {
+  constexpr uint32_t kMaxUs = std::numeric_limits<uint32_t>::max() / kNsPerUs;
+
+  EXPECT_EQ(
+      gflags::SetCommandLineOption(
+          "libsoftmetaroce_rto_rho_us", std::to_string(kMaxUs + 1).c_str()),
+      "")
+      << "rho is held in nanoseconds in 32 bits; accepting a larger value "
+         "would wrap it to a short offset";
+  EXPECT_NE(
+      gflags::SetCommandLineOption(
+          "libsoftmetaroce_rto_rho_us", std::to_string(kMaxUs).c_str()),
+      "")
+      << "the largest rho that converts cleanly must still be accepted";
 }
 
 TEST_F(RttEstimatorTest, QpEstimatorTakesItsInitialValueFromTheFlag) {

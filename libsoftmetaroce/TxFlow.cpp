@@ -61,6 +61,12 @@ DEFINE_uint32(
     "unset, --libsoftmetaroce_slow_receiver supplies 250ms instead, holding "
     "the cold-start RTO near a second; setting this takes precedence.");
 
+DEFINE_uint32(
+    libsoftmetaroce_rto_rho_us,
+    0,
+    "Rho, added to srtt + 4*mdev in the retransmission timeout, in "
+    "microseconds.");
+
 DEFINE_bool(
     libsoftmetaroce_rfc6298_first_rtt_sample,
     true,
@@ -87,6 +93,7 @@ bool validateInitialRttUs(const char* flagname, uint32_t valueUs) {
 
 DEFINE_validator(libsoftmetaroce_initial_est_rtt_us, &validateInitialRttUs);
 DEFINE_validator(libsoftmetaroce_initial_mdev_rtt_us, &validateInitialRttUs);
+DEFINE_validator(libsoftmetaroce_rto_rho_us, &validateInitialRttUs);
 
 namespace libsoftmetaroce {
 
@@ -133,7 +140,8 @@ TxFlow::TxFlow(
       qpRetxTimer_{qpRetxTimer},
       sackRetxConfig_{sackRetxConfig},
       minRtoNs_{uint64_t{FLAGS_libsoftmetaroce_min_rto_us} * kNsPerUs},
-      maxRtoNs_{resolveMaxRtoNs(kDefaultMaxRtoNs)} {
+      maxRtoNs_{resolveMaxRtoNs(kDefaultMaxRtoNs)},
+      rhoNs_{FLAGS_libsoftmetaroce_rto_rho_us * kNsPerUs} {
   retxTimerCallback_ = std::make_unique<HighResTimer::Callback>(
       [this]() { onRetransmissionTimeout(); });
   txState_.estRttNs = FLAGS_libsoftmetaroce_initial_est_rtt_us * kNsPerUs;
@@ -162,6 +170,7 @@ TxFlow::TxFlow(TxFlow&& other) noexcept
       sackRetxConfig_{other.sackRetxConfig_},
       minRtoNs_{other.minRtoNs_},
       maxRtoNs_{other.maxRtoNs_},
+      rhoNs_{other.rhoNs_},
       txState_{std::move(other.txState_)},
       consecutiveRtosWithoutAck_{other.consecutiveRtosWithoutAck_.load()},
       lastConsumedRtoCount_{other.lastConsumedRtoCount_} {
@@ -184,12 +193,10 @@ TxFlow::~TxFlow() {
 uint32_t TxFlow::computeRtoIntervalUs() const {
   unsigned int exponent = std::min(
       kMaxRtoBackoffExponent, (unsigned int)consecutiveRtosWithoutAck_);
-  const auto rtoNs = std::max(
-      minRtoNs_,
-      std::min(
-          static_cast<uint64_t>(txState_.estRttNs + (txState_.mdevRttNs << 2))
-              << exponent,
-          maxRtoNs_));
+  const uint64_t baseRtoNs = uint64_t{txState_.estRttNs} +
+      (uint64_t{txState_.mdevRttNs} << 2) + rhoNs_;
+  const auto rtoNs =
+      std::max(minRtoNs_, std::min(baseRtoNs << exponent, maxRtoNs_));
   // RTO timeout precision is in microseconds
   // @lint-ignore CLANGTIDY clang-diagnostic-shorten-64-to-32
   return rtoNs / kNsPerUs;
