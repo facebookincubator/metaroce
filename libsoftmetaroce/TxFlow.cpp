@@ -193,8 +193,10 @@ TxFlow::~TxFlow() {
 uint32_t TxFlow::computeRtoIntervalUs() const {
   unsigned int exponent = std::min(
       kMaxRtoBackoffExponent, (unsigned int)consecutiveRtosWithoutAck_);
-  const uint64_t baseRtoNs = uint64_t{txState_.estRttNs} +
-      (uint64_t{txState_.mdevRttNs} << 2) + rhoNs_;
+  const uint64_t baseRtoNs = std::max(
+      uint64_t{txState_.estRttNs} + (uint64_t{txState_.mdevRttNs} << 2) +
+          rhoNs_,
+      uint64_t{txState_.latestRttSampleNs});
   const auto rtoNs =
       std::max(minRtoNs_, std::min(baseRtoNs << exponent, maxRtoNs_));
   // RTO timeout precision is in microseconds
@@ -1509,6 +1511,7 @@ void TxFlow::updateRtt(uint32_t timestampNs, uint32_t nowNs) {
     return;
   }
   const auto rttNs = computeRttNs(timestampNs, nowNs);
+  txState_.latestRttSampleNs = rttNs;
   if (!txState_.haveRttSample) {
     txState_.haveRttSample = true;
     if (FLAGS_libsoftmetaroce_rfc6298_first_rtt_sample) {

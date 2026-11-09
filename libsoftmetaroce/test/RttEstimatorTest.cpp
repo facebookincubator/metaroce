@@ -37,6 +37,8 @@ DECLARE_uint32(libsoftmetaroce_initial_est_rtt_us);
 DECLARE_uint32(libsoftmetaroce_initial_mdev_rtt_us);
 // NOLINTNEXTLINE(facebook-hte-PreventUseOfDeclareGflag)
 DECLARE_uint32(libsoftmetaroce_rto_rho_us);
+// NOLINTNEXTLINE(facebook-hte-PreventUseOfDeclareGflag)
+DECLARE_uint32(libsoftmetaroce_min_rto_us);
 
 using namespace testing;
 namespace libsoftmetaroce {
@@ -153,6 +155,27 @@ TEST_F(RttEstimatorTest, RhoIsAddedToTheEstimate) {
   EXPECT_EQ(flow->computeRtoIntervalUs(), 3 * kRttNs / kNsPerUs + kRhoUs)
       << "the timeout is srtt + 4*mdev plus the configured rho; leaving rho "
          "out retransmits earlier than the operator configured";
+}
+
+TEST_F(RttEstimatorTest, RtoIsNoShorterThanTheLatestSample) {
+  constexpr uint32_t kSteadyRttNs = 1'000'000;
+  constexpr uint32_t kJumpRttNs = 10'000'000;
+  FLAGS_libsoftmetaroce_min_rto_us = 1;
+  auto* flow = makeFlow();
+  ASSERT_NE(flow, nullptr);
+  flow->updateRtt(kSentAtNs, kSentAtNs + kSteadyRttNs);
+
+  flow->updateRtt(kSentAtNs, kSentAtNs + kJumpRttNs);
+
+  const auto& txState = flow->getTxState();
+  ASSERT_LT(
+      uint64_t{txState.estRttNs} + 4 * uint64_t{txState.mdevRttNs}, kJumpRttNs)
+      << "precondition: the filtered estimate must trail the jump, or the "
+         "estimate alone already covers the sample";
+  EXPECT_EQ(flow->computeRtoIntervalUs(), kJumpRttNs / kNsPerUs)
+      << "the rto is never shorter than the latest sample; a timer shorter "
+         "than the round trip just measured retransmits every packet still in "
+         "flight at that delay";
 }
 
 TEST_F(RttEstimatorTest, LaterSamplesAreFilteredRatherThanAdopted) {

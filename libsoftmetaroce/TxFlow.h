@@ -104,6 +104,7 @@ class TxFlow : public Flow {
     };
     uint32_t estRttNs{kInitialEstRttNs};
     uint32_t mdevRttNs{kInitialMdevRttNs};
+    uint32_t latestRttSampleNs{0};
     bool haveRttSample{false};
     uint16_t sndNxt{0}; // Next FSN to be sent
     uint16_t sndUna{0}; // Next FSN to be (in-order) ACKed
