@@ -470,10 +470,8 @@ TEST(CodecTest, RnrBackoffTime) {
       static_cast<uint32_t>(FLAGS_libsoftmetaroce_min_rnr_backoff_us))
       << "exp 0 should yield the configured minimum backoff";
 
-  // exp > 0 yields exactly the protocol base unit (5us) shifted by exp. The
-  // upper bound keeps 5us << exp within the int range the implementation
-  // shifts into.
-  for (uint8_t exp = 1; exp <= 20; exp++) {
+  // A defined exp yields exactly the protocol base unit (5us) shifted by exp.
+  for (uint8_t exp = 1; exp <= kMaxRnrBackoffTimeExp; exp++) {
     const AckHeader hrnrHeader = makeHrnr(exp);
     EXPECT_EQ(hrnrHeader.getAckStatus(), AckStatus::HRNR);
     EXPECT_TRUE(hrnrHeader.isHrnr());
@@ -484,6 +482,15 @@ TEST(CodecTest, RnrBackoffTime) {
         hrnrHeader.computeRnrBackoffTimeUs(), static_cast<uint32_t>(5u << exp))
         << "backoff for exp " << static_cast<int>(exp)
         << " should be 5us << exp";
+  }
+
+  for (uint8_t exp = kMaxRnrBackoffTimeExp + 1; exp <= 0x1f; exp++) {
+    EXPECT_EQ(
+        makeHrnr(exp).computeRnrBackoffTimeUs(),
+        kRnrBackoffBaseUs << kMaxRnrBackoffTimeExp)
+        << "a reserved exponent " << static_cast<int>(exp)
+        << " must not pause transmission longer than the 163.84 ms the "
+           "largest defined exponent requests";
   }
 
   // When the shifted value is below the configured minimum, the minimum wins.

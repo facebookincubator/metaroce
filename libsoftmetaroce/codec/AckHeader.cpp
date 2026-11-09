@@ -225,7 +225,8 @@ AckHeader AckHeader::AckHeaderBuilder::build() && {
 }
 
 uint32_t AckHeader::computeRnrBackoffTimeUs() const {
-  uint8_t rnrBackoffTimeExp = getRnrBackoffTimeExp();
+  const uint8_t rnrBackoffTimeExp =
+      std::min(getRnrBackoffTimeExp(), kMaxRnrBackoffTimeExp);
   if (rnrBackoffTimeExp == 0) {
     return FLAGS_libsoftmetaroce_min_rnr_backoff_us;
   } else {
