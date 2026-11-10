@@ -18,5 +18,5 @@
 
 DEFINE_uint32(
     libsoftmetaroce_nic_rate_gbps,
-    10,
+    100,
     "NIC rate in Gbps for RCN rate hint computation.");
