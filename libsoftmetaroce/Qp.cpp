@@ -305,8 +305,7 @@ Qp::Qp(
     }
     bool newlyProbing = false;
     bool retryLimitExceeded = false;
-    for (const auto tagNum : tagSet_.getTagNums()) {
-      Tag& tag = existingTag(tagNum);
+    for (Tag& tag : tagSet_.tags()) {
       auto tagGuard = tag.scopedLock();
       if (tag.getBrnrState() == BrnrState::BRNR_BLOCKED_TX) {
         // Each backoff expiry initiates one more probe (retry). A finite
@@ -448,8 +447,7 @@ Qp::~Qp() {
   // Complete outstanding WQEs with a flush error (verbs contract on destroy).
   // Safe without first clearing the tx trackers' raw Wqe* refs: teardown has
   // quiesced the timers, coroutines, and receives that would dereference them.
-  for (const auto tagNum : tagSet_.getTagNums()) {
-    Tag& tag = existingTag(tagNum);
+  for (Tag& tag : tagSet_.tags()) {
     auto retirementGuard = tag.lockForWqeRetirement();
     tag.flushAllPendingWqesInError();
   }
@@ -795,8 +793,8 @@ void Qp::checkRcnActiveOnWqeCompletion() {
     return;
   }
   // Stay active if any other receive WQE is still actively receiving data
-  for (const auto tagNum : tagSet_.getTagNums()) {
-    if (existingTag(tagNum).hasPartiallyReceivedRWqe()) {
+  for (const Tag& tag : tagSet_.tags()) {
+    if (tag.hasPartiallyReceivedRWqe()) {
       return;
     }
   }
@@ -1407,8 +1405,7 @@ void Qp::onEnteringRts() {
   // Every Tag's timeout and retry count are refused past RTR, and one timer
   // serves the QP, so the longest deadline any Tag sets wins.
   std::chrono::milliseconds longestIntervalMs{0};
-  for (const auto tagNum : tagSet_.getTagNums()) {
-    const Tag& tag = existingTag(tagNum);
+  for (const Tag& tag : tagSet_.tags()) {
     const auto exponent = tag.getLocalAckTimeoutExponent();
     // A retry count multiplies a wait, so a Tag setting one without a timeout
     // has set no wait for it to multiply and derives no deadline here.
@@ -1468,8 +1465,7 @@ void Qp::processWatchdogExpiry() {
   // One: mark the work failing and error the tags. No work request is freed
   // here -- one with a frame in flight is not settled, so it does not retire.
   SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
-  for (const auto tagNum : tagSet_.getTagNums()) {
-    Tag& tag = existingTag(tagNum);
+  for (Tag& tag : tagSet_.tags()) {
     auto tagGuard = tag.scopedLock();
     auto retirementGuard = tag.lockForWqeRetirement();
 
@@ -1497,8 +1493,7 @@ void Qp::processWatchdogExpiry() {
   // Three: whatever the sweep did not settle. A tag with no send of its own is
   // finished with the receives it holds: it is in error as of the first pass,
   // so no arriving packet will fill them.
-  for (const auto tagNum : tagSet_.getTagNums()) {
-    Tag& tag = existingTag(tagNum);
+  for (Tag& tag : tagSet_.tags()) {
     auto tagGuard = tag.scopedLock();
     auto retirementGuard = tag.lockForWqeRetirement();
     tag.flushAllPendingWqesInError();
@@ -1513,8 +1508,7 @@ SenderWake Qp::processRnrRetryExceeded() {
   // enter the error state. The rest are still making progress, or waiting on a
   // receiver that has not yet run out of chances to post a buffer.
   SenderWake tagErrorWake = SenderWake::NOT_NEEDED;
-  for (const auto tagNum : tagSet_.getTagNums()) {
-    Tag& tag = existingTag(tagNum);
+  for (Tag& tag : tagSet_.tags()) {
     auto tagGuard = tag.scopedLock();
     // The same fact the backoff timer acted on: spending an allowance is
     // arithmetic, and a zero one reads as spent before any receiver spoke.
@@ -1525,7 +1519,7 @@ SenderWake Qp::processRnrRetryExceeded() {
     auto retirementGuard = tag.lockForWqeRetirement();
     LOG(ERROR) << "RNR retry limit (" << (int)tag.getRnrRetryLimit()
                << ") exceeded for qp: " << localQpNum_
-               << " tag: " << (uint32_t)tagNum;
+               << " tag: " << (uint32_t)tag.getTagNum();
     // Through the funnel even though this marks the work failing right here;
     // the sweep it asks for finds no work left.
     tagErrorWake |= enterTagErrorWithTagHeld(tag);

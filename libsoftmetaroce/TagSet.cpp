@@ -211,16 +211,6 @@ uint32_t TagSet::getQpNum() const {
   return qpNum_;
 }
 
-std::vector<uint8_t> TagSet::getTagNums() const {
-  std::scoped_lock lock(stateLock_);
-  std::vector<uint8_t> tagNums;
-  tagNums.reserve(tags_.size());
-  for (const auto& tag : tags_) {
-    tagNums.push_back(tag->getTagNum());
-  }
-  return tagNums;
-}
-
 bool TagSet::contains(uint8_t tagNum) const {
   std::scoped_lock lock(stateLock_);
   return getTagByNumber(tagNum) != nullptr;

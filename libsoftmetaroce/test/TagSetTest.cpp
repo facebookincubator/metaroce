@@ -189,8 +189,8 @@ class TagSetTest : public ::testing::Test {
     admissionCancellation_.requestCancellation();
     admissionExecutor_.drain();
     if (!admissionLoop_->isReady()) {
-      for (const auto tagNum : tagSet_->getTagNums()) {
-        tagSet_->at(tagNum).markForDeletion();
+      for (Tag& tag : tagSet_->tags()) {
+        tag.markForDeletion();
       }
       admissionExecutor_.drain();
     }
@@ -297,17 +297,21 @@ TEST_F(TagSetTest, GetNonExistentTag) {
 }
 
 // Test getTags method
-TEST_F(TagSetTest, GetTagNumss) {
-  // Initially empty
-  EXPECT_TRUE(tagSet_->getTagNums().empty());
+TEST_F(TagSetTest, TagsAreTheAddedTagsInTagNumberOrder) {
+  EXPECT_TRUE(tagSet_->tags().empty())
+      << "a set no Tag was added to has no Tag to visit";
 
-  // Add some tags
-  tagSet_->add(1, cqs_[0].get(), ibvQp_);
   tagSet_->add(3, cqs_[1].get(), ibvQp_);
+  tagSet_->add(1, cqs_[0].get(), ibvQp_);
   tagSet_->add(5, cqs_[2].get(), ibvQp_);
 
-  EXPECT_THAT(tagSet_->getTagNums(), ::testing::ElementsAre(1, 3, 5))
-      << "the tags added, in ascending order, and no others";
+  std::vector<uint8_t> visited;
+  for (const Tag& tag : tagSet_->tags()) {
+    visited.push_back(tag.getTagNum());
+  }
+  EXPECT_THAT(visited, ::testing::ElementsAre(1, 3, 5))
+      << "callers visit every Tag once, in tag-number order, whatever order "
+         "the Tags were added in";
 }
 
 TEST_F(TagSetTest, PostWqe) {
@@ -828,7 +832,8 @@ TEST_F(TagSetTest, ErrorConditions) {
   EXPECT_EQ(tagSet_->getNumPendingRWqes(), 0);
   EXPECT_FALSE(tagSet_->findNextWqe(false).has_value());
   EXPECT_FALSE(tagSet_->findNextWqe(true).has_value());
-  EXPECT_TRUE(tagSet_->getTagNums().empty());
+  EXPECT_TRUE(tagSet_->tags().empty())
+      << "an empty set has no Tag for a caller to visit";
 
   EXPECT_THROW(std::ignore = tagSet_->at(1), std::out_of_range);
   EXPECT_THROW(std::ignore = tagSet_->at(0), std::out_of_range);

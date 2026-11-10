@@ -300,8 +300,8 @@ class Qp {
     return tagSet_.allTagsMarkedForDeletion();
   }
 
-  [[nodiscard]] std::vector<uint8_t> getTagNums() const {
-    return tagSet_.getTagNums();
+  [[nodiscard]] auto tags() const {
+    return tagSet_.tags();
   }
 
   // Stop counting posns that were unsent work and will never be sent. TagSet

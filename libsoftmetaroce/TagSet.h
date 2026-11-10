@@ -23,6 +23,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <set>
 #include <utility>
 #include <vector>
@@ -115,8 +116,13 @@ class TagSet {
   // torn down). Vacuously true for an empty set.
   [[nodiscard]] bool allTagsMarkedForDeletion() const;
   [[nodiscard]] uint32_t getQpNum() const;
-  // Ascending.
-  [[nodiscard]] std::vector<uint8_t> getTagNums() const;
+  // Every Tag, in tag-number order. Takes no lock: for a caller past RESET,
+  // when no Tag can be added, or for teardown.
+  [[nodiscard]] auto tags() const {
+    return tags_ |
+        std::views::transform(
+               [](const std::unique_ptr<Tag>& tag) -> Tag& { return *tag; });
+  }
   // Post a WQE for a specific Tag. New WQEs are first queued and then processed
   // into their Tags in round-robin order. Throws std::out_of_range from the
   // queue if tagNum matches no queue, which means no such Tag: a queue is

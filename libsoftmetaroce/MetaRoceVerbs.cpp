@@ -2503,8 +2503,8 @@ int MetaRoceVerbs::ibv_destroy_qp(struct ibv_qp* qp) {
 void MetaRoceVerbs::tearDownQp(std::unique_ptr<Qp> qp) {
   Qp& queuePair = *CHECK_NOTNULL(qp.get());
   std::vector<std::reference_wrapper<struct ibv_qp>> ibvQps;
-  for (auto t : queuePair.getTagNums()) {
-    ibvQps.emplace_back(queuePair.existingTag(t).getIbvQp());
+  for (Tag& tag : queuePair.tags()) {
+    ibvQps.emplace_back(tag.getIbvQp());
   }
   // Wait out any reader still holding a Qp* read before the erase. Drain off
   // receiversMutex_ (drainInFlightReceives() blocks cross-thread); the

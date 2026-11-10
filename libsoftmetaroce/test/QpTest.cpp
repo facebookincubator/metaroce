@@ -1716,8 +1716,8 @@ TEST_F(QpTest, RnrExhaustionIsAppliedOnTheSendersVisit) {
   constexpr uint8_t kOtherTag = kMetaRoceInitialTag + 1;
   constexpr uint8_t kRetryLimit = 2;
   qp.addTag(kOtherTag, &cq, &otherIbvQpStorage);
-  for (const auto tagNum : qp.getTagNums()) {
-    qp.getTag(tagNum)->setRnrRetryLimit(kRetryLimit);
+  for (Tag& tag : qp.tags()) {
+    tag.setRnrRetryLimit(kRetryLimit);
   }
   createAlwaysSendingMockCongestionController(qp);
   LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
