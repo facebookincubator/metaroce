@@ -124,6 +124,14 @@ unsigned int RdmaGenEndpoint::getAccessFlags() {
   return flags;
 }
 
+unsigned int RdmaGenEndpoint::getMrAccessFlags() {
+  unsigned int flags = getAccessFlags();
+  if (params_.relaxed_ordering) {
+    flags |= IBV_ACCESS_RELAXED_ORDERING;
+  }
+  return flags;
+}
+
 static void limitInt(uint32_t& v, uint32_t limit, const std::string& name) {
   if (v > limit) {
     LOG(INFO) << fmt::format(

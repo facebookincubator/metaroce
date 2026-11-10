@@ -193,6 +193,10 @@ DEFINE_bool(
     use_huge_pages,
     false,
     "If true, we provide hints using madvise for 2MB Page Size.");
+DEFINE_bool(
+    enable_pcie_relaxed,
+    false,
+    "If true, register memory regions with IBV_ACCESS_RELAXED_ORDERING.");
 DEFINE_uint32(sqp_per_qp, 1, "Number of SQPs (tags) per QP.");
 DEFINE_validator(sqp_per_qp, [](const char*, const uint32_t value) {
   return value >= 1;

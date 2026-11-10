@@ -57,6 +57,7 @@ Params buildParamsFromFlags() {
        .psn = getFlagValueIfSet("psn", FLAGS_psn),
        .use_qpt_driver = FLAGS_use_qpt_driver,
        .use_huge_pages = FLAGS_use_huge_pages,
+       .relaxed_ordering = FLAGS_enable_pcie_relaxed,
        .sqp_per_qp = static_cast<uint8_t>(FLAGS_sqp_per_qp),
        .tx_path_count = static_cast<uint8_t>(FLAGS_tx_path_count),
        .rx_path_count = static_cast<uint8_t>(FLAGS_rx_path_count),

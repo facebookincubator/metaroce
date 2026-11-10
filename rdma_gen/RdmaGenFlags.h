@@ -51,6 +51,7 @@ DECLARE_uint32(retry_cnt);
 DECLARE_uint32(psn);
 DECLARE_bool(use_qpt_driver);
 DECLARE_bool(use_huge_pages);
+DECLARE_bool(enable_pcie_relaxed);
 DECLARE_uint32(sqp_per_qp);
 DECLARE_uint32(tx_path_count);
 DECLARE_uint32(rx_path_count);

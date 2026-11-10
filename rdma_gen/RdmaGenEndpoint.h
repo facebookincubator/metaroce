@@ -119,7 +119,7 @@ class RdmaGenEndpoint {
         params_.rdma_mode,
         params_,
         ctx(),
-        getAccessFlags(),
+        getMrAccessFlags(),
         std::move(cudaWrapper));
   }
 
@@ -186,6 +186,8 @@ class RdmaGenEndpoint {
 
   // access flags for both qp_access_flags and memory regions
   unsigned int getAccessFlags();
+  // getAccessFlags() plus the flags that only apply to memory regions
+  unsigned int getMrAccessFlags();
 
   void limitParamsToDevice();
 

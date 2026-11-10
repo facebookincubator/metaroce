@@ -229,6 +229,8 @@ struct Params {
   std::function<bool(std::string_view devName, bool requested)>
       use_qpt_driver_resolver;
   bool use_huge_pages = false;
+  // Registers memory regions with IBV_ACCESS_RELAXED_ORDERING.
+  bool relaxed_ordering = false;
   uint8_t sqp_per_qp = 1;
   uint8_t tx_path_count = 1;
   uint8_t rx_path_count = 1;
