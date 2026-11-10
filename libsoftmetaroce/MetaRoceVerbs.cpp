@@ -543,7 +543,7 @@ void MetaRoceVerbs::getLocalAddrAndDevicesList() {
     std::vector<folly::StringPiece> parts;
     folly::split(',', FLAGS_libsoftmetaroce_gid, parts);
     for (auto p : parts) {
-      auto trimmed = folly::trimWhitespace(p).str();
+      std::string trimmed = std::string(folly::trimWhitespace(p));
       if (!trimmed.empty() && requestedGidSet.insert(trimmed).second) {
         requestedGidOrder.push_back(std::move(trimmed));
       }
