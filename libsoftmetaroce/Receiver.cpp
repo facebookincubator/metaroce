@@ -514,6 +514,12 @@ void Receiver::processIngress(
     const RnrCancelPacket& rnrCancel =
         *CHECK_NOTNULL(dynamic_cast<const RnrCancelPacket*>(&packet));
     auto rnrCancelHeader = rnrCancel.getRnrCancelHeader();
+    // Tags can be added until flows exist, and applyRnrCancel reads them
+    // unlocked. Before then the QP has sent no data, so it holds no RNR block.
+    if (qp.getNumTxFlows() == 0) {
+      VLOG(1) << "rnr cancel before flows exist on qp: " << qpn;
+      return;
+    }
     if (!qp.containsTag(rnrCancelHeader.getTag())) {
       LOG(WARNING) << "rnr cancel for unknown tag: "
                    << (int)rnrCancelHeader.getTag() << " on qp: " << qpn;

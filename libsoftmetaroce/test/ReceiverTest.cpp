@@ -4145,6 +4145,41 @@ TEST_F(ReceiverTest, RnrCancelIsHandedToTheSenderNotAppliedOnReceipt) {
       << "the sender's visit must drain the cancel and lift the block";
 }
 
+TEST_F(ReceiverTest, RnrCancelBeforeFlowsExistIsDropped) {
+  constexpr uint32_t cancelQpn = 792;
+  struct ibv_qp cancelIbvQp{};
+  auto cancelQp = std::make_unique<Qp>(
+      cancelQpn, *retxTimer, *arbiter, mrs, cq.get(), &cancelIbvQp);
+  cancelQp->setRemoteQpNum(srcQp);
+  auto* qpRawPtr = cancelQp.get();
+  qpNumToQp_.wlock()->emplace(cancelQpn, std::move(cancelQp));
+  ASSERT_EQ(qpRawPtr->getNumTxFlows(), 0u)
+      << "precondition: the QP is still being set up, so a Tag may be added";
+  qpRawPtr->enterHrnrBlock(60 * 1000 * 1000 /*60s*/);
+
+  using OperationType = BaseHeader::Opcode::OperationType;
+  const BaseHeader baseHeader =
+      BaseHeader::BaseHeaderBuilder()
+          .setOpcode(BaseHeader::Opcode(OperationType::RNR_CANCEL))
+          .setVersion(kMetaRoceProtocolVersion)
+          .setFlowId(0)
+          .setDstQp(cancelQpn)
+          .setSrcQp(srcQp)
+          .build();
+  const RnrCancelHeader rnrCancelHeader =
+      RnrCancelHeader::RnrCancelHeaderBuilder()
+          .setTag(kMetaRoceInitialTag)
+          .setPostedCsn(0)
+          .setFlowsAvailable(1)
+          .build();
+  mockReceiver_->simulateReceivePacket(
+      std::make_unique<RnrCancelPacket>(baseHeader, rnrCancelHeader), kEcnECT0);
+
+  EXPECT_EQ(qpRawPtr->getHrnrState(), HrnrState::HRNR_BLOCKED_TX)
+      << "a cancel reaching a QP that may still gain a Tag must be dropped "
+         "before its tag is looked up without the lock that adds Tags";
+}
+
 TEST_F(ReceiverTest, ConstructorThrowsOnBindFailureInsteadOfAborting) {
   // The constructor's bind runs on a noexcept EventBase thread, so it marshals
   // a bind failure back to the caller rather than terminating the process.

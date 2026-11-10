@@ -210,6 +210,10 @@ class Qp {
     return *CHECK_NOTNULL(tagSet_.getTagByNumber(tagNum));
   }
 
+  [[nodiscard]] Tag* FOLLY_NULLABLE getTagInAnyState(uint8_t tagNum) const {
+    return tagSet_.getTagInAnyState(tagNum);
+  }
+
   void addTag(
       uint8_t tagNum,
       CompletionQueue* sendCq,
@@ -312,11 +316,11 @@ class Qp {
   }
 
   // Signals inline on an error transition, so the caller must not hold a Tag
-  // semaphore, sndCur or TagSet::mutex_.
+  // semaphore, sndCur or a TagSet lock.
   void setIbvQpState(ibv_qp_state state) {
     tagSet_.setIbvQpState(state);
     if (state == IBV_QPS_ERR) {
-      // After setIbvQpState() has returned and dropped TagSet::mutex_: the
+      // After setIbvQpState() has returned and dropped its TagSet lock: the
       // sender fails a tag in error at its next visit, and a QP with every
       // posn already claimed has no other event to make it ready.
       signalReadyAsync();
@@ -713,7 +717,7 @@ class Qp {
 
   // Signals without awaiting a coroutine, so timer callbacks and receiver
   // threads can call it -- though not while holding a Tag semaphore, sndCur or
-  // TagSet::mutex_, which a build under arbiterMutex_ waits on.
+  // a TagSet lock, which a build under arbiterMutex_ waits on.
   void signalReadyAsync() {
     if (isTearingDown()) {
       return;

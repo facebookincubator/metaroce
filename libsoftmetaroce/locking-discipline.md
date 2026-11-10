@@ -11,7 +11,8 @@ around `Tag`, `TagSet`, `TxFlow`, or QP teardown.
 |---|---|---|---|
 | `Tag::freeSem_` | count-1 semaphore used as a busy token (`waitForFree` / `markFree`) | exclusive use of one `Tag`: its WQEs while a packet from it is being prepared, sent, or retransmitted, or the Tag is being torn down; and the per-tag BRNR state (`brnr_`), read and written only under it | per-Tag (fine) |
 | `Tag::wqeRetirementMutex_` | `folly::SharedMutex` (`accessForReceive` / `lockForWqeRetirement`) | the boundary between receive processing and WQE retirement: held shared while the receive path uses a `Wqe*` the Tag owns, exclusively while the Tag moves to error or retires one -- with the one exception below | per-Tag (fine) |
-| `TagSet::mutex_` | `std::shared_mutex` (`std::shared_lock` to read, `std::scoped_lock` to write) | the Tag map (`tagNumToTag_`), the WQE queue, and round-robin state (`scheduler_`) | per-TagSet (coarse) |
+| `TagSet::stateLock_` | `folly::MicroLock` | Tag additions, against QP state transitions (`setIbvQpState`), a Tag entering error (`enterTagErrorWithTagHeld`), and the readers that may run while a Tag is added (`contains`, `protectionDomain`, `getTagNums`, `getTagInAnyState`) | per-TagSet |
+| `TagSet::schedulerLock_` | `folly::MicroLock` | round-robin state (`scheduler_`): the sender's turns against the retransmit timer's peek | per-TagSet |
 | `Tag::pendingReceives_` | `folly::Synchronized` r/w lock | the receives waiting by csn (`receivesByCsn`) and the dedicated-queue RNR-Cancel request (`rnrCancelRequested`); receive lookup and request recording are atomic with receive insertion and request clearing | per-Tag (fine) |
 | `Tag::msnSpan_` | `folly::Synchronized` r/w lock | the msn span: the posted send-WQE map and the three cursors that bound it (`nextMsn`, `inOrderCompletedMsn`, `inOrderRetiredMsn`) | per-Tag (fine) |
 | `sndCur` | `folly::Synchronized` wlock in `TxFlow` | the send cursor / transmit state | per-path -- one per `TxFlow`, so holding it excludes no work on a sibling path of the same QP |
@@ -40,29 +41,26 @@ When a path genuinely needs both at once, the load-bearing invariant is:
 
 > **Acquire `sndCur` before a Tag's `freeSem_`, and a Tag's `wqeRetirementMutex_`
 > after its `freeSem_` and before its `msnSpan_`; never block acquiring
-> `sndCur` while holding a `freeSem_`. `TagSet::mutex_` is a brief leaf.**
+> `sndCur` while holding a `freeSem_`. `TagSet`'s locks are brief leaves.**
 
 Rationale: the retransmit path (`prepareRetxPacketsIfAny`) walks the transmit
 state under `sndCur` and then needs the specific Tag, so it takes `sndCur` before
 `freeSem_`. Holding `sndCur` across the transmit decision matches the single-owner
 transmit model, where one thread owns the transmit state for the duration of a
-turn. `mutex_` stays a leaf: snapshot the map or resolve a Tag under it, then
-release it before blocking on anything.
+turn. `schedulerLock_` is released before the Tag is acquired.
 
 Allowed vs forbidden:
 
 - `sndCur` -> `freeSem_`  — OK. When a path needs both, it takes the transmit state before the Tag, so a blocking `waitForFree` under `sndCur` is expected and safe.
-- `sndCur` -> `mutex_`  — OK (brief). `findNextWqe` snapshots the map under `sndCur`, releases it, then acquires the Tag.
-- `freeSem_` -> `mutex_`  — OK (brief). Own a Tag, then look it up or check its blocked MSN (`getTag`, `isBlockedMsn`).
+- `sndCur` -> `schedulerLock_`  — OK (brief). `findNextWqe` takes its turn under `sndCur`, releases the lock, then acquires the Tag.
+- `freeSem_` -> `stateLock_`  — OK (brief). `enterTagErrorWithTagHeld` publishes a Tag's error while owning it.
+- `stateLock_` -> `CompletionQueue::references_` and the WQE queue's coroutine mutex  — OK, during an add only. The add constructs the Tag, which references its completion queues, and creates the Tag's WQE queue (`containsQueue`, `addQueue`).
 - `sndCur` -> `freeSem_` -> `msnSpan_`  — OK (brief). The send path takes the transmit state, then the Tag, then reads that Tag's posted work: `findNextWqe` scopes the rlock to the lookup, and `arePriorWqesCompleteForFence` scopes it to the fence decision.
 - `msnSpan_` -> `CompletionQueue::admission_`  — OK (brief). `enqueueCqeForWqe` places a CQE while the span is held; placement and overflow reporting take queue and event synchronization but no Tag or QP lock, so the pair has one order and cannot close a cycle.
 - `wqeRetirementMutex_` -> `msnSpan_`  — OK. A retirement runs under the guard and takes the wlock to erase the entry, whether through `handleTxWqesCompletion`, `completeSingleTxWqe`, `failPendingWqesIfInErrorWithTagHeld` or `completeSettledFailedWqes`.
 - `freeSem_` -> `wqeRetirementMutex_`  — OK. A path that owns a Tag and then retires one of its WQEs excludes the receive path for that.
 - `Tag::msnSpan_` -> block on `wqeRetirementMutex_`  — FORBIDDEN. Inverts the pair above. A post that finds its Tag in error emplaces under `msnSpan_`, releases that lock, and only then takes the guard to retire the settled work requests.
-- `wqeRetirementMutex_` -> `mutex_`  — OK (brief). The receive path resolves a Tag while holding one shared; `mutex_` staying a leaf is what makes this safe.
-- `mutex_` -> block on `wqeRetirementMutex_`  — FORBIDDEN. The receive path takes `mutex_` under the guard, so a path holding the map and waiting for the guard closes a cycle.
 - `qpNumToQp_` -> `Qp::pendingRnrCancels_`  — OK (brief). A receive posted to a shared receive queue cancels the RNR of the tag it serves, holding the map across the enqueue so a destroy cannot free the queue pair mid-call. Nothing is taken while `pendingRnrCancels_` is held, so it closes no cycle.
-- `qpNumToQp_` -> `TagSet::mutex_`  — OK (brief). The cancel resolves the refused tag under the map to see whether it can still use the receive; `mutex_` stays a leaf, so the pair has one order.
 - `Qp::pendingRnrCancels_` -> anything  — FORBIDDEN. It is a leaf. `scheduleRnrCancelPacket` releases it before signaling the arbiter, and the build releases it before reaching the flows; signaling under it would put the arbiter's intake beneath this mutex.
 - `Qp::pacer_` -> anything  — FORBIDDEN. It is a leaf. The visit releases it before building each packet and charges with no flow lock held.
 - `Qp::pacingInputs_` -> `Qp::pacer_` -- OK (brief). `refreshPacerRate` records the limit under `pacingInputs_` and programs the pacer inside, so the pair has one order.
@@ -71,7 +69,7 @@ Allowed vs forbidden:
 - `SharedReceiveQueue::references_` -> `SharedReceiveQueue::admission_`  — FORBIDDEN. It is the reverse of the pair above. A queue pair letting go forgets its records under `admission_` and releases it before reaching `references_`.
 - `wqeRetirementMutex_` shared -> exclusive  — FORBIDDEN. Do not acquire exclusive retirement access while holding `ReceiveAccess`; a receiver that decides its Tag must fail records the failure and applies it after releasing the shared guard.
 - `freeSem_` -> block on `sndCur`  — FORBIDDEN. Taking the Tag before the send cursor inverts the datapath order.
-- `mutex_` -> block on `freeSem_`  — FORBIDDEN. Inverts the Tag-then-map order every other path uses.
+- `stateLock_` -> block on `freeSem_`  — FORBIDDEN. Inverts the Tag-then-`stateLock_` order of `enterTagErrorWithTagHeld`.
 - any datapath lock -> await `arbiterMutex_`  — FORBIDDEN. The arbiter holds it across the build callback, which takes `sndCur` and blocks on `freeSem_`. See the readiness-signal section below.
 - `arbiterMutex_`, `txStateLock_` or `sndCur` -> `SynchronizedCongestionController::box_`  — OK. The controller lock is a leaf.
 - `SynchronizedCongestionController::box_` -> any other lock  — FORBIDDEN. That is what keeps it a leaf.
@@ -102,7 +100,7 @@ and no lock is needed. When it does not, the receiver applies the ACK itself and
 the other, rather than trying to interleave two writers over the finer locks.
 
 It sits **above** every lock in the order above -- both sites take it with no
-`sndCur`, `freeSem_`, `wqeRetirementMutex_`, or `TagSet::mutex_` held, and both go
+`sndCur`, `freeSem_`, `wqeRetirementMutex_`, or `TagSet` lock held, and both go
 on to take those under it -- and **below** `receiveLock_`, which a multi-reader
 receiver is already holding by the time it reaches the inline apply. No path
 takes `receiveLock_` under this one, so that pair has a single order and cannot
@@ -134,7 +132,7 @@ the order above, and anything that waits for it from inside the datapath
 inverts that.
 
 `co_signalReady()` awaits `arbiterMutex_`, so it must be reached with no
-`sndCur`, `freeSem_`, `wqeRetirementMutex_`, or `TagSet::mutex_` held.
+`sndCur`, `freeSem_`, `wqeRetirementMutex_`, or `TagSet` lock held.
 `TagSet::processWqes` closes its Tag guard before signaling for this reason,
 and `TxFlow::processNakFlowIdError` closes its `sndCur` scope for the same one.
 
@@ -161,9 +159,9 @@ This is a field, not a lock, but it is read on the datapath and it is worth
 saying which reads are authoritative.
 
 Every concurrent access goes through the accessors in `QpState.h`: the field is
-written under several guards (the `TagSet::mutex_` walk in `setIbvQpState()`,
+written under several guards (the `TagSet::stateLock_` walk in `setIbvQpState()`,
 the per-Tag transition in `enterTagErrorWithTagHeld()`, and a Tag's own maps on
-a failing post), so only atomic accesses pair with every writer. `mutex_`
+a failing post), so only atomic accesses pair with every writer. `stateLock_`
 serializes the TagSet-owned writers, but a map-lock error publication can still
 occur mid-read, so an aggregate read is a sequence of atomic observations rather
 than a snapshot; `addIfAllTagsInReset()` is the one decision resting on it,
@@ -189,7 +187,7 @@ ordering makes the error publication visible to the sweep.
 This lock is the bottom of the datapath order: a holder takes no other Tag or QP
 lock under it. The holders only go on to enqueue a CQE (`enqueueCqeForWqe`) or
 mark a WQE failing, neither of which returns to `TxFlow`, the arbiter, or the
-Tag map, so `sndCur -> msnSpan_` is the only direction that pair is ever taken
+`TagSet`, so `sndCur -> msnSpan_` is the only direction that pair is ever taken
 and it cannot form a cycle. Enqueueing takes `CompletionQueue::admission_` and
 the queue's own synchronization, but no Tag or QP lock; on an armed queue it
 then takes `compChannels_` after releasing `admission_`. Keep it that way: do
@@ -222,11 +220,11 @@ source-port repathing (`getAlternateAckSocket`), and sender visits
 
 It is a leaf beneath the arbiter and inline-ack locks: failover reaches it from
 the build callback, with `arbiterMutex_` and, in inline-ack mode, `txStateLock_`
-held. Its callers hold no `sndCur`, `freeSem_`, or `TagSet::mutex_`, and no path
+held. Its callers hold no `sndCur`, `freeSem_`, or `TagSet` lock, and no path
 acquires another libsoftmetaroce lock while holding it
 (`createSocketWithLocalAddr` only binds sockets), so it cannot form a cycle. To
 keep it a leaf: do not call `getSocketIdFromAddress` / `getAlternateSocket`
-while holding `sndCur`, `freeSem_`, or `TagSet::mutex_`, and do not take another
+while holding `sndCur`, `freeSem_`, or a `TagSet` lock, and do not take another
 libsoftmetaroce lock inside the socket-creation path.
 
 `getSendSocket` reads fixed array entries without locking. Entries are
@@ -236,10 +234,9 @@ thread so the reader observes the initialized entry.
 
 ## Rules
 
-1. **Do not hold `TagSet::mutex_` across a blocking Tag acquisition.** To scan the
-   Tags and then use one, *snapshot* the map under `mutex_` (copy the Tag
-   pointers), release `mutex_`, then acquire the Tag's `freeSem_` with
-   no map lock held. See `findNextWqe`.
+1. **Do not hold a `TagSet` lock across a blocking Tag acquisition.** Take the
+   scheduler's turn under `schedulerLock_`, release it, then acquire the Tag's
+   `freeSem_`. See `findNextWqe`.
 2. **Prefer separate intervals; when both are needed, take `sndCur` before the
    Tag.** Most paths need only one lock at a time (see the separate-intervals note
    above). When a path must hold both — e.g. the retransmit path
@@ -247,17 +244,16 @@ thread so the reader observes the initialized entry.
    it takes `sndCur` first. Because every such path uses this one order, a blocking
    `waitForFree` under `sndCur` cannot deadlock. Do not take a Tag's `freeSem_`
    first and then block on `sndCur`.
-3. **`mutex_` is a leaf.** While you hold `sndCur` or a Tag's `freeSem_` you may
-   take `mutex_` briefly (a snapshot or a `getTag`), but release it before
-   blocking on another lock, and never block acquiring a `freeSem_` while holding
-   it.
+3. **`TagSet`'s locks are leaves.** While you hold `sndCur` or a Tag's
+   `freeSem_` you may take one briefly; take nothing under it except what an add
+   takes (above).
 4. **Hold `qpNumToQp_` only for the lookup/unlink.** Never hold it across blocking
    teardown (`~Qp`'s join). The Receiver holds the read lock across a whole
    dispatch to keep the `Qp*` alive, so teardown holding the write lock across
    blocking work starves, and can deadlock, the receive path.
 5. **Signal readiness after the guard.** The arbiter runs a QP's build
    under `arbiterMutex_`, so awaiting that mutex from under `sndCur`, a
-   `freeSem_`, `wqeRetirementMutex_`, or `TagSet::mutex_` closes a cycle. Do the
+   `freeSem_`, `wqeRetirementMutex_`, or a `TagSet` lock closes a cycle. Do the
    state change under the guard, leave the guard's scope, then signal. Where the
    two are far apart, record the pending wakeup and signal after releasing the
    guards; see `SenderWake`.
@@ -266,16 +262,16 @@ thread so the reader observes the initialized entry.
    it. Queued WQEs and tracked frames therefore retain a valid Tag during
    processing. Teardown quiesces ACK processing and retransmission callbacks
    before destroying Tags. Lookups using peer-supplied tag numbers must still
-   validate membership.
+   validate membership. A received packet reads Tags only once its QP has
+   flows: until then a Tag can still be added.
 
 ## Testing lock order
 
 The forbidden orderings above are lock-order inversions, so guard them with a
 **stress test** rather than a production test seam: run two datapath operations
 that take the pair in question against each other, over many iterations with few
-Tags for maximum contention. For the `mutex_`/`freeSem_` pair, run one thread in
-the legitimate Tag-then-map order against another calling the code under test;
-for the `sndCur`/`freeSem_` pair, run a fresh send against a concurrent
+Tags for maximum contention. For the `sndCur`/`freeSem_` pair, run a fresh send
+against a concurrent
 retransmit on the same QP. On code that violates rule 1 or 2 the two orders form
 a cycle and the test hangs (its target timeout fires); on correct code it
 completes quickly. A passing run shows the pair did not deadlock in that run,

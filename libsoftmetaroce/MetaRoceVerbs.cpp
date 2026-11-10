@@ -1782,7 +1782,8 @@ int MetaRoceVerbs::ibv_modify_qp(
   }
   auto tagNum = qpAndTagToTag(ibvqp->qp_num);
   AppliedTagConfig tagConfig{.localQpNum = qpNum, .tag = tagNum};
-  Tag* const maybeTag = qp->getTag(tagNum);
+  // This may run in RESET, while another thread adds a Tag.
+  Tag* const maybeTag = qp->getTagInAnyState(tagNum);
   if (maybeTag == nullptr) {
     return withErrno(ENOENT);
   }
@@ -2080,7 +2081,7 @@ int MetaRoceVerbs::ibv_query_qp(
   if (qp == nullptr) {
     return withErrno(ENOENT);
   }
-  const Tag* const tag = qp->getTag(qpAndTagToTag(ibvqp->qp_num));
+  const Tag* const tag = qp->getTagInAnyState(qpAndTagToTag(ibvqp->qp_num));
   if (tag == nullptr) {
     return withErrno(ENOENT);
   }
@@ -2469,7 +2470,7 @@ int MetaRoceVerbs::ibv_destroy_qp(struct ibv_qp* qp) {
     // An ibv_qp is really a Tag. Mark it, but leave it (and its ibv_qp handle)
     // in the table until the whole QP is destroyed -- readers may still ack its
     // WQEs, and the Tag dereferences the handle on its error paths.
-    Tag* const tag = qpIt->second->getTag(tagNum);
+    Tag* const tag = qpIt->second->getTagInAnyState(tagNum);
     if (tag == nullptr) {
       return withErrno(ENOENT);
     }

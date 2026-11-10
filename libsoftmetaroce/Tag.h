@@ -408,22 +408,13 @@ class Tag {
     return folly::makeGuard([this] { markFree(); });
   }
 
-  // The guard between receive processing and WQE retirement: held shared while
-  // the receive path uses a Wqe* this Tag owns, exclusively while the Tag moves
-  // to error or retires one. It is not a data lock -- a receiver still binds
-  // and erases under it, which is safe only because one thread owns the receive
-  // side -- and it has no upgrade, so a receiver that decides the Tag must fail
-  // applies that after releasing. Taken after the Tag semaphore.
+  // Keeps each Wqe* the receive path uses from being retired: shared while
+  // receiving, exclusive to retire one. Taken after the Tag semaphore.
   class ReceiveAccess {
    public:
     explicit ReceiveAccess(Tag& tag)
         : lock_(tag.wqeRetirementMutex_), tag_(tag) {}
 
-    // Every path that fails a Tag sets its state under this same guard, so the
-    // answer cannot go stale before the use it covers. A client erroring its
-    // own QP through the verbs API writes that state under the Tag map
-    // instead, unordered against this, and retires no WQE; a post landing on
-    // that Tag afterward retires the settled ones, under the guard.
     [[nodiscard]] bool isTagInError() const {
       return tag_.isInErrorState();
     }

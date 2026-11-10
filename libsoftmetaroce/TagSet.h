@@ -20,15 +20,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
-#include <shared_mutex>
 #include <utility>
 #include <vector>
 
+#include <folly/MicroLock.h>
 #include <libsoftmetaroce/CompletionQueue.h>
 #include <libsoftmetaroce/MultiUnboundedQueue.h>
 #include <libsoftmetaroce/QpArbiterIface.h>
@@ -99,10 +98,14 @@ class TagSet {
       uint32_t sendQueueDepth = kMaxQpWorkRequests,
       uint32_t receiveQueueDepth = kMaxQpWorkRequests,
       SharedReceiveQueue* FOLLY_NULLABLE sharedReceiveQueue = nullptr);
+  // Takes no lock: once a Tag has left RESET, no Tag can be added.
   [[nodiscard]] Tag& at(uint8_t tagNum) const;
   // Returns the Tag for tagNum, or nullptr if it does not exist.
   // Unlike at(), this does not throw on missing tags.
   [[nodiscard]] Tag* FOLLY_NULLABLE getTagByNumber(uint8_t tagNum) const;
+  // Looks the Tag up under the lock that adds Tags, for a caller that may run
+  // in RESET, while a Tag can be added.
+  [[nodiscard]] Tag* FOLLY_NULLABLE getTagInAnyState(uint8_t tagNum) const;
   // The domain the Tags of this QP were created under. Every Tag shares it, so
   // any of them answers; empty only where the set is.
   [[nodiscard]] struct ibv_pd* protectionDomain() const;
@@ -112,7 +115,7 @@ class TagSet {
   // torn down). Vacuously true for an empty set.
   [[nodiscard]] bool allTagsMarkedForDeletion() const;
   [[nodiscard]] uint32_t getQpNum() const;
-  // Ascending, as the map holds them.
+  // Ascending.
   [[nodiscard]] std::vector<uint8_t> getTagNums() const;
   // Post a WQE for a specific Tag. New WQEs are first queued and then processed
   // into their Tags in round-robin order. Throws std::out_of_range from the
@@ -139,8 +142,7 @@ class TagSet {
   // in the QpArbiter), in which case the TagSet should advance its round-robin
   // to the next Tag and the found WQE's Tag should update it's BRNR state, if
   // necessary. A returned Tag holds its semaphore; the caller must call
-  // Tag::markFree() after it finishes using the WQE. Call without holding
-  // mutex_.
+  // Tag::markFree() after it finishes using the WQE.
   [[nodiscard]] std::optional<std::pair<Wqe*, Tag*>> findNextWqe(
       bool intendToSend);
   // Set the QP state of every Tag in this TagSet. A Tag already in
@@ -161,8 +163,8 @@ class TagSet {
   // A tag failure is split across two threads: the one that notices it
   // publishes it, and the sender that owns posn state fails the work.
 
-  // Notice and publish. Caller holds that Tag's semaphore; this takes mutex_
-  // briefly under it and returns the wake it cannot perform there.
+  // Notice and publish. Caller holds that Tag's semaphore; this takes
+  // stateLock_ briefly under it and returns the wake it cannot perform there.
   [[nodiscard]] SenderWake enterTagErrorWithTagHeld(Tag& tag);
 
   // Sweep. Runs on the sender's thread, the only one that may write posn
@@ -193,11 +195,11 @@ class TagSet {
       std::chrono::milliseconds timeoutMs);
   // True when every Tag is in `state` -- each has its own ibv_qp and fails
   // on its own, so they need not agree. Vacuously true for an empty set. The
-  // internal caller holds mutex_ and uses the private form.
+  // internal caller holds stateLock_ and uses the private form.
   [[nodiscard]] bool allTagsInState(ibv_qp_state state) const;
 
  private:
-  using TagsByNum = std::map<uint8_t, std::unique_ptr<Tag>>;
+  using TagsByNum = std::vector<std::unique_ptr<Tag>>;
 
   // Tells the sender a Tag has entered error with work still to be failed, so
   // its next visit sweeps. Any thread. Raising it for a Tag whose work is
@@ -205,7 +207,7 @@ class TagSet {
   // work to fail.
   void notifySenderTagEnteredError();
 
-  // Both add paths, with mutex_ already held. Returns the inserted Tag.
+  // Both add paths, with stateLock_ already held. Returns the inserted Tag.
   Tag* addWithLockHeld(
       uint8_t tagNum,
       CompletionQueue* sendCq,
@@ -221,7 +223,7 @@ class TagSet {
       uint8_t tagNum,
       CompletionQueue* sendCq,
       struct ibv_qp* ibvQp) const;
-  // Whether every Tag is in this state. Caller holds mutex_.
+  // Whether every Tag is in this state. Caller holds stateLock_.
   [[nodiscard]] bool allTagsInStateWithLockHeld(ibv_qp_state state) const;
   [[nodiscard]] std::optional<std::pair<Wqe*, Tag*>> peekNextWqe();
   [[nodiscard]] std::optional<std::pair<Wqe*, Tag*>> findNextWqeToSend();
@@ -235,12 +237,15 @@ class TagSet {
 
   // Protocol / runtime state.
   MultiUnboundedQueue<uint8_t, std::unique_ptr<Wqe>> wqeQueue_;
-  // Tags are not removed once added.
-  TagsByNum tagNumToTag_;
+  // In tag-number order. Tags are added before the data path starts and removed
+  // only with the QP, so the data path reads this without a lock.
+  TagsByNum tags_;
   WrrScheduler<TagsByNum::iterator> scheduler_;
-  // Protects adding and counting Tags. Mutable because read-only accessors
-  // need to acquire a shared lock.
-  mutable std::shared_mutex mutex_;
+  // Serializes tag additions with QP state transitions and tag errors, and
+  // with the readers that may run while a Tag is added.
+  mutable folly::MicroLock stateLock_;
+  // Serializes the sender's turns with the retransmit timer's peek.
+  folly::MicroLock schedulerLock_;
   // Raised when a Tag enters the error state, cleared by the sweep that fails
   // its work. Lets the sender's visit skip the walk when no Tag has entered
   // error, rather than taking every Tag's semaphore on the hot path.

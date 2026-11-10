@@ -41,7 +41,7 @@ TagSet::TagSet(
 }
 
 TagSet::~TagSet() {
-  for (auto& [_, tag] : tagNumToTag_) {
+  for (auto& tag : tags_) {
     tag->releaseCompletionQueueReferences();
   }
 }
@@ -74,7 +74,7 @@ void TagSet::add(
     uint32_t receiveQueueDepth,
     SharedReceiveQueue* FOLLY_NULLABLE sharedReceiveQueue) {
   throwIfCannotAdd(tagNum, sendCq, ibvQp);
-  std::scoped_lock lock(mutex_);
+  std::scoped_lock lock(stateLock_);
   addWithLockHeld(
       tagNum,
       sendCq,
@@ -98,7 +98,7 @@ Tag* FOLLY_NULLABLE TagSet::addIfAllTagsInReset(
     uint32_t receiveQueueDepth,
     SharedReceiveQueue* FOLLY_NULLABLE sharedReceiveQueue) {
   throwIfCannotAdd(tagNum, sendCq, ibvQp);
-  std::scoped_lock lock(mutex_);
+  std::scoped_lock lock(stateLock_);
   if (!allTagsInStateWithLockHeld(IBV_QPS_RESET)) {
     return nullptr;
   }
@@ -124,31 +124,34 @@ Tag* TagSet::addWithLockHeld(
     uint32_t sendQueueDepth,
     uint32_t receiveQueueDepth,
     SharedReceiveQueue* FOLLY_NULLABLE sharedReceiveQueue) {
-  auto [it, inserted] = tagNumToTag_.emplace(
-      tagNum,
-      std::make_unique<Tag>(
-          qpNum_,
-          tagNum,
-          sendCq,
-          recvCq,
-          ibvQp,
-          sqSigAll,
-          maxInlineData,
-          sendQueueDepth,
-          receiveQueueDepth,
-          sharedReceiveQueue));
-  if (inserted) {
-    // Erase the Tag if queue setup throws; a Tag without its queue is unusable.
-    auto rollback = folly::makeGuard([&] { tagNumToTag_.erase(tagNum); });
-    CHECK(!wqeQueue_.containsQueue(tagNum));
-    wqeQueue_.addQueue(tagNum);
-    rollback.dismiss();
-    return it->second.get();
-  } else {
+  const auto pos = std::lower_bound(
+      tags_.begin(), tags_.end(), tagNum, [](const auto& tag, uint8_t num) {
+        return tag->getTagNum() < num;
+      });
+  if (pos != tags_.end() && (*pos)->getTagNum() == tagNum) {
     throw std::invalid_argument(
         fmt::format(
             "Tag: '{}' already exists on QP: '{}'", (uint32_t)tagNum, qpNum_));
   }
+  const auto index = pos - tags_.begin();
+  CHECK(!wqeQueue_.containsQueue(tagNum))
+      << "a WQE queue is created with its Tag, and this Tag is new";
+  // Reserved before the queue is added, so the insert below cannot throw and
+  // leave a queue without its Tag.
+  tags_.reserve(tags_.size() + 1);
+  auto tag = std::make_unique<Tag>(
+      qpNum_,
+      tagNum,
+      sendCq,
+      recvCq,
+      ibvQp,
+      sqSigAll,
+      maxInlineData,
+      sendQueueDepth,
+      receiveQueueDepth,
+      sharedReceiveQueue);
+  wqeQueue_.addQueue(tagNum);
+  return tags_.insert(tags_.begin() + index, std::move(tag))->get();
 }
 
 void TagSet::add(
@@ -172,30 +175,36 @@ void TagSet::add(
 }
 
 size_t TagSet::size() const {
-  std::shared_lock lock(mutex_);
-  return tagNumToTag_.size();
+  std::scoped_lock lock(stateLock_);
+  return tags_.size();
 }
 
 Tag& TagSet::at(uint8_t tagNum) const {
-  std::shared_lock lock(mutex_);
-  auto tagIt = tagNumToTag_.find(tagNum);
-  if (tagIt == tagNumToTag_.end()) {
+  Tag* const tag = getTagByNumber(tagNum);
+  if (tag == nullptr) {
     throw std::out_of_range(
         fmt::format("Tag: {} not found for QP: {}", (uint32_t)tagNum, qpNum_));
   }
-  return *tagIt->second;
+  return *tag;
 }
 
 Tag* FOLLY_NULLABLE TagSet::getTagByNumber(uint8_t tagNum) const {
-  std::shared_lock lock(mutex_);
-  auto tagIt = tagNumToTag_.find(tagNum);
-  return tagIt == tagNumToTag_.end() ? nullptr : tagIt->second.get();
+  for (const auto& tag : tags_) {
+    if (tag->getTagNum() == tagNum) {
+      return tag.get();
+    }
+  }
+  return nullptr;
+}
+
+Tag* FOLLY_NULLABLE TagSet::getTagInAnyState(uint8_t tagNum) const {
+  std::scoped_lock lock(stateLock_);
+  return getTagByNumber(tagNum);
 }
 
 struct ibv_pd* TagSet::protectionDomain() const {
-  std::shared_lock lock(mutex_);
-  return tagNumToTag_.empty() ? nullptr
-                              : tagNumToTag_.begin()->second->getIbvQp().pd;
+  std::scoped_lock lock(stateLock_);
+  return tags_.empty() ? nullptr : tags_.front()->getIbvQp().pd;
 }
 
 uint32_t TagSet::getQpNum() const {
@@ -203,23 +212,23 @@ uint32_t TagSet::getQpNum() const {
 }
 
 std::vector<uint8_t> TagSet::getTagNums() const {
-  std::shared_lock lock(mutex_);
+  std::scoped_lock lock(stateLock_);
   std::vector<uint8_t> tagNums;
-  tagNums.reserve(tagNumToTag_.size());
-  for (const auto& [tagNum, _] : tagNumToTag_) {
-    tagNums.push_back(tagNum);
+  tagNums.reserve(tags_.size());
+  for (const auto& tag : tags_) {
+    tagNums.push_back(tag->getTagNum());
   }
   return tagNums;
 }
 
 bool TagSet::contains(uint8_t tagNum) const {
-  std::shared_lock lock(mutex_);
-  return tagNumToTag_.contains(tagNum);
+  std::scoped_lock lock(stateLock_);
+  return getTagByNumber(tagNum) != nullptr;
 }
 
 bool TagSet::allTagsMarkedForDeletion() const {
-  std::shared_lock lock(mutex_);
-  for (const auto& [_, tag] : tagNumToTag_) {
+  std::scoped_lock lock(stateLock_);
+  for (const auto& tag : tags_) {
     if (!tag->isMarkedForDeletion()) {
       return false;
     }
@@ -228,9 +237,7 @@ bool TagSet::allTagsMarkedForDeletion() const {
 }
 
 bool TagSet::postWqe(uint8_t tagNum, std::unique_ptr<Wqe> wqe) {
-  std::scoped_lock lock(mutex_);
-  // Read from the map, not through at(), which takes mutex_ this already holds.
-  Tag& tag = *tagNumToTag_.at(tagNum);
+  Tag& tag = at(tagNum);
   const bool reserved = wqe->getWorkType() == Wqe::WorkType::kReceive
       ? tag.tryReserveReceiveQueueEntry()
       : tag.tryReserveSendQueueEntry();
@@ -255,7 +262,6 @@ folly::coro::Task<void> TagSet::processWqes(
     std::optional<uint16_t> maybeRnrCancelCsn;
     // A Tag lives in the set until the whole QP is torn down, so a WQE the
     // queue accepted still has one; at() says so by throwing if it does not.
-    // The map lock is not held past this: it guards the map.
     Tag& tag = at(tagNum);
 
     // Only this coroutine assigns msns, so room found here is still there
@@ -337,10 +343,8 @@ folly::coro::Task<void> TagSet::processWqes(
 }
 
 [[nodiscard]] int TagSet::getNumPendingRWqes() const {
-  std::shared_lock lock(mutex_);
-  // sum over all Tags in tagNumToTag_.
   int numPendingRWqes = 0;
-  for (const auto& [_, tag] : tagNumToTag_) {
+  for (const auto& tag : tags_) {
     numPendingRWqes += tag->getNumPendingRWqes();
   }
   return numPendingRWqes;
@@ -380,25 +384,21 @@ bool TagSet::waitForRWqesToBePosted(
 }
 
 [[nodiscard]] bool TagSet::hasPendingWqes() const {
-  std::shared_lock lock(mutex_);
-  return std::any_of(
-      tagNumToTag_.begin(), tagNumToTag_.end(), [](const auto& entry) {
-        return entry.second->hasPendingWqes();
-      });
+  return std::any_of(tags_.begin(), tags_.end(), [](const auto& tag) {
+    return tag->hasPendingWqes();
+  });
 }
 
 [[nodiscard]] int TagSet::getNumPendingWqes() const {
-  std::shared_lock lock(mutex_);
-  // sum over all Tags in tagNumToTag_.
   int numPendingWqes = 0;
-  for (const auto& [_, tag] : tagNumToTag_) {
+  for (const auto& tag : tags_) {
     numPendingWqes += tag->getNumPendingWqes();
   }
   return numPendingWqes;
 }
 
 Tag& TagSet::asSchedulable(TagsByNum::value_type& entry) {
-  return *entry.second;
+  return *entry;
 }
 
 std::optional<std::pair<Wqe*, Tag*>> TagSet::findNextWqe(bool intendToSend) {
@@ -409,69 +409,55 @@ std::optional<std::pair<Wqe*, Tag*>> TagSet::findNextWqe(bool intendToSend) {
 }
 
 std::optional<std::pair<Wqe*, Tag*>> TagSet::peekNextWqe() {
-  // A readiness peek changes no scheduler state. It snapshots the tags,
-  // taking Tag semaphores without holding mutex_.
-  std::vector<Tag*> tags;
+  // A readiness peek changes no scheduler state, and takes Tag semaphores
+  // without holding schedulerLock_.
+  std::optional<size_t> startIdx;
   {
-    std::scoped_lock lock(mutex_);
-    auto start = scheduler_.peek(
-        tagNumToTag_.begin(), tagNumToTag_.end(), asSchedulable);
-    if (start == tagNumToTag_.end()) {
-      return std::nullopt;
-    }
-    tags.reserve(tagNumToTag_.size());
-    for (auto it = start; it != tagNumToTag_.end(); ++it) {
-      tags.push_back(it->second.get());
-    }
-    for (auto it = tagNumToTag_.begin(); it != start; ++it) {
-      tags.push_back(it->second.get());
+    std::scoped_lock lock(schedulerLock_);
+    auto start = scheduler_.peek(tags_.begin(), tags_.end(), asSchedulable);
+    if (start != tags_.end()) {
+      startIdx = static_cast<size_t>(start - tags_.begin());
     }
   }
-  for (const auto& tag : tags) {
-    if (auto* wqe = tag->findNextWqe()) {
-      return std::make_pair(wqe, tag);
+  if (!startIdx.has_value()) {
+    return std::nullopt;
+  }
+  for (size_t i = 0; i < tags_.size(); ++i) {
+    Tag& tag = *tags_[(*startIdx + i) % tags_.size()];
+    if (auto* wqe = tag.findNextWqe()) {
+      return std::make_pair(wqe, &tag);
     }
   }
   return std::nullopt;
 }
 
 std::optional<std::pair<Wqe*, Tag*>> TagSet::findNextWqeToSend() {
-  // Each turn selects from the live map, so a tag added mid-scan joins at
-  // once. The Tag semaphore waits outside mutex_.
-  size_t numLive = 0;
-  {
-    std::scoped_lock lock(mutex_);
-    numLive = tagNumToTag_.size();
-  }
-  // One pass over at most every live tag; a miss marks the tag fully
-  // visited, so the scan reaches servable work. A tag this scan has tried is
-  // excluded from the rest of it, refills included.
+  // Each tag is tried at most once per scan, even after the scheduler refills.
   std::bitset<std::numeric_limits<uint8_t>::max() + 1> tried;
-  const auto wasTried = [&tried](const auto& entry) {
-    return tried.test(entry.first);
+  const auto wasTried = [&tried](const TagsByNum::value_type& entry) {
+    return tried.test(entry->getTagNum());
   };
-  for (size_t attempt = 0; attempt < numLive; ++attempt) {
-    // Iterator to the selected entry, held across the Tag semaphore wait
-    // outside mutex_. Recorded entries are never erased, so it stays valid.
+  for (size_t attempt = 0; attempt < tags_.size(); ++attempt) {
+    // Held across the Tag semaphore wait. No Tag is added once the QP has left
+    // RESET, so it stays valid.
     TagsByNum::iterator selected;
     // Claim this turn up front, so a hit costs one lock hold; a miss
     // forfeits the claimed visit with the rest below.
     {
-      std::scoped_lock lock(mutex_);
-      auto it = scheduler_.select(
-          tagNumToTag_.begin(), tagNumToTag_.end(), asSchedulable, wasTried);
-      if (it == tagNumToTag_.end()) {
+      std::scoped_lock lock(schedulerLock_);
+      selected = scheduler_.select(
+          tags_.begin(), tags_.end(), asSchedulable, wasTried);
+      if (selected == tags_.end()) {
         return std::nullopt;
       }
-      tried.set(it->first);
-      scheduler_.noteServed(it, asSchedulable);
-      selected = it;
+      tried.set((*selected)->getTagNum());
+      scheduler_.noteServed(selected, asSchedulable);
     }
-    Tag& tag = *selected->second;
+    Tag& tag = **selected;
     if (auto* wqe = tag.findNextWqe()) {
       return std::make_pair(wqe, &tag);
     }
-    std::scoped_lock lock(mutex_);
+    std::scoped_lock lock(schedulerLock_);
     scheduler_.noteSkipped(selected, asSchedulable);
   }
   return std::nullopt;
@@ -496,8 +482,7 @@ bool TagSet::takeTagLeftServiceNotice() {
 }
 
 bool TagSet::noTagSurvives() const {
-  std::shared_lock lock(mutex_);
-  for (const auto& [_, tag] : tagNumToTag_) {
+  for (const auto& tag : tags_) {
     if (!tag->isInErrorState() && !tag->isMarkedForDeletion()) {
       return false;
     }
@@ -507,10 +492,10 @@ bool TagSet::noTagSurvives() const {
 
 SenderWake TagSet::enterTagErrorWithTagHeld(Tag& tag) {
   {
-    // Under mutex_ so this serializes with the whole-QP walk in
+    // Under stateLock_ so this serializes with the whole-QP walk in
     // setIbvQpState(); owning a Tag and then taking it briefly is the send
     // path's own order.
-    std::scoped_lock lock(mutex_);
+    std::scoped_lock lock(stateLock_);
     tag.setErrorStateWithoutNotification();
   }
   notifySenderTagEnteredError();
@@ -532,18 +517,8 @@ void TagSet::failWqesOfTagsInError() {
   if (!tagErrorSweepPending_.exchange(false, std::memory_order_acq_rel)) {
     return;
   }
-  // Snapshot under mutex_ and take each Tag outside it: waiting on a Tag
-  // semaphore while holding mutex_ would close a cycle against the send path,
-  // which owns a Tag and then takes mutex_ to find the next one.
-  std::vector<Tag*> tags;
-  {
-    std::shared_lock lock(mutex_);
-    tags.reserve(tagNumToTag_.size());
-    for (const auto& [_, tag] : tagNumToTag_) {
-      tags.push_back(tag.get());
-    }
-  }
-  for (const auto& tag : tags) {
+  // A Tag in error stays there, so no Tag is added while this walks.
+  for (const auto& tag : tags_) {
     auto tagGuard = tag->scopedLock();
     const uint32_t abandonedPosnCount =
         tag->failPendingWqesIfInErrorWithTagHeld();
@@ -552,20 +527,19 @@ void TagSet::failWqesOfTagsInError() {
 }
 
 bool TagSet::allTagsInState(ibv_qp_state state) const {
-  std::shared_lock lock(mutex_);
+  std::scoped_lock lock(stateLock_);
   return allTagsInStateWithLockHeld(state);
 }
 
 bool TagSet::allTagsInStateWithLockHeld(ibv_qp_state state) const {
-  return std::all_of(
-      tagNumToTag_.begin(), tagNumToTag_.end(), [state](const auto& entry) {
-        return loadQpState(entry.second->getIbvQp()) == state;
-      });
+  return std::all_of(tags_.begin(), tags_.end(), [state](const auto& tag) {
+    return loadQpState(tag->getIbvQp()) == state;
+  });
 }
 
 void TagSet::setIbvQpState(ibv_qp_state state) {
-  std::scoped_lock lock(mutex_);
-  for (auto& [_, tag] : tagNumToTag_) {
+  std::scoped_lock lock(stateLock_);
+  for (auto& tag : tags_) {
     // IBV_QPS_ERR is terminal, so a Tag already there keeps it.
     if (tag->isInErrorState()) {
       continue;
