@@ -40,6 +40,7 @@
 #include <tuple>
 #include <vector>
 
+DECLARE_bool(libsoftmetaroce_dont_fragment);
 DECLARE_bool(libsoftmetaroce_slow_receiver);
 DECLARE_uint32(libsoftmetaroce_min_rto_us);
 
@@ -108,6 +109,7 @@ class RtoRepathTest : public QpTestBase, public WithParamInterface<bool> {
     FLAGS_libsoftmetaroce_min_rto_us = 1000;
     FLAGS_libsoftmetaroce_max_rto_us = 1000;
     FLAGS_libsoftmetaroce_slow_receiver = false;
+    FLAGS_libsoftmetaroce_dont_fragment = false;
     QpTestBase::SetUp();
     auto identification = std::make_shared<TimerGate>();
     auto identified = std::make_shared<folly::Baton<>>();
@@ -134,6 +136,9 @@ class RtoRepathTest : public QpTestBase, public WithParamInterface<bool> {
               .WillByDefault([this](const folly::SocketAddress& address) {
                 boundLocals.push_back(address.getIPAddress());
               });
+          ON_CALL(*socket, setDFAndTurnOffPMTU()).WillByDefault([this]() {
+            ++dontFragmentSockets;
+          });
           return std::make_pair(std::move(socket), std::unique_ptr<Modifier>{});
         },
         LimitedTestSender::kDefaultSendToPort,
@@ -328,6 +333,7 @@ class RtoRepathTest : public QpTestBase, public WithParamInterface<bool> {
   // QP teardown reaches its WQEs and Sender, including the captured counter.
   std::vector<char> payload = std::vector<char>(4096 * 16);
   size_t socketCreations{0};
+  size_t dontFragmentSockets{0};
   size_t socketCreationFailures{0};
   bool failNextSocketCreation{false};
   std::vector<folly::IPAddress> boundLocals;
@@ -476,6 +482,46 @@ TEST_P(RtoRepathTest, AcceptedAcksResetEntropyConsumption) {
         << "an accepted ACK must allow a repeated timeout count to select entropy again";
     expectPacketRoute(*renewedPacket, *flow, configuredEndpoints);
   }
+}
+
+TEST_P(RtoRepathTest, DontFragmentCoversEntropySockets) {
+  FLAGS_libsoftmetaroce_dont_fragment = true;
+  testQp = makeQp(distinctPairs(1));
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(1))
+      << "precondition: an outstanding frame arms the entropy recovery timer";
+  EXPECT_EQ(dontFragmentSockets, socketCreations)
+      << "every initial data and ack socket must drop oversize packets rather "
+         "than fragment them";
+  const auto creationsBefore = socketCreations;
+
+  ASSERT_TRUE(advanceTimeouts(2))
+      << "precondition: the threshold timeouts must complete before the "
+         "sender visits";
+  ASSERT_TRUE(flow->getNextPacketToSend())
+      << "precondition: the threshold sender visit retransmits the frame";
+  ASSERT_GT(socketCreations, creationsBefore)
+      << "precondition: the threshold visit creates an entropy socket";
+
+  EXPECT_EQ(dontFragmentSockets, socketCreations)
+      << "a socket created by a repath must drop oversize packets like the "
+         "initial sockets, or the sender fragments again after its first "
+         "repath";
+}
+
+TEST_P(RtoRepathTest, DontFragmentOffLeavesSocketsUntouched) {
+  testQp = makeQp(distinctPairs(1));
+  auto* flow = testQp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  ASSERT_TRUE(sendFrames(1))
+      << "precondition: sending a frame creates the initial sockets";
+  ASSERT_GT(socketCreations, 0u)
+      << "precondition: the sender created at least one socket";
+
+  EXPECT_EQ(dontFragmentSockets, 0u)
+      << "the flag defaults off, so sockets keep the host's path MTU "
+         "discovery";
 }
 
 TEST_P(RtoRepathTest, DisabledAndOversizedThresholdPreserveRoute) {

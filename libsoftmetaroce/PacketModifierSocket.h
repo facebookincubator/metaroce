@@ -196,6 +196,9 @@ class PacketModifierSocket : public PacketSocket::ReadCallback {
   }
   void checkRcvBuf();
   void checkSndBuf();
+  void setDontFragment() {
+    packetSocket_->setDontFragment();
+  }
 
   // Test-only: returns the underlying AsyncUDPSocket so tests can
   // dynamic_cast to MockUDPSocket. Returns nullptr for non-UDP transports.

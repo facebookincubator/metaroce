@@ -103,6 +103,10 @@ void UdpPacketSocket::setReusePort(bool reusePort) {
   socket_->setReusePort(reusePort);
 }
 
+void UdpPacketSocket::setDontFragment() {
+  socket_->setDFAndTurnOffPMTU();
+}
+
 int UdpPacketSocket::getRcvBuf() {
   int value;
   socklen_t optLen = sizeof(value);

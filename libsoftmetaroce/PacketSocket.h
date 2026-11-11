@@ -108,6 +108,9 @@ class PacketSocket {
   // Enable SO_REUSEPORT before bind() so several sockets can share one
   // address/port and the kernel load-balances datagrams across them by 4-tuple.
   virtual void setReusePort(bool) {}
+
+  // Disables fragmentation, where supported.
+  virtual void setDontFragment() {}
 };
 
 } // namespace libsoftmetaroce

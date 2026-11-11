@@ -65,6 +65,7 @@ class UdpPacketSocket : public PacketSocket,
   int getSndBuf() override;
   void setMaxReadsPerEvent(uint16_t maxReads) override;
   void setReusePort(bool reusePort) override;
+  void setDontFragment() override;
 
   // Testing accessor: returns the underlying AsyncUDPSocket.
   [[nodiscard]] folly::AsyncUDPSocket* getUdpSocket() {

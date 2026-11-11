@@ -28,6 +28,12 @@
 #include <cerrno>
 #include <string>
 
+DEFINE_bool(
+    libsoftmetaroce_dont_fragment,
+    false,
+    "Disable fragmentation and ignore path MTU "
+    "updates (IP_PMTUDISC_PROBE / IPV6_PMTUDISC_PROBE).");
+
 namespace libsoftmetaroce {
 
 Sender::~Sender() {
@@ -559,6 +565,9 @@ uint16_t Sender::createSocketWithLocalAddr(
     socket.sizeSndBufBeforeBind();
     assignment->sourcePorts.bindNext(socket, localAddr);
     socket.checkSndBuf();
+    if (FLAGS_libsoftmetaroce_dont_fragment) {
+      socket.setDontFragment();
+    }
     // Place the DSCP code point in the upper 6 bits of the TOS byte and
     // OR in ECT(0) in the lower 2 (ECN) bits to keep the socket
     // ECN-capable. No-op for raw Ethernet, which has no IP TOS.

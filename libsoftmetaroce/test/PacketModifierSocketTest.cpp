@@ -14,11 +14,13 @@
  * limitations under the License.
  */
 
+#include <folly/String.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/net/NetOps.h>
 #include <folly/synchronization/Baton.h>
 #include <gtest/gtest.h>
 #include <libsoftmetaroce/EsunEncapsulation.h>
@@ -442,6 +444,29 @@ TEST_F(PacketModifierSocketTest, ParsePacketFromBufferForwardsUndefinedOpcode) {
   EXPECT_NE(dynamic_cast<UnsupportedPacket*>(result.get()), nullptr)
       << "an undefined opcode must parse to an UnsupportedPacket so the "
          "responder rejects it by type, not by re-deriving it from the opcode";
+}
+
+TEST_F(PacketModifierSocketTest, DontFragmentIgnoresPathMtuOnIpv6) {
+  socket_->bind(folly::SocketAddress("::1", 0));
+
+  socket_->setDontFragment();
+
+  int mode = -1;
+  socklen_t optLen = sizeof(mode);
+  ASSERT_EQ(
+      folly::netops::getsockopt(
+          CHECK_NOTNULL(socket_->getSocket())->getNetworkSocket(),
+          IPPROTO_IPV6,
+          IPV6_MTU_DISCOVER,
+          &mode,
+          &optLen),
+      0)
+      << "precondition: the socket's path MTU discovery mode is readable: "
+      << folly::errnoStr(errno);
+  EXPECT_EQ(mode, IPV6_PMTUDISC_PROBE)
+      << "a router must drop a packet larger than its next link's MTU; the "
+         "sending host neither fragments it nor shrinks later packets after "
+         "a Packet Too Big";
 }
 
 // Test that destroying a PacketModifierSocket with pending timer callbacks

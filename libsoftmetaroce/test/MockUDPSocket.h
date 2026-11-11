@@ -70,6 +70,7 @@ class MockUDPSocket : public folly::AsyncUDPSocket {
        const std::unique_ptr<folly::IOBuf>*,
        size_t));
   MOCK_METHOD(void, resumeRead, (ReadCallback * cob));
+  MOCK_METHOD(void, setDFAndTurnOffPMTU, ());
   MOCK_METHOD(
       void,
       setAdditionalCmsgsFunc,
