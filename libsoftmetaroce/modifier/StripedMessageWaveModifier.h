@@ -98,6 +98,11 @@ struct StripedMessageWaveState {
 
   // Test-only support.
   std::condition_variable scheduledPacketsCv;
+  // Receives each scheduled or recovery packet's pacing timestamp. The release
+  // thread holds mutex for the call, before the packet leaves scheduledPackets
+  // or recoveryPackets, so the call's effects are visible once
+  // waitForDrainForTest returns true. Set the hook before any packet is queued.
+  folly::Function<void(uint64_t)> onPacingTimestampForTest;
 
   // Declared after callback state so scheduler destruction happens first.
   DeadlineQueue releaseQueue{"lsmrStripe"};

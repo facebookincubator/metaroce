@@ -96,40 +96,39 @@ TEST(
   using Fragment = std::tuple<uint32_t, uint32_t, uint16_t>;
   std::vector<Fragment> delivered;
   std::vector<uint64_t> deliveredAtNs;
+  waveState->onPacingTimestampForTest =
+      [&deliveredAtNs](uint64_t pacingTimestampNs) {
+        deliveredAtNs.push_back(pacingTimestampNs);
+      };
   std::mutex deliveredMutex;
   std::condition_variable deliveredCv;
   std::atomic<bool> wrongCallback{false};
   std::array<SendPacketFn, kNumQps> sendFns;
   for (uint32_t qp = 0; qp < kNumQps; ++qp) {
-    sendFns[qp] = [&delivered,
-                   &deliveredAtNs,
-                   &deliveredMutex,
-                   &deliveredCv,
-                   &wrongCallback,
-                   qp](
-                      const folly::SocketAddress&,
-                      std::unique_ptr<Packet> packet,
-                      std::optional<uint32_t>) {
-      const uint64_t callbackStartedAtNs = getNowNs64();
-      const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
-      if (dataPacket == nullptr) {
-        wrongCallback = true;
-        return -1L;
-      }
-      if (packet->getBaseHeader().getSrcQp() != qp) {
-        wrongCallback = true;
-      }
-      {
-        std::lock_guard<std::mutex> lock(deliveredMutex);
-        delivered.emplace_back(
-            packet->getBaseHeader().getSrcQp(),
-            dataPacket->getDataHeader().getMsn(),
-            dataPacket->getDataHeader().getPosn());
-        deliveredAtNs.push_back(callbackStartedAtNs);
-      }
-      deliveredCv.notify_all();
-      return static_cast<ssize_t>(packet->getSizeBytes());
-    };
+    sendFns[qp] =
+        [&delivered, &deliveredMutex, &deliveredCv, &wrongCallback, qp](
+            const folly::SocketAddress&,
+            std::unique_ptr<Packet> packet,
+            std::optional<uint32_t>) {
+          const auto* dataPacket =
+              dynamic_cast<const DataPacket*>(packet.get());
+          if (dataPacket == nullptr) {
+            wrongCallback = true;
+            return -1L;
+          }
+          if (packet->getBaseHeader().getSrcQp() != qp) {
+            wrongCallback = true;
+          }
+          {
+            std::lock_guard<std::mutex> lock(deliveredMutex);
+            delivered.emplace_back(
+                packet->getBaseHeader().getSrcQp(),
+                dataPacket->getDataHeader().getMsn(),
+                dataPacket->getDataHeader().getPosn());
+          }
+          deliveredCv.notify_all();
+          return static_cast<ssize_t>(packet->getSizeBytes());
+        };
   }
 
   const auto submitPacket =
@@ -184,6 +183,9 @@ TEST(
       << "each packet must use the flow callback that accepted it";
   ASSERT_TRUE(modifiers[0]->waitForDrainForTest(std::chrono::seconds(2)))
       << "paced message wave remained queued after all callbacks completed";
+  ASSERT_EQ(deliveredAtNs.size(), delivered.size())
+      << "precondition: the pacing checks need the modifier's pacing "
+         "timestamp for every packet it sent";
   for (size_t index = 1; index < deliveredAtNs.size(); ++index) {
     EXPECT_GE(deliveredAtNs[index] - deliveredAtNs[index - 1], 1'000'000)
         << "self-chained pacing must not catch up with a packet burst";
@@ -208,6 +210,9 @@ TEST(
   }
   ASSERT_TRUE(modifiers[0]->waitForDrainForTest(std::chrono::seconds(2)))
       << "retransmit recovery remained queued after both callbacks completed";
+  ASSERT_EQ(deliveredAtNs.size(), delivered.size())
+      << "precondition: the pacing checks need the modifier's pacing "
+         "timestamp for every packet it sent";
   EXPECT_EQ(std::get<0>(delivered[deliveredBeforeCompletedRepeat]), 0)
       << "the first retransmit recovery should retain its QP";
   EXPECT_EQ(std::get<0>(delivered[deliveredBeforeCompletedRepeat + 1]), 1)
@@ -316,11 +321,14 @@ TEST(
   constexpr uint64_t kCallbackWorkNs = 80'000'000;
   constexpr size_t kPackets = 4;
   std::vector<uint64_t> sendStarts;
-  SendPacketFn sendFn = [&sendStarts](
-                            const folly::SocketAddress&,
-                            std::unique_ptr<Packet> packet,
-                            std::optional<uint32_t>) {
-    sendStarts.push_back(getNowNs64());
+  auto waveState = std::make_shared<StripedMessageWaveState>();
+  waveState->onPacingTimestampForTest =
+      [&sendStarts](uint64_t pacingTimestampNs) {
+        sendStarts.push_back(pacingTimestampNs);
+      };
+  SendPacketFn sendFn = [](const folly::SocketAddress&,
+                           std::unique_ptr<Packet> packet,
+                           std::optional<uint32_t>) {
     const uint64_t workDeadlineNs = steadyNowNs() + kCallbackWorkNs;
     while (steadyNowNs() < workDeadlineNs) {
     }
@@ -336,6 +344,7 @@ TEST(
       1,
       kPackets,
       kReleaseIntervalUs);
+  config->state = waveState;
   StripedMessageWaveModifier modifier(std::move(config));
   for (uint32_t qp = 0; qp < 2; ++qp) {
     for (uint16_t posn = 0; posn < 2; ++posn) {
@@ -451,18 +460,26 @@ TEST(StripedMessageWaveModifierTest, RecoverySharesOriginalPacketPacing) {
         "max_pending_packets": 4,
         "release_interval_us": 10000
       })";
+  auto waveState = std::make_shared<StripedMessageWaveState>();
   auto config =
       ModifierConfig::buildModifierConfigFromJson(folly::parseJson(jsonStr));
+  auto* waveConfig =
+      dynamic_cast<StripedMessageWaveModifierConfig*>(config.get());
+  ASSERT_NE(waveConfig, nullptr);
+  waveConfig->state = waveState;
   StripedMessageWaveModifier modifier(std::move(config));
   using Fragment = std::tuple<uint32_t, uint32_t, uint16_t, bool>;
   std::vector<Fragment> delivered;
   std::vector<uint64_t> deliveredAtNs;
+  waveState->onPacingTimestampForTest =
+      [&deliveredAtNs](uint64_t pacingTimestampNs) {
+        deliveredAtNs.push_back(pacingTimestampNs);
+      };
   std::mutex deliveredMutex;
   std::condition_variable deliveredCv;
   SendPacketFn sendFn = [&](const folly::SocketAddress&,
                             std::unique_ptr<Packet> packet,
                             std::optional<uint32_t>) {
-    const uint64_t callbackStartedAtNs = getNowNs64();
     const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
     CHECK(dataPacket);
     const auto& header = dataPacket->getDataHeader();
@@ -473,7 +490,6 @@ TEST(StripedMessageWaveModifierTest, RecoverySharesOriginalPacketPacing) {
           header.getMsn(),
           header.getPosn(),
           header.getIsRetransmit());
-      deliveredAtNs.push_back(callbackStartedAtNs);
     }
     deliveredCv.notify_all();
     return static_cast<ssize_t>(packet->getSizeBytes());
@@ -516,6 +532,9 @@ TEST(StripedMessageWaveModifierTest, RecoverySharesOriginalPacketPacing) {
   }
   ASSERT_TRUE(modifier.waitForDrainForTest(std::chrono::seconds(2)))
       << "mixed traffic must release all deferred callbacks before teardown";
+  ASSERT_EQ(deliveredAtNs.size(), delivered.size())
+      << "precondition: the pacing checks need the modifier's pacing "
+         "timestamp for every packet it sent";
   std::vector<Fragment> originals;
   bool previousWasRecovery = false;
   for (size_t index = 4; index < delivered.size(); ++index) {
@@ -551,17 +570,25 @@ TEST(StripedMessageWaveModifierTest, ShortTailsRetainFullFragmentSpacing) {
         "release_interval_us": 2000000,
         "tail_release_interval_us": 10000
       })";
+  auto waveState = std::make_shared<StripedMessageWaveState>();
   auto config =
       ModifierConfig::buildModifierConfigFromJson(folly::parseJson(jsonStr));
+  auto* waveConfig =
+      dynamic_cast<StripedMessageWaveModifierConfig*>(config.get());
+  ASSERT_NE(waveConfig, nullptr);
+  waveConfig->state = waveState;
   StripedMessageWaveModifier modifier(std::move(config));
   std::vector<std::pair<uint32_t, uint16_t>> delivered;
   std::vector<uint64_t> deliveredAtNs;
+  waveState->onPacingTimestampForTest =
+      [&deliveredAtNs](uint64_t pacingTimestampNs) {
+        deliveredAtNs.push_back(pacingTimestampNs);
+      };
   std::mutex deliveredMutex;
   std::condition_variable deliveredCv;
   SendPacketFn sendFn = [&](const folly::SocketAddress&,
                             std::unique_ptr<Packet> packet,
                             std::optional<uint32_t>) {
-    const uint64_t callbackStartedAtNs = getNowNs64();
     const auto* dataPacket = dynamic_cast<const DataPacket*>(packet.get());
     CHECK(dataPacket);
     {
@@ -569,7 +596,6 @@ TEST(StripedMessageWaveModifierTest, ShortTailsRetainFullFragmentSpacing) {
       delivered.emplace_back(
           packet->getBaseHeader().getSrcQp(),
           dataPacket->getDataHeader().getPosn());
-      deliveredAtNs.push_back(callbackStartedAtNs);
     }
     deliveredCv.notify_all();
     return static_cast<ssize_t>(packet->getSizeBytes());
@@ -595,6 +621,9 @@ TEST(StripedMessageWaveModifierTest, ShortTailsRetainFullFragmentSpacing) {
   }
   ASSERT_TRUE(modifier.waitForDrainForTest(std::chrono::seconds(2)))
       << "completed tail delivery must leave no scheduled callbacks";
+  ASSERT_EQ(deliveredAtNs.size(), delivered.size())
+      << "precondition: the pacing checks need the modifier's pacing "
+         "timestamp for every packet it sent";
   const std::vector<std::pair<uint32_t, uint16_t>> expected = {
       {0, 0}, {1, 0}, {0, 1}, {1, 1}};
   EXPECT_EQ(delivered, expected)

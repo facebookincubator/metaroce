@@ -405,6 +405,10 @@ void StripedMessageWaveModifier::dispatchWavePacket(
   const uint64_t sendStartedAtNs = sendWavePacketNoThrow(
       isRecovery ? *recovery.send : *scheduled.send,
       isRecovery ? "recovery" : "scheduled");
+  if (state->onPacingTimestampForTest) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->onPacingTimestampForTest(sendStartedAtNs);
+  }
   if (isRecovery) {
     state->recoveryPackets.fetch_sub(1, std::memory_order_relaxed);
   } else {
