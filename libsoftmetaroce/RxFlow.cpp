@@ -623,6 +623,7 @@ RequestValidationError RxFlow::ensureAndValidateWqe(
         &addrErr,
         qp_.getMemoryRegions(),
         qp_.getMtu());
+    qp_.watchdog_.recordProgress();
     if (addrErr) {
       validationError = RequestValidationError::kAddressError;
     }
@@ -655,6 +656,7 @@ RequestValidationError RxFlow::ensureAndValidateWqe(
           &addrErr,
           qp_.getMemoryRegions(),
           qp_.getMtu());
+      qp_.watchdog_.recordProgress();
       if (addrErr) {
         validationError = RequestValidationError::kAddressError;
       }

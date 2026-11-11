@@ -4584,6 +4584,58 @@ TEST_F(QpTest, MarkedTagNaksIncomingReadWithImmediate) {
          "serve it";
 }
 
+/*
+ * A responder's queue pair can be built long before any read arrives. The
+ * response a read request creates is transmit work, as a posted send is, so the
+ * request records watchdog progress.
+ */
+TEST_F(QpTest, ANewReadRequestRecordsWatchdogProgress) {
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 1, &mockSender);
+  auto* const rxFlow = qp.getRxFlowById(0);
+
+  const uint16_t pktFsn = 10;
+  rxFlow->getRxState().rcvNxt = pktFsn;
+  BaseHeader::Opcode opCode(BaseHeader::Opcode::OperationType::READ);
+  const BaseHeader baseHeader = BaseHeader::BaseHeaderBuilder()
+                                    .setSrcQp(qp.getRemoteQpNum())
+                                    .setDstQp(qp.getLocalQpNum())
+                                    .setFlowId(0)
+                                    .setOpcode(std::move(opCode))
+                                    .setVersion(0)
+                                    .build();
+  const ReadWriteHeader readHeader =
+      ReadWriteHeader::ReadWriteHeaderBuilder()
+          .setKey(mrKey)
+          .setMessageAddr(reinterpret_cast<uint64_t>(receiveBuffer.data()))
+          .setMessageLength(mtu)
+          .build();
+  const DataHeader dataHeader = DataHeader::DataHeaderBuilder()
+                                    .setFsn(pktFsn)
+                                    .setUna(pktFsn)
+                                    .setPosn(0)
+                                    .setMsn(initialTag->getCDMSN() + 1)
+                                    .setAckRequest(true)
+                                    .build();
+  const ReadWritePacket readPacket(
+      baseHeader,
+      dataHeader,
+      readHeader,
+      /*payloadAddress=*/nullptr,
+      /*payloadSizeBytes=*/0);
+
+  const auto before = qp.getLastProgressTime();
+  auto maybeAck = rxFlow->processDataPacket(&readPacket, kEcnECT0);
+  ASSERT_TRUE(maybeAck.has_value())
+      << "precondition: the request asks for an ack";
+  ASSERT_EQ(maybeAck.value().getAckStatus(), AckStatus::ACK)
+      << "precondition: the request is served rather than refused, or there "
+         "is no response here to time";
+  EXPECT_GT(qp.getLastProgressTime(), before)
+      << "a new read is transmit work, so the response's deadline must start "
+         "at the request rather than when the queue pair was built";
+}
+
 TEST_F(QpTest, ReadWithImmediateCarryingPayloadIsNakd) {
   LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
   qp.setupFlows(1, 1, &mockSender);
