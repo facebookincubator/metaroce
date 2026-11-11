@@ -8402,6 +8402,99 @@ TEST_F(QpTest, BrnrDoubleInSequence) {
   EXPECT_EQ(receiveBuffer[mtu - 1], 33) << "buffer did not get the data";
 }
 
+TEST_F(QpTest, ABrnrAtTheHeadOfAFullWindowIsReleasedByTheNextWindowsUna) {
+  ScopedSuppressedTxTimers suppressTimers;
+  createAlwaysSendingMockCongestionController(qp);
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 0, &mockSender);
+
+  Qp receivingQp{kSecondQpNum, retxTimer, arbiter, mrs, &cq, ibvQp};
+  receivingQp.setMtu(mtu);
+  receivingQp.addPortPair(
+      *qp.getRemoteAddrs().begin(), *qp.getLocalAddrs().begin());
+  LimitedTestSender receivingSender(arbiter, mockUDPSocketMaker);
+  receivingQp.setupFlows(0, 1, &receivingSender);
+  auto* receivingFlow = receivingQp.getRxFlowById(0);
+  auto* sendingFlow = qp.getTxFlowById(0);
+
+  // A window as wide as the selective-ack bit vector: a write with immediate
+  // the receiver has no receive for, then a write filling the other frames.
+  constexpr uint32_t kWindowFrames = AckHeader::kAckTrackerBits;
+  const uint32_t writeBytes = (kWindowFrames - 1) * mtu;
+  std::vector<char> source(writeBytes, 33);
+  std::vector<char> target(writeBytes, 0);
+  struct ibv_mr* targetMr = mrs.reg_mr(
+      &pd,
+      target.data(),
+      target.size(),
+      IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_LOCAL_WRITE);
+  ASSERT_NE(targetMr, nullptr);
+  postWqeHelper(
+      &qp,
+      {.workType = Wqe::WorkType::kWriteWithImm,
+       .msgSizeBytes = mtu,
+       .address = source.data(),
+       .maybeImmediateData = 7});
+  postWqeHelper(
+      &qp,
+      {.workType = Wqe::WorkType::kWrite,
+       .msgSizeBytes = writeBytes,
+       .address = source.data(),
+       .remote_addr = reinterpret_cast<uint64_t>(target.data()),
+       .rkey = targetMr->rkey});
+
+  std::optional<AckHeader> lastAck;
+  for (uint32_t frame = 0; frame < kWindowFrames; ++frame) {
+    auto egress = sendingFlow->getNextPacketToSend();
+    ASSERT_TRUE(egress) << "precondition: frame " << frame
+                        << " of the window is sendable before any ack";
+    auto* dataPacket = dynamic_cast<DataPacket*>(egress->packet.get());
+    ASSERT_NE(dataPacket, nullptr);
+    if (auto ack = receivingFlow->processDataPacket(dataPacket, kEcnECT0)) {
+      lastAck = std::move(ack);
+    }
+  }
+  ASSERT_TRUE(lastAck.has_value())
+      << "precondition: the receiver acknowledges the window";
+  ASSERT_EQ(lastAck->getAckStatus(), AckStatus::BRNR)
+      << "precondition: the receiver refuses the head of the window and "
+         "accepts the rest";
+  ASSERT_EQ(lastAck->getCumulativeFsn(), 0xffff)
+      << "precondition: the refused head holds the cumulative FSN back";
+
+  lastAck->setTimestamp(0);
+  sendingFlow->processAckPacket(
+      *lastAck, simulatedProcessedAtNs(lastAck->getTimestamp()));
+  retxTimer.cancelCallback(qp.getBrnrTimerCallback());
+  initialTag->brnr().beginProbe();
+  postWqeHelper(
+      &receivingQp,
+      {.workType = Wqe::WorkType::kReceive,
+       .msgSizeBytes = 0,
+       .address = nullptr});
+
+  auto retry = qp.getNextPacketToSend();
+  ASSERT_TRUE(retry) << "precondition: the refused write is sent again once "
+                        "the backoff ends; BRNR state is "
+                     << initialTag->getBrnrState();
+  auto* retryPacket = dynamic_cast<DataPacket*>(retry->packet.get());
+  ASSERT_NE(retryPacket, nullptr);
+  const auto& retryHeader = retryPacket->getDataHeader();
+  EXPECT_EQ(retryHeader.getUna(), kWindowFrames)
+      << "the sender clears the refused head and the acknowledged frames, so "
+         "its next packet is the first to tell the receiver it may release "
+         "the head";
+  ASSERT_EQ(retryHeader.getFsn(), kWindowFrames)
+      << "precondition: the retry takes the first FSN past the window, a "
+         "full bit vector past the refused head";
+
+  auto releasingAck = receivingFlow->processDataPacket(retryPacket, kEcnECT0);
+  ASSERT_TRUE(releasingAck.has_value())
+      << "precondition: the receiver answers the retry with an ack";
+  EXPECT_EQ(releasingAck->getCumulativeFsn(), retryHeader.getFsn())
+      << "only this packet's UNA can release the refused head";
+}
+
 TEST_F(QpTest, SetupTellsTheControllerHowManyPortPairsTheFlowsSpan) {
   Qp multiportQp{31, retxTimer, arbiter, mrs, &cq, ibvQp};
   multiportQp.setMtu(mtu);
