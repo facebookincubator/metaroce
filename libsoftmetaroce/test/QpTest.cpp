@@ -6069,6 +6069,50 @@ TEST_F(QpTest, HrnrForAnAckedFsnIsIgnored) {
          "QP";
 }
 
+TEST_F(QpTest, AnHrnrDoesNotAcknowledgeTheFramesBeforeTheOneItRefuses) {
+  ScopedSuppressedTxTimers suppressTimers;
+  createAlwaysSendingMockCongestionController(qp);
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 0, &mockSender);
+  auto* txFlow = qp.getTxFlowById(0);
+
+  constexpr uint16_t kFrames = 11;
+  constexpr uint16_t kRefusedFsn = kFrames - 1;
+  const uint32_t msgSizeBytes = kFrames * mtu;
+  auto payload = std::make_unique<char[]>(msgSizeBytes);
+  postWqeHelper(
+      &qp,
+      {.workType = Wqe::WorkType::kSend,
+       .msgSizeBytes = msgSizeBytes,
+       .address = payload.get()});
+  for (uint16_t frame = 0; frame < kFrames; ++frame) {
+    ASSERT_TRUE(qp.getNextPacketToSend())
+        << "precondition: frame " << frame << " of the send goes out";
+  }
+
+  // The responder refuses the last frame with an HRNR, whose FSN fields both
+  // name the refused frame; the frames before it may have been lost.
+  const AckHeader hrnr = AckHeader::AckHeaderBuilder()
+                             .setAckStatus(AckStatus::HRNR)
+                             .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
+                             .setCumulativeFsn(kRefusedFsn)
+                             .setMaxRcvdFsn(kRefusedFsn)
+                             .setTimestamp(0)
+                             .build();
+  txFlow->processAckPacket(hrnr, simulatedProcessedAtNs(hrnr.getTimestamp()));
+
+  EXPECT_EQ(qp.getHrnrState(), HrnrState::HRNR_BLOCKED_TX)
+      << "the HRNR holds transmission; applied as an acknowledgment of new "
+         "frames, it would also release its own hold";
+  EXPECT_EQ(cq.getNumCompletedWqes(), 0)
+      << "the HRNR reports one refused frame and nothing about the others; "
+         "reading its Cumulative FSN as an acknowledgment would complete a "
+         "send the responder refused and may never have received";
+  EXPECT_EQ(txFlow->getTxState().sndUna, 0)
+      << "every frame of the send stays outstanding, so the transmission "
+         "that resumes after the backoff carries all of it again";
+}
+
 // Fixture for the HRNR probe cycle, whose tests all need a QP holding unacked
 // data that a probe can carry.
 class QpHrnrProbeTest : public QpTest {
