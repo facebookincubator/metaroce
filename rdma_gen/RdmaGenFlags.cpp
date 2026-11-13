@@ -175,6 +175,12 @@ DEFINE_string(
     "",
     "Traffic classes, if multiple split with commas. Will default to all 0");
 DEFINE_int32(duration_secs, 30, "Number of seconds to run test-0 == infinite");
+DEFINE_int32(
+    stall_timeout_secs,
+    0,
+    "Client only: exit with status 3 if no send completion arrives for this "
+    "many seconds while sends are outstanding, after logging the per-QP "
+    "outstanding counts. 0 disables the check.");
 DEFINE_int32(sample_int, 1, "Number of seconds per sample");
 DEFINE_bool(log_msg_latencies, false, "Log percentiles of message latencies");
 DEFINE_string(

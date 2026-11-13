@@ -16,9 +16,13 @@
 
 #include "rdma_gen/RdmaGenClientServerMain.h"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <optional>
 
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <re2/re2.h>
 #include <numeric>
 
@@ -34,12 +38,41 @@
 #include "rdma_gen/RdmaGenReceiver.h"
 #include "rdma_gen/RdmaGenRequesterFactory.h"
 #include "rdma_gen/RdmaGenResponderFactory.h"
+#include "rdma_gen/RdmaGenStallWatchdog.h"
 #include "rdma_gen/RdmaGenWriteResponder.h"
 
 namespace facebook::neteng::ai::rdma_gen {
 
 // 6-bit DSCP values are between 0 and 63 (inclusive).
 constexpr int kMaxDscpValue = 63;
+
+// Exit status when --stall_timeout_secs expires.
+constexpr int kStallExitCode = 3;
+
+namespace {
+
+bool hasOutstandingSends(const RdmaGenRequester& client) {
+  const auto counts = client.waitingCompletionCounts();
+  return std::any_of(
+      counts.begin(), counts.end(), [](uint32_t count) { return count > 0; });
+}
+
+[[noreturn]] void exitOnStall(
+    const RdmaGenRequester& client,
+    std::chrono::milliseconds flat) {
+  LOG(ERROR) << fmt::format(
+      "Stalled: no send completion for {} ms while sends are outstanding "
+      "(--stall_timeout_secs={}); completions so far: {}; outstanding per QP: "
+      "[{}]",
+      flat.count(),
+      FLAGS_stall_timeout_secs,
+      client.numCompletions(),
+      folly::join(", ", client.waitingCompletionCounts()));
+  google::FlushLogFiles(google::GLOG_INFO);
+  std::_Exit(kStallExitCode);
+}
+
+} // namespace
 
 int runClientOrServer(
     Params& params,
@@ -354,6 +387,16 @@ int clientMain(
   const auto numEffectiveQps = params.effectiveQpCap();
   std::vector<int> msgSentVec(numEffectiveQps, 0);
   int msgSent = 0;
+  std::optional<RdmaGenStallWatchdog> stallWatchdog;
+  if (FLAGS_stall_timeout_secs > 0) {
+    stallWatchdog.emplace(
+        std::chrono::seconds(FLAGS_stall_timeout_secs),
+        [&client] { return client->numCompletions(); },
+        [&client] { return hasOutstandingSends(*client); },
+        [&client](std::chrono::milliseconds flat) {
+          exitOnStall(*client, flat);
+        });
+  }
   const auto writesBeforeImm = params.writes_before_imm;
 
   // To make linter happy

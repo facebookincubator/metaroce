@@ -191,6 +191,19 @@ class RdmaGenRequester {
     }
   }
 
+  uint64_t numCompletions() const {
+    return numCompletions_.load(std::memory_order_relaxed);
+  }
+
+  // Posted sends still waiting for a completion, per QP.
+  std::vector<uint32_t> waitingCompletionCounts() const {
+    std::vector<uint32_t> counts(poolManager_->getWaitingCompletionPoolSize());
+    for (uint32_t qp = 0; qp < counts.size(); ++qp) {
+      counts[qp] = poolManager_->getWaitingCompletionPoolSizeForQp(qp);
+    }
+    return counts;
+  }
+
   void setMaxCompletions(int maxCompletions) {
     std::unique_lock lock(maxCompletionMutex_);
     maxCompletions_ = maxCompletions;
@@ -272,7 +285,7 @@ class RdmaGenRequester {
   std::thread cqPollThread_;
   std::thread cqeProcessThread_;
   // The poll thread updates this count and runs completion callbacks.
-  uint64_t numCompletions_{0};
+  std::atomic<uint64_t> numCompletions_{0};
   // params.completion_callbacks and the --completion_hooks commands, sorted by
   // after_completions.
   std::vector<CompletionCallback> completionCallbacks_;

@@ -224,6 +224,7 @@ set(SRC_LIB
     rdma_gen/RdmaGenResponder.h
     rdma_gen/RdmaGenSender.h
     rdma_gen/RdmaGenServerStatsRecorder.h
+    rdma_gen/RdmaGenStallWatchdog.h
     rdma_gen/RdmaGenStatsRecorder.h
     rdma_gen/RdmaGenThriftControlClient.h
     rdma_gen/RdmaGenThriftControlCommon.h

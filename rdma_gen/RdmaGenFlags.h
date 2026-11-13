@@ -81,6 +81,7 @@ DECLARE_bool(equal_messages_per_server);
 DECLARE_string(rc_servers);
 DECLARE_string(cos);
 DECLARE_int32(duration_secs);
+DECLARE_int32(stall_timeout_secs);
 DECLARE_int32(sample_int);
 DECLARE_bool(log_msg_latencies);
 DECLARE_string(target_qp_state);
