@@ -17,6 +17,7 @@
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 #include <libsoftmetaroce/congestion_control/FastStart.h>
+#include <string>
 
 using namespace testing;
 namespace libsoftmetaroce {
@@ -192,6 +193,37 @@ TEST_F(FastStartTest, AnAckWithNothingToSendLeavesFastStartRunning) {
       << "an ack arriving with no data left to send should leave fast start "
          "running, so a following message is not held to a window sized for "
          "a small one";
+}
+
+/*
+ * A sender with one small message in flight at a time sees every ack with
+ * nothing pending, so fast start keeps running while each flow's fwnd climbs to
+ * its maximum. A flow there must keep sending as its acks come back.
+ */
+TEST_F(FastStartTest, AFlowAtItsMaximumFwndKeepsSendingAsAcksReturn) {
+  gflags::FlagSaver flagSaver;
+  constexpr uint16_t kMaxFwnd = 4;
+  gflags::SetCommandLineOption(
+      "libsoftmetaroce_max_fwnd", std::to_string(kMaxFwnd).c_str());
+  FastStart cc;
+  cc.onFlowAdded(0);
+
+  for (int message = 0; message < 3 * kMaxFwnd; ++message) {
+    ASSERT_GT(cc.getAvailableWindowSize(0), 0)
+        << "every earlier packet is acked, so message " << message
+        << " must find window, or the queue pair stalls with no error; fwnd is "
+        << cc.getFwnd(0);
+    cc.onPacketSent(0);
+    cc.onPacketAck(
+        0,
+        CongestionController::AckEvent{
+            .numAckedPackets = 1, .sendPending = false});
+  }
+
+  ASSERT_TRUE(cc.flowForNextSend().has_value())
+      << "precondition: acks with nothing pending leave fast start running";
+  EXPECT_EQ(cc.getFwnd(0), kMaxFwnd)
+      << "fast start must not grow a flow past its maximum fwnd";
 }
 
 TEST_F(FastStartTest, ACongestionMarkEndsFastStartWithNothingToSend) {

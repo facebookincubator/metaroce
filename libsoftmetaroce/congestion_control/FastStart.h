@@ -43,7 +43,7 @@ class FastStart : public CongestionController {
 
   void onPacketSent(uint16_t flowId) override {
     auto& flow = flowStateForId(flowId);
-    if (inFastStart_) {
+    if (inFastStart_ && flow.fwnd < maxFwnd_) {
       flow.fwnd += 1;
       qwnd_++;
       inFastStart_ = qwnd_ < qwnd_max_;
@@ -87,12 +87,12 @@ class FastStart : public CongestionController {
   uint16_t getAvailableWindowSize(uint16_t flowId) const override {
     auto& flow = flowStateForId(flowId);
     auto fwnd = flow.fwnd;
-    if (inFastStart_) {
-      // in fast start, all flows are always ready to send, until
-      // reaching a maximum fwnd; returning nonzero is enough to
-      // continue in fast start.
-      return (fwnd < maxFwnd_ && qwnd_ < qwnd_max_) ? 1 : 0;
+    if (inFastStart_ && fwnd < maxFwnd_ && qwnd_ < qwnd_max_) {
+      // in fast start, a flow below its maximum fwnd is always ready to
+      // send; returning nonzero is enough to continue in fast start.
+      return 1;
     }
+    // Otherwise a flow sends within its window, even at maxFwnd_ in fast start.
     auto inflights = flow.inflightPackets;
     return fwnd > inflights ? fwnd - inflights : 0;
   }
