@@ -2040,6 +2040,40 @@ TEST_F(StaleAckTest, ARepeatedAckIsReportedWithItsRateHintButNotItsMark) {
       << "a receiver may send an ack only to update its rate hint";
 }
 
+TEST_F(StaleAckTest, ARepeatedSelectiveAckTakesNoRttSample) {
+  constexpr uint32_t kRttNs = 100'000;
+  BitVector<AckHeader::kAckTrackerBits> sack;
+  sack.setBit(1);
+  const auto selectiveAck = [&sack](uint32_t sentAtNs) {
+    return AckHeader::AckHeaderBuilder()
+        .setTag(kMetaRoceInitialTag)
+        .setCumulativeFsn(0xffff)
+        .setMaxRcvdFsn(1)
+        .setFsnBitVector(sack)
+        .setAckStatus(AckStatus::ACK_OUT_OF_ORDER)
+        .setTimestamp(sentAtNs)
+        .build();
+  };
+  uint32_t nowNs = getNowNs();
+  flow_->processAckPacket(selectiveAck(nowNs - kRttNs), nowNs);
+  const auto& txState = flow_->getTxState();
+  ASSERT_TRUE(txState.haveRttSample)
+      << "precondition: the first copy returns fsn 1 and times it; "
+      << estimatorState();
+  const uint32_t srttNs = txState.estRttNs;
+  const uint32_t latestSampleNs = txState.latestRttSampleNs;
+
+  nowNs = getNowNs();
+  flow_->processAckPacket(selectiveAck(nowNs - 5 * kRttNs), nowNs);
+
+  EXPECT_EQ(txState.estRttNs, srttNs)
+      << "a repeat that returns no frames does not time the arrival of any "
+         "frame, so it must not move the smoothed RTT; "
+      << estimatorState();
+  EXPECT_EQ(txState.latestRttSampleNs, latestSampleNs)
+      << "nor may it set the latest sample that bounds the RTO from below";
+}
+
 /*
  * A 1 s max RTO puts the max-RTO limit at 4 s, past the 2^32 ns that srtt +
  * mdev reaches after a first sample of about 2.86 s.

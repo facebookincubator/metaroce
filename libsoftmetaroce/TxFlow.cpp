@@ -1164,15 +1164,24 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     processBrnrPacket(ack, minBrnrMsnByTag);
   }
 
+  // An abandoned frame leaves the window exactly as a BRNR'd one does, and
+  // that already counts here: the sender waits for neither.
+  const uint16_t numFramesReturnedToCc =
+      newlyAckedPkts.size() + numPosnDeallocated + numRetiredAbandonedFrames;
+
   // Capture QP-level smoothed RTT before updates
   const auto smoothedQpRttNsBeforeUpdate = getQp().getEstQpRttNs();
-  updateRtt(ack.getTimestamp(), nowNs);
-  if (ack.getTimestamp() != 0) {
-    getQp().updateQpRtt(rttNs);
-    VLOG(1) << "packet_rtt qp=" << qp_.getLocalQpNum() << " flow_id=" << flowId_
-            << " socket_id=" << socketId_ << " cfsn=" << ack.getCumulativeFsn()
-            << " max_rcvd_fsn=" << ack.getMaxRcvdFsn() << " rtt_ns=" << rttNs
-            << " send_ts_ns=" << ack.getTimestamp() << " now_ns=" << nowNs;
+  // An ack that returns no frames does not time the arrival of any frame.
+  if (numFramesReturnedToCc > 0) {
+    updateRtt(ack.getTimestamp(), nowNs);
+    if (ack.getTimestamp() != 0) {
+      getQp().updateQpRtt(rttNs);
+      VLOG(1) << "packet_rtt qp=" << qp_.getLocalQpNum()
+              << " flow_id=" << flowId_ << " socket_id=" << socketId_
+              << " cfsn=" << ack.getCumulativeFsn()
+              << " max_rcvd_fsn=" << ack.getMaxRcvdFsn() << " rtt_ns=" << rttNs
+              << " send_ts_ns=" << ack.getTimestamp() << " now_ns=" << nowNs;
+    }
   }
   CongestionController& cc =
       *CHECK_NOTNULL(getQp().congestionController_.get());
@@ -1205,10 +1214,6 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     }
   }
 
-  // An abandoned frame leaves the window exactly as a BRNR'd one does, and
-  // that already counts here: the sender waits for neither.
-  uint16_t numFramesReturnedToCc =
-      newlyAckedPkts.size() + numPosnDeallocated + numRetiredAbandonedFrames;
   if (numFramesReturnedToCc > 0) {
     cc.onPacketAck(
         flowId_,
