@@ -247,6 +247,8 @@ class TxFlow : public Flow {
 
   void disableAndNotifyCongestionControl();
 
+  void reportAckReturningNoFrames(const AckHeader& ack);
+
   // Computes rate hints based on unsent POSN count vs qwnd.
   // Returns 0 if unsent < qwnd (near end of transfer), else
   // kDefaultRateHintGbps. `qwnd` includes this packet because `onPacketSent()`

@@ -836,6 +836,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
 
   if (ack.getAckStatus() == AckStatus::NAK_FLOW_ID_ERROR) {
     processNakFlowIdError();
+    reportAckReturningNoFrames(ack);
     return;
   }
 
@@ -912,6 +913,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     // that a stale packet left the network and this could be an
     // indication to wake up and consider sending, but that is
     // not here.)
+    reportAckReturningNoFrames(ack);
     if (before(ack.getMaxRcvdFsn(), (uint16_t)(txState_.sndUna - 1))) {
       // an ack that is particularly stale is a sign of reordering
       // of acks; this ack has worse information than we already have.
@@ -972,6 +974,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
   // staleness guards above apply to it too.
   if (ack.isHrnr()) {
     processHrnrPacket(ack);
+    reportAckReturningNoFrames(ack);
     return;
   }
 
@@ -1217,6 +1220,8 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
             .rcnDesiredRateGbps = ack.getRateHints(),
             .sendPending = qp_.getUnsentPosnCount() > 0,
         });
+  } else {
+    reportAckReturningNoFrames(ack);
   }
 
   // A BRNR advances sndUna without any newly-acked frames, so the clears below
@@ -1548,6 +1553,27 @@ void TxFlow::disableAndNotifyCongestionControl() {
   if (qp_.congestionController_) {
     qp_.congestionController_->onFlowDisabled(flowId_);
   }
+}
+
+void TxFlow::reportAckReturningNoFrames(const AckHeader& ack) {
+  if (!qp_.congestionController_) {
+    return;
+  }
+  // An HRNR's rate hint field is reserved, and a flow ID NAK's holds the
+  // supported flow count.
+  const AckStatus status = ack.getAckStatus();
+  const bool carriesRateHint = status == AckStatus::ACK ||
+      status == AckStatus::ACK_OUT_OF_ORDER || status == AckStatus::BRNR;
+  qp_.congestionController_->onPacketAck(
+      flowId_,
+      CongestionController::AckEvent{
+          .numAckedPackets = 0,
+          .numAckedPacketsWithCE = 0,
+          .measuredRttNs = 0,
+          .smoothedQpRttNs = getQp().getEstQpRttNs(),
+          .rcnDesiredRateGbps = carriesRateHint ? ack.getRateHints() : 0,
+          .sendPending = qp_.getUnsentPosnCount() > 0,
+      });
 }
 
 // The caller serializes this helper with ACK resets, already holding

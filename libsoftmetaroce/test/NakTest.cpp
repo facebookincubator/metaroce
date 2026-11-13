@@ -1024,4 +1024,46 @@ TEST_F(NakTest, FlowZeroIsNotTakenOutOfServiceByAFlowIdNak) {
   sender = nullptr;
 }
 
+TEST_F(NakTest, AFlowIdNakIsReportedWithoutItsFlowCount) {
+  auto sender =
+      createTestSenderWithFlows(2, LimitedTestSender::kDisableSendLoop);
+  ON_CALL(congestionController(), getAvailableWindowSize(_))
+      .WillByDefault(Return(kCongestionWindowSize));
+  auto payload = std::make_unique<char[]>(kTestFrameCount * qp->getMtu());
+  postTestWqe(kTestFrameCount, payload.get());
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the WQE reaches its Tag, or flow 1 has nothing to send";
+  auto sent = txFlow(1).getNextPacketToSend();
+  ASSERT_NE(sent, nullptr);
+  const auto* data = dynamic_cast<const DataPacket*>(sent->packet.get());
+  ASSERT_NE(data, nullptr);
+  constexpr uint32_t kSupportedFlowCount = 1;
+  const uint32_t sentAtNs = data->getDataHeader().getTimestamp();
+  const AckHeader nak = AckHeader::AckHeaderBuilder()
+                            .setTag(kMetaRoceInitialTag)
+                            .setCumulativeFsn(data->getDataHeader().getFsn())
+                            .setMaxRcvdFsn(data->getDataHeader().getFsn())
+                            .setAckStatus(AckStatus::NAK_FLOW_ID_ERROR)
+                            .setRateHints(kSupportedFlowCount)
+                            .setTimestamp(sentAtNs)
+                            .build();
+
+  CongestionController::AckEvent reported;
+  EXPECT_CALL(congestionController(), onPacketAck(1, _))
+      .WillOnce(SaveArg<1>(&reported));
+  txFlow(1).processAckPacket(nak, simulatedProcessedAtNs(sentAtNs));
+
+  EXPECT_EQ(reported.numAckedPackets, 0)
+      << "the NAK releases the rejected frame to be sent again rather than "
+         "acknowledging it";
+  EXPECT_TRUE(reported.sendPending)
+      << "a NAK arriving while frames of the send are unsent ends fast start";
+  EXPECT_EQ(reported.measuredRttNs, 0)
+      << "the NAK times the arrival of no frame, so it carries no RTT sample";
+  EXPECT_EQ(reported.rcnDesiredRateGbps, 0)
+      << "a flow ID NAK's rate hint field holds the supported flow count, not "
+         "a rate";
+}
+
 } // namespace libsoftmetaroce

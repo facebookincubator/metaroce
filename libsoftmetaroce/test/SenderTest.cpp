@@ -2005,6 +2005,41 @@ TEST_F(StaleAckTest, AckOlderThanMeasuredRttLimitIsDiscarded) {
       << estimatorState();
 }
 
+TEST_F(StaleAckTest, ARepeatedAckIsReportedWithItsRateHintButNotItsMark) {
+  constexpr uint32_t kRttNs = 100'000;
+  constexpr uint32_t kRateHint = 7;
+  ackThrough(0, kRttNs);
+  ASSERT_EQ(flow_->getTxState().sndUna, 1)
+      << "precondition: the first ack returns fsn 0; " << estimatorState();
+
+  CongestionController::AckEvent reported;
+  EXPECT_CALL(*rawCongestionController, onPacketAck(0, _))
+      .WillOnce(SaveArg<1>(&reported));
+  const uint32_t nowNs = getNowNs();
+  flow_->processAckPacket(
+      AckHeader::AckHeaderBuilder()
+          .setTag(kMetaRoceInitialTag)
+          .setCumulativeFsn(0)
+          .setMaxRcvdFsn(0)
+          .setAckStatus(AckStatus::ACK)
+          .setCnpCE(1)
+          .setRateHints(kRateHint)
+          .setTimestamp(nowNs - kRttNs)
+          .build(),
+      nowNs);
+
+  EXPECT_EQ(reported.numAckedPackets, 0)
+      << "the first ack already returned fsn 0, so the repeat returns none";
+  EXPECT_EQ(reported.numAckedPacketsWithCE, 0)
+      << "a mark on an ack that returns no frames would shrink the window "
+         "without advancing it";
+  EXPECT_EQ(reported.measuredRttNs, 0)
+      << "the repeat times the arrival of no frame, so it carries no RTT "
+         "sample";
+  EXPECT_EQ(reported.rcnDesiredRateGbps, kRateHint)
+      << "a receiver may send an ack only to update its rate hint";
+}
+
 /*
  * A 1 s max RTO puts the max-RTO limit at 4 s, past the 2^32 ns that srtt +
  * mdev reaches after a first sample of about 2.86 s.

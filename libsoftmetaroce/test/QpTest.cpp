@@ -6113,6 +6113,35 @@ TEST_F(QpTest, AnHrnrDoesNotAcknowledgeTheFramesBeforeTheOneItRefuses) {
          "that resumes after the backoff carries all of it again";
 }
 
+TEST_F(QpTest, AnHrnrIsReportedWithoutItsReservedRateHint) {
+  ScopedSuppressedTxTimers suppressTimers;
+  TrackedMessageFixture fixture(
+      arbiter,
+      qp,
+      mtu,
+      initialTag,
+      {Flow::FsnState::UNACKED, Flow::FsnState::UNACKED},
+      /*sndCur=*/12);
+  const AckHeader hrnr = AckHeader::AckHeaderBuilder()
+                             .setCumulativeFsn(11)
+                             .setMaxRcvdFsn(11)
+                             .setAckStatus(AckStatus::HRNR)
+                             .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
+                             .setRateHints(7)
+                             .setTimestamp(0)
+                             .build();
+
+  CongestionController::AckEvent reported;
+  EXPECT_CALL(*fixture.congestionController, onPacketAck(0, _))
+      .WillOnce(SaveArg<1>(&reported));
+  fixture.flow->processAckPacket(hrnr, simulatedProcessedAtNs(0));
+
+  EXPECT_EQ(reported.numAckedPackets, 0)
+      << "an HRNR acknowledges none of the frames sent";
+  EXPECT_EQ(reported.rcnDesiredRateGbps, 0)
+      << "an HRNR's rate hint field is reserved, so it carries no rate";
+}
+
 // Fixture for the HRNR probe cycle, whose tests all need a QP holding unacked
 // data that a probe can carry.
 class QpHrnrProbeTest : public QpTest {
@@ -10127,6 +10156,7 @@ TEST_F(SackRetransmissionTest, ARepeatedSackForTheSameHoleSendsNoSecondCopy) {
       << "precondition: the frame sent again is the one the sack reports "
          "missing";
 
+  f.expectAck(0);
   f.flow->processAckPacket(
       f.ackHeader, simulatedProcessedAtNs(f.ackHeader.getTimestamp()));
 
