@@ -25,8 +25,10 @@
 #include <libsoftmetaroce/MemoryRegions.h>
 #include <libsoftmetaroce/Qp.h>
 #include <libsoftmetaroce/QpArbiter.h>
+#include <libsoftmetaroce/RcnRateHint.h>
 #include <libsoftmetaroce/Sender.h>
 #include <libsoftmetaroce/TxFlow.h>
+#include <libsoftmetaroce/codec/BitVector.h>
 #include <libsoftmetaroce/modifier/DuplicateModifier.h>
 #include <libsoftmetaroce/modifier/Modifier.h>
 #include <libsoftmetaroce/modifier/ReorderModifier.h>
@@ -70,7 +72,8 @@ class SenderTest : public Test {
   void createQp() {
     // The arbiter takes each QP number once, so the old QP must go first.
     qp = nullptr;
-    qp = std::make_unique<Qp>(10, retxTimer, arbiter, mrs, &cq, &ibvQpStorage);
+    qp = std::make_unique<Qp>(
+        10, retxTimer, arbiter, mrs, &cq, &ibvQpStorage, &rcnRateHint_);
     qp->addPortPair(localAddr, remoteAddr);
     qp->setRemoteQpNum(100);
     qp->setMtu(1000);
@@ -154,6 +157,7 @@ class SenderTest : public Test {
   MemoryRegions mrs;
   folly::IPAddress localAddr{"fc00::1"};
   folly::IPAddress remoteAddr{"fc00::101"};
+  RcnRateHint rcnRateHint_{FLAGS_libsoftmetaroce_nic_rate_gbps};
   std::unique_ptr<Qp> qp;
   CompletionQueue cq;
   MockCongestionController* rawCongestionController{nullptr};
@@ -1068,6 +1072,190 @@ TEST_F(SenderTest, PacingReachesRetransmissionsOnOtherFlows) {
       << "the pacer holds the QP's new data, so the visit must rotate past "
          "flow 0 to flow 1's exempt retransmission";
   EXPECT_EQ(egressPacket->rxmitType, EgressPacket::RxmitType::Rto);
+}
+
+TEST_F(SenderTest, RcnHintFromFramelessAckPacesTheQp) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_rcn_pacing_multiplier = 2;
+  ScopedSuppressedTxTimers suppressTimers;
+
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100000));
+  auto sender = createTestSenderWithFlows(
+      mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
+
+  constexpr int kFrames = 8;
+  auto wqePayload = createAndPostTestWqe(kFrames);
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the send must reach its Tag, or the acks below "
+         "acknowledge no frames";
+  auto admitted = collectAdmittedPackets(*qp);
+  ASSERT_EQ(admitted.size(), 8u)
+      << "precondition: with no limit installed the whole WQE must go, so "
+         "the sack below can open a hole";
+  auto* flow = qp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  auto* firstPacket = dynamic_cast<DataPacket*>(admitted.front()->packet.get());
+  ASSERT_NE(firstPacket, nullptr);
+  const uint32_t sentTsNs = firstPacket->getDataHeader().getTimestamp();
+
+  // Sack frames 4 and 5 while leaving the frontier unacked: maxAckdFsn runs
+  // ahead of sndUna, which is what lets the next ack return no frames.
+  BitVector<AckHeader::kAckTrackerBits> sackAhead;
+  sackAhead.setBit(3);
+  sackAhead.setBit(4);
+  flow->processAckPacket(
+      AckHeader::AckHeaderBuilder()
+          .setTag(kMetaRoceInitialTag)
+          .setCumulativeFsn(0)
+          .setMaxRcvdFsn(5)
+          .setFsnBitVector(sackAhead)
+          .setAckStatus(AckStatus::ACK)
+          .setTimestamp(sentTsNs)
+          .setRateHints(0)
+          .build());
+  EXPECT_FALSE(qp->isRateLimited())
+      << "a zero hint is reserved, so the setup ack must leave the pacer "
+         "unlimited";
+
+  // This ack covers only frame 1, unacked but below the acked frontier: it
+  // returns no frames, yet still reports the receiver's latest share.
+  flow->processAckPacket(
+      AckHeader::AckHeaderBuilder()
+          .setTag(kMetaRoceInitialTag)
+          .setCumulativeFsn(0)
+          .setMaxRcvdFsn(1)
+          .setAckStatus(AckStatus::ACK)
+          .setTimestamp(sentTsNs)
+          .setRateHints(100)
+          .build());
+  EXPECT_TRUE(qp->isRateLimited())
+      << "a frameless ack must still move the hint, or a quiet receiver's "
+         "share change would never reach the pacer";
+  const auto effective = qp->getEffectiveRateLimit();
+  EXPECT_EQ(effective.rateBytesPerSec, 25'000'000'000ULL)
+      << "the hint must be scaled from Gbps to bytes and by the multiplier, "
+         "or the queue pair paces at a share the receiver never reported";
+  EXPECT_EQ(effective.burstBytes, qp->getSender().getSendBatch() * qp->getMtu())
+      << "an RCN-only ceiling takes the default burst, one send batch of "
+         "full-size frames, so pacing does not split a send batch";
+}
+
+TEST_F(SenderTest, NakDoesNotClearRcnHint) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_rcn_pacing_multiplier = 2;
+  ScopedSuppressedTxTimers suppressTimers;
+  auto sender = createTestSenderWithFlows(
+      mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
+
+  qp->updateRcnHintGbps(100);
+  ASSERT_TRUE(qp->isRateLimited())
+      << "precondition: the hint must program the pacer before the NAK";
+  auto* flow = qp->getTxFlowById(0);
+  ASSERT_NE(flow, nullptr);
+  flow->processAckPacket(
+      AckHeader::AckHeaderBuilder()
+          .setTag(kMetaRoceInitialTag)
+          .setCumulativeFsn(0)
+          .setMaxRcvdFsn(0)
+          .setAckStatus(AckStatus::NAK_FLOW_ID_ERROR)
+          .setTimestamp(0)
+          .setRateHints(0)
+          .build());
+  EXPECT_TRUE(qp->isRateLimited())
+      << "a NAK's zero hint is reserved, so error handling must leave the "
+         "installed ceiling alone";
+  EXPECT_EQ(qp->getEffectiveRateLimit().rateBytesPerSec, 25'000'000'000ULL)
+      << "the NAK must leave the earlier hint's ceiling in place";
+}
+
+TEST_F(SenderTest, ZeroMultiplierDisablesRcnTerm) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_rcn_pacing_multiplier = 0;
+  qp->updateRcnHintGbps(100);
+  EXPECT_EQ(qp->getEffectiveRateLimit().rateBytesPerSec, 0ULL)
+      << "multiplier 0 disables the RCN term: hints arrive but the pacer "
+         "stays unlimited";
+}
+
+TEST_F(SenderTest, DefaultMultiplierAppliesRcnTerm) {
+  // Reads the shipped default, so this test leaves the flag unset.
+  qp->updateRcnHintGbps(100);
+  EXPECT_EQ(qp->getEffectiveRateLimit().rateBytesPerSec, 25'000'000'000ULL)
+      << "the multiplier defaults to 2, so hints pace a queue pair without "
+         "configuration";
+}
+
+TEST_F(SenderTest, EffectiveRateIsMinOfVerbsAndRcn) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_rcn_pacing_multiplier = 2;
+
+  qp->setRateLimit(
+      QpPacer::RateLimit{.rateBytesPerSec = 1'000'000'000, .burstBytes = 4096});
+  qp->updateRcnHintGbps(100); // 25 GB/s: above the verbs limit.
+  auto effective = qp->getEffectiveRateLimit();
+  EXPECT_EQ(effective.rateBytesPerSec, 1'000'000'000ULL)
+      << "the ceiling is the lower input, or a generous hint would override "
+         "the limit the caller installed";
+  EXPECT_EQ(effective.burstBytes, 4096u)
+      << "the caller's max_burst_sz must apply while its rate binds";
+
+  qp->setRateLimit(
+      QpPacer::RateLimit{
+          .rateBytesPerSec = 100'000'000'000ULL, .burstBytes = 8192});
+  qp->updateRcnHintGbps(1); // 250 MB/s: below the verbs limit.
+  effective = qp->getEffectiveRateLimit();
+  EXPECT_EQ(effective.rateBytesPerSec, 250'000'000ULL)
+      << "the ceiling is the lower input, or a generous caller limit would "
+         "ignore the receiver's reported share";
+  EXPECT_EQ(effective.burstBytes, 8192u)
+      << "the caller's max_burst_sz must hold while the RCN term sets the "
+         "rate, or a hint would discard it";
+}
+
+TEST_F(SenderTest, RcnTermTakesTheBurstOfAnUnlimitedVerbsLimit) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_rcn_pacing_multiplier = 2;
+
+  qp->setRateLimit(
+      QpPacer::RateLimit{.rateBytesPerSec = 0, .burstBytes = 4096});
+  qp->updateRcnHintGbps(1);
+  const auto effective = qp->getEffectiveRateLimit();
+  EXPECT_EQ(effective.rateBytesPerSec, 250'000'000ULL)
+      << "a zero caller rate lifts only the caller's ceiling, so the RCN term "
+         "must still pace";
+  EXPECT_EQ(effective.burstBytes, 4096u)
+      << "the caller's max_burst_sz describes the receiver whichever input "
+         "sets the rate, so a zero caller rate must not discard it";
+}
+
+TEST_F(SenderTest, RcnDeactivationRestoresVerbsLimit) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_rcn_pacing_multiplier = 2;
+
+  qp->setRateLimit(
+      QpPacer::RateLimit{
+          .rateBytesPerSec = 100'000'000'000ULL, .burstBytes = 4096});
+  qp->updateRcnHintGbps(1); // 250 MB/s: below the caller's limit.
+  ASSERT_EQ(qp->getEffectiveRateLimit().rateBytesPerSec, 250'000'000ULL)
+      << "precondition: the RCN term must bind before deactivation, or "
+         "restoring the caller's limit cannot be observed";
+  qp->updateRcnActiveState(1);
+  qp->checkRcnActiveOnWqeCompletion();
+  EXPECT_EQ(qp->getEffectiveRateLimit().rateBytesPerSec, 100'000'000'000ULL)
+      << "clearing the hint must restore the caller's limit, or the queue "
+         "pair stays at the receiver's stale share";
+
+  qp->setRateLimit(QpPacer::RateLimit{.rateBytesPerSec = 0, .burstBytes = 0});
+  qp->updateRcnHintGbps(50);
+  ASSERT_TRUE(qp->isRateLimited())
+      << "precondition: the hint must program the pacer before deactivation";
+  qp->updateRcnActiveState(1);
+  qp->checkRcnActiveOnWqeCompletion();
+  EXPECT_EQ(qp->getEffectiveRateLimit().rateBytesPerSec, 0ULL)
+      << "with no caller limit, a stale hint must not keep pacing a queue "
+         "pair the receiver stopped limiting";
 }
 
 TEST_F(SenderTest, SendLoopWithDropModifier) {

@@ -804,6 +804,8 @@ void Qp::checkRcnActiveOnWqeCompletion() {
 void Qp::deactivateRcn() {
   rcnActive_ = false;
   CHECK_NOTNULL(rcnRateHint_)->onQpBecameInactive();
+  rcnHintGbps_.store(0, std::memory_order_relaxed);
+  refreshPacerRate();
 }
 
 bool Qp::checkForRxMessageCompletion(
@@ -1433,16 +1435,6 @@ void Qp::setRateLimit(QpPacer::RateLimit rateLimit) {
   refreshPacerRate();
 }
 
-void Qp::refreshPacerRate() {
-  auto inputs = pacingInputs_.lock();
-  QpPacer::RateLimit rateLimit = inputs->verbsLimit;
-  if (rateLimit.burstBytes == 0) {
-    rateLimit.burstBytes = maxHeldSendsPerFlow_ * mtu_;
-  }
-  auto pacer = pacer_.lock();
-  pacer->setRateLimit(rateLimit, getNowNs64());
-}
-
 bool Qp::isRateLimited() const {
   auto pacer = pacer_.lock();
   return !pacer->isUnlimited();
@@ -1451,6 +1443,44 @@ bool Qp::isRateLimited() const {
 QpPacer::RateLimit Qp::getEffectiveRateLimit() const {
   auto pacer = pacer_.lock();
   return pacer->getRateLimit();
+}
+
+void Qp::updateRcnHintGbps(uint32_t hintGbps) {
+  if (hintGbps == 0 ||
+      rcnHintGbps_.load(std::memory_order_relaxed) == hintGbps) {
+    return;
+  }
+  rcnHintGbps_.store(hintGbps, std::memory_order_relaxed);
+  refreshPacerRate();
+}
+
+void Qp::refreshPacerRate() {
+  auto inputs = pacingInputs_.lock();
+  std::optional<uint64_t> ceiling;
+  if (inputs->verbsLimit.rateBytesPerSec != 0) {
+    ceiling = inputs->verbsLimit.rateBytesPerSec;
+  }
+  const uint32_t multiplier = FLAGS_libsoftmetaroce_rcn_pacing_multiplier;
+  const uint64_t hintGbps = rcnHintGbps_.load(std::memory_order_relaxed);
+  // Exact in 64 bits for any uint32 hint; the multiplied rate saturates.
+  if (multiplier != 0 && hintGbps != 0) {
+    static constexpr uint64_t kBitsPerGbps = 1000000000;
+    const uint64_t hintBytesPerSec = hintGbps * kBitsPerGbps / 8;
+    const uint64_t rcnRate = hintBytesPerSec > UINT64_MAX / multiplier
+        ? UINT64_MAX
+        : hintBytesPerSec * multiplier;
+    if (!ceiling.has_value() || rcnRate < *ceiling) {
+      ceiling = rcnRate;
+    }
+  }
+  const uint32_t burstBytes = inputs->verbsLimit.burstBytes != 0
+      ? inputs->verbsLimit.burstBytes
+      : maxHeldSendsPerFlow_ * mtu_;
+  auto pacer = pacer_.lock();
+  pacer->setRateLimit(
+      QpPacer::RateLimit{
+          .rateBytesPerSec = ceiling.value_or(0), .burstBytes = burstBytes},
+      getNowNs64());
 }
 
 void Qp::processWatchdogExpiry() {

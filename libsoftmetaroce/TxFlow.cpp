@@ -1229,6 +1229,9 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     reportAckReturningNoFrames(ack);
   }
 
+  // Outside the frame-return branch above: every accepted ack carries the hint.
+  qp_.updateRcnHintGbps(ack.getRateHints());
+
   // A BRNR advances sndUna without any newly-acked frames, so the clears below
   // must still run.
   if (!newlyAckedPkts.empty()) {

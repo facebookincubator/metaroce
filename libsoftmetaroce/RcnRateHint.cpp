@@ -20,3 +20,8 @@ DEFINE_uint32(
     libsoftmetaroce_nic_rate_gbps,
     100,
     "NIC rate in Gbps for RCN rate hint computation.");
+DEFINE_uint32(
+    libsoftmetaroce_rcn_pacing_multiplier,
+    2,
+    "Per-QP RCN pacing multiplier: the send pacer also caps the rate at "
+    "multiplier times the latest RCN hint; 0 disables the RCN term.");

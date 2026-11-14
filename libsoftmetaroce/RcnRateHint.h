@@ -21,6 +21,7 @@
 #include <cstdint>
 
 DECLARE_uint32(libsoftmetaroce_nic_rate_gbps);
+DECLARE_uint32(libsoftmetaroce_rcn_pacing_multiplier);
 
 namespace libsoftmetaroce {
 

@@ -671,6 +671,10 @@ class Qp {
 
   [[nodiscard]] bool isRateLimited() const;
 
+  // Records the latest RCN hint from any flow and re-derives the pacer's
+  // ceiling; a zero hint is ignored.
+  void updateRcnHintGbps(uint32_t hintGbps);
+
   // For testing: the rate currently programmed into the pacer.
   [[nodiscard]] QpPacer::RateLimit getEffectiveRateLimit() const;
 
@@ -858,8 +862,8 @@ class Qp {
 
   // RCN rate hinting.
   void deactivateRcn();
-  // Programs the pacer with the verbs-installed limit; a zero burst takes one
-  // send batch of full-size frames.
+  // Programs the pacer at min(verbs limit, multiplier x RCN hint), skipping an
+  // absent input; a zero burst takes one send batch of full-size frames.
   void refreshPacerRate();
 
   // Instrumentation.
@@ -941,6 +945,9 @@ class Qp {
     QpPacer::RateLimit verbsLimit;
   };
   folly::Synchronized<PacingInputs, std::mutex> pacingInputs_;
+  // The latest RCN hint from any flow's ack, kept outside pacingInputs_ so an
+  // ack repeating it takes no lock.
+  std::atomic<uint32_t> rcnHintGbps_{0};
 
   // QP-level smoothed RTT
   static constexpr uint16_t kDefaultInverseLog2QpRttAlpha = 4;
