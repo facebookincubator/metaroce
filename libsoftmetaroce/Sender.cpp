@@ -36,6 +36,50 @@ DEFINE_bool(
 
 namespace libsoftmetaroce {
 
+namespace {
+bool socketsAlreadyAdjacent(
+    const std::vector<std::unique_ptr<struct EgressPacket>>& batch) {
+  for (auto run = batch.begin(); run != batch.end();) {
+    const PacketModifierSocket* const socket = (*run)->socketToSendOn;
+    const auto onSocket = [socket](const auto& packet) {
+      return packet->socketToSendOn == socket;
+    };
+    const auto runEnd = std::find_if_not(run, batch.end(), onSocket);
+    if (std::any_of(runEnd, batch.end(), onSocket)) {
+      return false;
+    }
+    run = runEnd;
+  }
+  return true;
+}
+
+// Makes each socket's packets adjacent, sockets in the order they first appear.
+// Stable, so the packets on one socket keep their build order.
+void groupBySocket(std::vector<std::unique_ptr<struct EgressPacket>>& batch) {
+  const bool keepOrder =
+      std::any_of(batch.begin(), batch.end(), [](const auto& packet) {
+        return packet->keepBuildOrder;
+      });
+  if (keepOrder || socketsAlreadyAdjacent(batch)) {
+    return;
+  }
+  std::vector<std::unique_ptr<struct EgressPacket>> grouped;
+  grouped.reserve(batch.size());
+  // A moved-from slot is null, which marks its packet as already grouped.
+  for (size_t i = 0; i < batch.size(); ++i) {
+    if (batch[i]) {
+      const PacketModifierSocket* const socket = batch[i]->socketToSendOn;
+      for (size_t j = i; j < batch.size(); ++j) {
+        if (batch[j] && batch[j]->socketToSendOn == socket) {
+          grouped.push_back(std::move(batch[j]));
+        }
+      }
+    }
+  }
+  batch.swap(grouped);
+}
+} // namespace
+
 Sender::~Sender() {
   shutdownAndJoinSendLoops();
   // Socket creation populates both per-CoS entries or throws.
@@ -263,6 +307,10 @@ folly::coro::Task<bool> Sender::sendClaimedBatchInRuns(
   // Settled to idle iff the build ran dry rather than hitting the cap: only
   // then is the batch still short of the cap.
   const bool settled = batch.size() < sendBatch_;
+  // gso already builds a run per flow, holding the flow while it can send.
+  if (sendmmsgEnabled_) {
+    groupBySocket(batch);
+  }
   // A faulting run already parked the QP, so stop there.
   bool faulted = false;
   for (size_t runStart = 0; !faulted && runStart < batch.size();) {

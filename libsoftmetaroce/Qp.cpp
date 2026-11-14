@@ -1218,11 +1218,13 @@ std::unique_ptr<struct EgressPacket> Qp::getNextPacketToSend() {
     return std::unique_ptr<struct EgressPacket>();
   }
 
+  bool controllerOrdersFlows = false;
   // A controller may own flow selection (fast start walks a fixed burst per
   // flow); start from its choice, and fall through to the rotation below if
   // that flow cannot send.
   if (congestionController_) {
     if (const auto next = congestionController_->flowForNextSend()) {
+      controllerOrdersFlows = true;
       // setupFlows registers each txFlow with the controller under the same id,
       // so a flow the controller chooses indexes txFlows_ directly.
       DCHECK_LT(next->flowId, txFlows_.size()) << "controller chose a flow the "
@@ -1284,6 +1286,7 @@ std::unique_ptr<struct EgressPacket> Qp::getNextPacketToSend() {
       sendsOnHeldFlow_ = 0;
     }
     if (hasPacket) {
+      egressPacket->keepBuildOrder = controllerOrdersFlows;
       // Leave HRNR_PROBING only once a probe (data packet) is actually sent:
       // one probe, then block and re-arm the backoff so the next probe waits
       // it out.

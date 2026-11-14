@@ -25,7 +25,7 @@ namespace libsoftmetaroce {
 class PacketModifierSocket;
 
 // A buffer and the metadata to send one packet, including its resolved send
-// socket. Every field is set by the constructor.
+// socket. Every field but keepBuildOrder is set by the constructor.
 struct EgressPacket {
   enum class RxmitType { None, Fast, Rto };
   // Data and ACK packets travel on independent sockets so the TOS byte is set
@@ -50,6 +50,9 @@ struct EgressPacket {
   const folly::IPAddress remoteAddr;
   const uint32_t qpNum;
   const RxmitType rxmitType;
+  // The congestion controller chose the order of flows this packet was built
+  // in, so a batch holding it is sent in build order.
+  bool keepBuildOrder{false};
 };
 
 } // namespace libsoftmetaroce

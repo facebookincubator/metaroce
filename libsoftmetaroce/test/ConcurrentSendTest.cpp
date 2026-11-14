@@ -38,8 +38,10 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <set>
 #include <string>
 #include <vector>
@@ -61,6 +63,10 @@ struct SendPathTally {
   std::atomic<uint64_t> plainWrites{0}; // write() calls
   std::atomic<uint64_t> gsoWrites{0}; // writeGSO() calls (incl. failed)
   std::atomic<uint64_t> writemWrites{0}; // writem() calls (incl. failed)
+  std::atomic<uint64_t> writemFrames{0}; // datagrams writem() accepted
+  std::mutex writemFsnsMutex;
+  // Each flow's fsns, in the order writem() accepted them.
+  std::map<uint16_t, std::vector<uint16_t>> writemFsnsByFlow;
 };
 
 // Mock socket whose sends are tallied per path; each send returns the chain
@@ -114,11 +120,21 @@ makeCountingSocket(
                 opts.gso > 0 ? total / static_cast<uint64_t>(opts.gso) : 1);
             return static_cast<ssize_t>(total);
           });
+  auto recordFsns = [&tally](const std::unique_ptr<folly::IOBuf>* bufs, int n) {
+    std::lock_guard<std::mutex> lock(tally.writemFsnsMutex);
+    for (int i = 0; i < n; ++i) {
+      folly::io::Cursor cursor(bufs[i].get());
+      BaseHeader baseHeader(cursor);
+      DataHeader dataHeader(cursor);
+      tally.writemFsnsByFlow[baseHeader.getFlowId()].push_back(
+          dataHeader.getFsn());
+    }
+  };
   ON_CALL(*socket, writem(_, _, _))
       .WillByDefault(
-          [recordWrites, writemFails, writemPartial, &tally](
+          [recordWrites, recordFsns, writemFails, writemPartial, &tally](
               folly::Range<const folly::SocketAddress*>,
-              const std::unique_ptr<folly::IOBuf>*,
+              const std::unique_ptr<folly::IOBuf>* bufs,
               size_t n) -> int {
             ++tally.writemWrites;
             if (writemFails) {
@@ -132,9 +148,13 @@ makeCountingSocket(
               // the last datagram; the sender must still deliver the unsent
               // tail.
               const int sent = static_cast<int>(n) - 1;
+              tally.writemFrames += static_cast<uint64_t>(sent);
+              recordFsns(bufs, sent);
               recordWrites(static_cast<uint64_t>(sent));
               return sent;
             }
+            tally.writemFrames += n;
+            recordFsns(bufs, static_cast<int>(n));
             recordWrites(n);
             return static_cast<int>(n);
           });
@@ -477,6 +497,86 @@ TEST(ConcurrentSendTest, SendBatchWithSingleConsumerDrainsAllQps) {
       << " frames drained by the single consumer at sendBatch=" << kSendBatch
       << ", but only " << tally.frames.load()
       << " were; a QP was stranded after its batch settled without a reenqueue.";
+}
+
+// The QP builds a batch a packet per flow in turn, each flow on its own
+// socket, and the batch still takes one sendmmsg per socket.
+TEST(ConcurrentSendTest, SendmmsgCarriesEachSocketsPacketsInOneCall) {
+  constexpr int kNumFlows = 2;
+  constexpr int kFramesPerFlow = 4;
+  constexpr uint32_t kFrames = kNumFlows * kFramesPerFlow;
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_send = "sendmmsg";
+
+  SendPathTally tally;
+  folly::Baton<> allWritten;
+  auto socketMaker = [&tally, &allWritten](folly::EventBase* evb) {
+    return makeCountingSocket(evb, tally, kFrames, allWritten);
+  };
+
+  HighResTimer retxTimer;
+  MemoryRegions mrs;
+  CompletionQueue cq;
+  struct ibv_qp ibvQpStorage{};
+
+  // Destruction order (reverse of declaration) runs qp -> sender -> arbiter,
+  // with payload destroyed last since the sender reads it until it joins.
+  std::unique_ptr<char[]> payload;
+  ConcurrentQpArbiter arbiter;
+  // One send loop and a batch that holds the whole WQE, so the WQE goes out
+  // as a single batch.
+  Sender sender(
+      arbiter,
+      socketMaker,
+      kMetaRoceSendToPort,
+      /*numSendingThreads=*/1u,
+      /*sendBatch=*/kFrames);
+
+  auto qp =
+      std::make_unique<Qp>(100, retxTimer, arbiter, mrs, &cq, &ibvQpStorage);
+  qp->addPortPair(folly::IPAddress{"fc00::1"}, folly::IPAddress{"fc00::101"});
+  qp->setRemoteQpNum(100);
+  qp->setMtu(1000);
+  auto congestionController =
+      std::make_unique<NiceMock<MockCongestionController>>();
+  ON_CALL(*congestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(kFrames));
+  qp->setCongestionController(std::move(congestionController));
+  qp->setupFlows(kNumFlows, kNumFlows, &sender);
+  qp->startProcessingWqes();
+
+  const uint32_t length = kFrames * qp->getMtu();
+  payload = std::make_unique<char[]>(length);
+  ASSERT_TRUE(qp->postWqe(
+      kMetaRoceInitialTag,
+      std::make_unique<SendWqe>(
+          0 /* workReqId */, oneSge(payload.get(), length), qp->getMtu())))
+      << "precondition: the QP accepts the WQE, or no batch is built";
+
+  ASSERT_TRUE(allWritten.try_wait_for(std::chrono::seconds(30)))
+      << "the sender wrote only " << tally.frames.load() << " of " << kFrames
+      << " frames, so the batch never finished sending";
+
+  EXPECT_EQ(tally.writemFrames.load(), kFrames)
+      << "every frame of the batch must go out in a sendmmsg; "
+      << tally.plainWrites.load()
+      << " went out one sendmsg each, which pays a system call per packet";
+  EXPECT_EQ(tally.writemWrites.load(), static_cast<uint64_t>(kNumFlows))
+      << "the batch must take one sendmmsg per socket; more calls mean a "
+         "socket's packets were split across calls";
+  std::vector<uint16_t> fsnsPerFlow(kFramesPerFlow);
+  std::iota(fsnsPerFlow.begin(), fsnsPerFlow.end(), uint16_t{0});
+  const std::map<uint16_t, std::vector<uint16_t>> expectedFsnsByFlow{
+      {0, fsnsPerFlow}, {1, fsnsPerFlow}};
+  {
+    std::lock_guard<std::mutex> lock(tally.writemFsnsMutex);
+    EXPECT_EQ(tally.writemFsnsByFlow, expectedFsnsByFlow)
+        << "grouping must keep each socket's packets in build order; a flow "
+           "reaching its socket out of fsn order shows the receiver a gap and "
+           "then a late frame";
+  }
+
+  qp.reset(); // leave the arbiter before sender/arbiter tear down
 }
 
 namespace {
