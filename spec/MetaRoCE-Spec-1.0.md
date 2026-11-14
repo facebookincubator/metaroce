@@ -1,3 +1,8 @@
+<!-- This file is a reference copy of the released Meta-RoCE specification.
+     Do not make piecemeal edits to this reference copy, including corrections
+     or clarifications. Propose those changes to the specification's
+     maintainers; replace this copy when a new version is released. -->
+
 # Meta-RoCE Protocol for AI Accelerators
 
 Version 1.0, October 12, 2026
