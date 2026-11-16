@@ -17,9 +17,13 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
+#include <vector>
 
+#include <folly/CppAttributes.h>
 #include <folly/Function.h>
 #include <folly/MPMCQueue.h>
 #include <folly/SharedMutex.h>
@@ -76,8 +80,13 @@ class ConcurrentQpArbiter : public QpArbiterIface {
   [[nodiscard]] bool reenqueueQp(uint32_t qpNum) noexcept override;
   std::unique_ptr<struct EgressPacket> nextPacketOrIdle(
       uint32_t qpNum) override;
+  std::vector<std::unique_ptr<struct EgressPacket>> buildBatchOrIdle(
+      uint32_t qpNum,
+      std::unique_ptr<struct EgressPacket> first,
+      size_t batchCap) override;
 
  private:
+  using RegistryReadLock = std::shared_lock<folly::SharedMutex>;
   // A QP's send registration: how to build its next packet, plus its readiness
   // counter. `pending` is both the enqueue-dedup trigger (its 0 -> 1 bump
   // enqueues the QP) and the "signaled during a turn" record; `pending >= 1` is
@@ -126,6 +135,15 @@ class ConcurrentQpArbiter : public QpArbiterIface {
    private:
     void signal() noexcept;
   };
+
+  // Returns nullptr if the QP was removed while queued or mid-turn. The caller
+  // must hold the registry read lock while using the returned pointer.
+  RegisteredQp* FOLLY_NULLABLE
+  findSignaledQp(uint32_t qpNum, const RegistryReadLock& registryHeld);
+  // Returns nullptr only after settling the QP to idle.
+  static std::unique_ptr<struct EgressPacket> buildOrIdle(
+      RegisteredQp& regQp,
+      const RegistryReadLock& registryHeld);
 
   // F14NodeMap gives each RegisteredQp a stable address (nodes do not move on
   // rehash), so it is stored by value -- no extra indirection. registryMutex_

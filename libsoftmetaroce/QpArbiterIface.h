@@ -16,8 +16,10 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include <folly/Function.h>
 #include <folly/coro/Task.h>
@@ -116,6 +118,23 @@ class QpArbiterIface {
   virtual std::unique_ptr<struct EgressPacket> nextPacketOrIdle(
       uint32_t /*qpNum*/) {
     return nullptr;
+  }
+
+  // The batch starts with `first`. A QP that runs out of packets before
+  // `batchCap` settles to idle. The default takes each further packet from
+  // nextPacketOrIdle().
+  virtual std::vector<std::unique_ptr<struct EgressPacket>> buildBatchOrIdle(
+      uint32_t qpNum,
+      std::unique_ptr<struct EgressPacket> first,
+      size_t batchCap) {
+    std::vector<std::unique_ptr<struct EgressPacket>> batch;
+    batch.push_back(std::move(first));
+    std::unique_ptr<struct EgressPacket> packet;
+    while (batch.size() < batchCap &&
+           (packet = nextPacketOrIdle(qpNum)) != nullptr) {
+      batch.push_back(std::move(packet));
+    }
+    return batch;
   }
 };
 

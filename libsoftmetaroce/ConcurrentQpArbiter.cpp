@@ -119,14 +119,53 @@ ConcurrentQpArbiter::claimNextPacketToSend() {
 
 std::unique_ptr<struct EgressPacket> ConcurrentQpArbiter::nextPacketOrIdle(
     uint32_t qpNum) {
-  std::shared_lock lock(registryMutex_);
+  const RegistryReadLock lock(registryMutex_);
+  RegisteredQp* const regQp = findSignaledQp(qpNum, lock);
+  if (regQp == nullptr) {
+    return nullptr;
+  }
+  return buildOrIdle(*regQp, lock);
+}
+
+std::vector<std::unique_ptr<struct EgressPacket>>
+ConcurrentQpArbiter::buildBatchOrIdle(
+    uint32_t qpNum,
+    std::unique_ptr<struct EgressPacket> first,
+    size_t batchCap) {
+  std::vector<std::unique_ptr<struct EgressPacket>> batch;
+  batch.reserve(batchCap);
+  batch.push_back(std::move(first));
+  if (batch.size() >= batchCap) {
+    return batch;
+  }
+  const RegistryReadLock lock(registryMutex_);
+  RegisteredQp* const regQp = findSignaledQp(qpNum, lock);
+  if (regQp == nullptr) {
+    return batch;
+  }
+  std::unique_ptr<struct EgressPacket> packet;
+  while (batch.size() < batchCap &&
+         (packet = buildOrIdle(*regQp, lock)) != nullptr) {
+    batch.push_back(std::move(packet));
+  }
+  return batch;
+}
+
+ConcurrentQpArbiter::RegisteredQp* FOLLY_NULLABLE
+ConcurrentQpArbiter::findSignaledQp(
+    uint32_t qpNum,
+    const RegistryReadLock& /*registryHeld*/) {
   auto it = registeredQps_.find(qpNum);
   if (it == registeredQps_.end()) {
-    // QP removed since it was signaled: no packet to build.
     staleSignalDropCount_.fetch_add(1, std::memory_order_relaxed);
     return nullptr;
   }
-  RegisteredQp& regQp = it->second;
+  return &it->second;
+}
+
+std::unique_ptr<struct EgressPacket> ConcurrentQpArbiter::buildOrIdle(
+    RegisteredQp& regQp,
+    const RegistryReadLock& /*registryHeld*/) {
   // Snapshot pending before building. The common path builds a packet and
   // returns it; the loop repeats only when a signal() races the turn and the
   // build finds no packet, so we re-take the turn in place.

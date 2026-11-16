@@ -264,14 +264,15 @@ folly::coro::Task<void> Sender::sendLoop() {
   }
 }
 
-folly::coro::Task<bool>
-Sender::yieldForAnotherTurn(uint32_t qpNum, bool faulted, bool settled) {
+folly::coro::Task<bool> Sender::yieldForAnotherTurn(uint32_t qpNum) {
   std::unique_ptr<struct EgressPacket> next;
-  while (!faulted && !settled && !arbiter_.reenqueueQp(qpNum) &&
+  while (!arbiter_.reenqueueQp(qpNum) &&
          (next = arbiter_.nextPacketOrIdle(qpNum)) != nullptr) {
-    faulted = co_await writeEgress(std::move(next));
+    if (co_await writeEgress(std::move(next))) {
+      co_return true;
+    }
   }
-  co_return faulted;
+  co_return false;
 }
 
 folly::coro::Task<bool> Sender::sendClaimedBatch(
@@ -285,10 +286,11 @@ folly::coro::Task<bool> Sender::sendClaimedBatch(
        ++sent) {
     faulted = co_await writeEgress(std::move(next));
   }
-  // Settled to idle iff the build ran dry rather than hitting the cap or
-  // faulting: only then is sent still below the batch cap.
-  const bool settled = !faulted && sent < sendBatch_;
-  co_return co_await yieldForAnotherTurn(qpNum, faulted, settled);
+  const bool ranDry = !faulted && sent < sendBatch_;
+  if (faulted || ranDry) {
+    co_return faulted;
+  }
+  co_return co_await yieldForAnotherTurn(qpNum);
 }
 
 folly::coro::Task<bool> Sender::sendClaimedBatchInRuns(
@@ -296,32 +298,36 @@ folly::coro::Task<bool> Sender::sendClaimedBatchInRuns(
     std::unique_ptr<struct EgressPacket> first,
     SameRunFn sameRun,
     EmitRunFn emitRunFn) {
-  std::vector<std::unique_ptr<struct EgressPacket>> batch;
-  batch.reserve(sendBatch_);
-  batch.push_back(std::move(first));
-  std::unique_ptr<struct EgressPacket> next;
-  while (batch.size() < sendBatch_ &&
-         (next = arbiter_.nextPacketOrIdle(qpNum)) != nullptr) {
-    batch.push_back(std::move(next));
+  std::vector<std::unique_ptr<struct EgressPacket>> batch =
+      arbiter_.buildBatchOrIdle(qpNum, std::move(first), sendBatch_);
+  const bool ranDry = batch.size() < sendBatch_;
+  const bool faulted = co_await emitInRuns(batch, sameRun, emitRunFn);
+  if (faulted || ranDry) {
+    co_return faulted;
   }
-  // Settled to idle iff the build ran dry rather than hitting the cap: only
-  // then is the batch still short of the cap.
-  const bool settled = batch.size() < sendBatch_;
+  co_return co_await yieldForAnotherTurn(qpNum);
+}
+
+folly::coro::Task<bool> Sender::emitInRuns(
+    std::vector<std::unique_ptr<struct EgressPacket>>& batch,
+    SameRunFn sameRun,
+    EmitRunFn emitRunFn) {
   // gso already builds a run per flow, holding the flow while it can send.
   if (sendmmsgEnabled_) {
     groupBySocket(batch);
   }
-  // A faulting run already parked the QP, so stop there.
-  bool faulted = false;
-  for (size_t runStart = 0; !faulted && runStart < batch.size();) {
+  for (size_t runStart = 0; runStart < batch.size();) {
     size_t runEnd = runStart + 1;
     while (runEnd < batch.size() && sameRun(*batch[runStart], *batch[runEnd])) {
       ++runEnd;
     }
-    faulted = co_await (this->*emitRunFn)(batch, runStart, runEnd);
+    // A faulting run already parked the QP, so stop there.
+    if (co_await (this->*emitRunFn)(batch, runStart, runEnd)) {
+      co_return true;
+    }
     runStart = runEnd;
   }
-  co_return co_await yieldForAnotherTurn(qpNum, faulted, settled);
+  co_return false;
 }
 
 folly::coro::Task<bool> Sender::emitRun(

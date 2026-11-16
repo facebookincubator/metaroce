@@ -275,6 +275,40 @@ CO_TEST(QpArbiterTest, StaleSignalForRemovedQpIsDroppedAndCounted) {
   co_await arbiter.shutdown();
 }
 
+// Overrides nextPacketOrIdle alone, so buildBatchOrIdle is the interface's.
+class PacketsLeftArbiter : public QpArbiter {
+ public:
+  explicit PacketsLeftArbiter(int packetsLeft) : packetsLeft_{packetsLeft} {}
+
+  std::unique_ptr<EgressPacket> nextPacketOrIdle(uint32_t qpNum) override {
+    return packetsLeft_-- > 0 ? makeArbiterTestPacket(qpNum) : nullptr;
+  }
+
+ private:
+  int packetsLeft_;
+};
+
+TEST(QpArbiterTest, DefaultBuildBatchTakesPacketsFromNextPacketOrIdle) {
+  constexpr uint32_t kQpNum = 1;
+  PacketsLeftArbiter arbiter(/*packetsLeft=*/5);
+
+  EXPECT_EQ(
+      arbiter
+          .buildBatchOrIdle(
+              kQpNum, makeArbiterTestPacket(kQpNum), /*batchCap=*/3)
+          .size(),
+      3u)
+      << "an arbiter that implements only nextPacketOrIdle still fills a "
+         "batch, or sendmmsg would carry one packet per call";
+  EXPECT_EQ(
+      arbiter
+          .buildBatchOrIdle(
+              kQpNum, makeArbiterTestPacket(kQpNum), /*batchCap=*/8)
+          .size(),
+      4u)
+      << "the batch ends at the first null, which has settled the QP to idle";
+}
+
 TEST(QpArbiterTest, PostSignalDropsAndCountsWhenIntakeFull) {
   QpArbiter arbiter;
   // Overfill the lock-free intake (capacity 8192) without draining it.

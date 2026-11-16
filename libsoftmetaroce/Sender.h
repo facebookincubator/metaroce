@@ -210,8 +210,7 @@ class Sender : public folly::NonCopyableNonMovable {
 
   // Yield the claimed QP for a fair turn; if the ready queue is full, keep
   // sending its packets in place rather than dropping it.
-  folly::coro::Task<bool>
-  yieldForAnotherTurn(uint32_t qpNum, bool faulted, bool settled);
+  folly::coro::Task<bool> yieldForAnotherTurn(uint32_t qpNum);
 
   // Send a short batch while we own this QP: fewer ready-queue round-trips and
   // better cache locality, bounded by sendBatch_ so other QPs still progress
@@ -231,11 +230,17 @@ class Sender : public folly::NonCopyableNonMovable {
       size_t);
 
   // Build the whole batch before locking, so the per-socket write lock covers
-  // only the emit. Then walk the batch as maximal same-run slices [runStart,
-  // runEnd) and emit each.
+  // only the emit.
   folly::coro::Task<bool> sendClaimedBatchInRuns(
       uint32_t qpNum,
       std::unique_ptr<struct EgressPacket> first,
+      SameRunFn sameRun,
+      EmitRunFn emitRunFn);
+
+  // Under sendmmsg the batch is first grouped by socket. Returns true if a run
+  // faulted. No run after a faulted one is sent.
+  folly::coro::Task<bool> emitInRuns(
+      std::vector<std::unique_ptr<struct EgressPacket>>& batch,
       SameRunFn sameRun,
       EmitRunFn emitRunFn);
 
