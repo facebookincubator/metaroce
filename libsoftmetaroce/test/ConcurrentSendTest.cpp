@@ -579,6 +579,189 @@ TEST(ConcurrentSendTest, SendmmsgCarriesEachSocketsPacketsInOneCall) {
   qp.reset(); // leave the arbiter before sender/arbiter tear down
 }
 
+/*
+ * If a build that runs the QP dry ended the turn before the batch is sent,
+ * another send thread could take the QP from the ready queue and build the
+ * next frames while the first batch is still going out. Each flow must reach
+ * its socket in fsn order all the same.
+ *
+ * 1. The first message builds three frames, alternating between the flows, and
+ *    the build runs dry. Three is odd, so the next frame comes from the flow
+ *    that sent the middle frame.
+ * 2. The batch's first send call is held, standing in for a send thread
+ *    descheduled in its system call. The other flow's frame is still unsent.
+ * 3. The second message is posted. The other send thread takes the QP from
+ *    the ready queue and builds from the next flow, whose socket the held call
+ *    leaves unlocked.
+ * 4. The held call is released once a frame of the second message has gone
+ *    out, or after kOvertakeWindow if none can.
+ */
+TEST(ConcurrentSendTest, EachFlowReachesItsSocketInFsnOrderAcrossSendThreads) {
+  constexpr int kNumFlows = 2;
+  constexpr uint32_t kFirstMessageFrames = 3;
+  constexpr uint32_t kSecondMessageFrames = 4;
+  constexpr uint32_t kFrames = kFirstMessageFrames + kSecondMessageFrames;
+  constexpr auto kOvertakeWindow = std::chrono::seconds(1);
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_send = "sendmmsg";
+  // The test has no receiver to ack, so keep RTO retransmissions out of the
+  // record.
+  FLAGS_libsoftmetaroce_min_rto_us = 5'000'000;
+
+  struct SentFrame {
+    uint16_t flowId;
+    uint16_t fsn;
+    uint16_t msn;
+  };
+  std::mutex mtx;
+  std::condition_variable cv;
+  std::vector<SentFrame> sent;
+  std::atomic<bool> holdTaken{false};
+  folly::Baton<> held;
+  folly::Baton<> release;
+
+  auto record = [&mtx, &cv, &sent](
+                    const std::unique_ptr<folly::IOBuf>* bufs, size_t n) {
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      for (size_t i = 0; i < n; ++i) {
+        folly::io::Cursor cursor(bufs[i].get());
+        BaseHeader baseHeader(cursor);
+        DataHeader dataHeader(cursor);
+        sent.push_back(
+            {baseHeader.getFlowId(), dataHeader.getFsn(), dataHeader.getMsn()});
+      }
+    }
+    cv.notify_all();
+  };
+  auto holdFirstCall = [&holdTaken, &held, &release] {
+    if (!holdTaken.exchange(true)) {
+      held.post();
+      EXPECT_TRUE(release.try_wait_for(std::chrono::seconds(30)))
+          << "the test never released the held send call";
+    }
+  };
+  auto socketMaker = [&record, &holdFirstCall](folly::EventBase* evb) {
+    auto socket = std::make_unique<NiceMock<MockUDPSocket>>(evb);
+    ON_CALL(*socket, write(_, _))
+        .WillByDefault(
+            [&record, &holdFirstCall](
+                const folly::SocketAddress&,
+                const std::unique_ptr<folly::IOBuf>& buf) -> ssize_t {
+              record(&buf, 1);
+              holdFirstCall();
+              return static_cast<ssize_t>(buf->computeChainDataLength());
+            });
+    ON_CALL(*socket, writem(_, _, _))
+        .WillByDefault(
+            [&record, &holdFirstCall](
+                folly::Range<const folly::SocketAddress*>,
+                const std::unique_ptr<folly::IOBuf>* bufs,
+                size_t n) -> int {
+              record(bufs, n);
+              holdFirstCall();
+              return static_cast<int>(n);
+            });
+    return std::make_pair(std::move(socket), nullptr);
+  };
+
+  HighResTimer retxTimer;
+  MemoryRegions mrs;
+  CompletionQueue cq;
+  struct ibv_qp ibvQpStorage{};
+
+  std::vector<std::unique_ptr<char[]>> payloads;
+  ConcurrentQpArbiter arbiter;
+  // Two send threads, so one can take a turn while the other is held. The
+  // batch cap exceeds the first message, so its build runs dry.
+  Sender sender(
+      arbiter,
+      socketMaker,
+      kMetaRoceSendToPort,
+      /*numSendingThreads=*/2u,
+      /*sendBatch=*/kFrames);
+
+  auto qp =
+      std::make_unique<Qp>(100, retxTimer, arbiter, mrs, &cq, &ibvQpStorage);
+  qp->addPortPair(folly::IPAddress{"fc00::1"}, folly::IPAddress{"fc00::101"});
+  qp->setRemoteQpNum(100);
+  qp->setMtu(1000);
+  auto congestionController =
+      std::make_unique<NiceMock<MockCongestionController>>();
+  ON_CALL(*congestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(kFrames));
+  qp->setCongestionController(std::move(congestionController));
+  qp->setupFlows(kNumFlows, kNumFlows, &sender);
+  qp->startProcessingWqes();
+
+  auto postMessage = [&qp, &payloads](uint32_t frames) {
+    const uint32_t length = frames * qp->getMtu();
+    auto payload = std::make_unique<char[]>(length);
+    const bool posted = qp->postWqe(
+        kMetaRoceInitialTag,
+        std::make_unique<SendWqe>(
+            0 /* workReqId */, oneSge(payload.get(), length), qp->getMtu()));
+    payloads.push_back(std::move(payload));
+    return posted;
+  };
+
+  ASSERT_TRUE(postMessage(kFirstMessageFrames))
+      << "precondition: the QP accepts the first message, or no batch is built";
+  ASSERT_TRUE(held.try_wait_for(std::chrono::seconds(30)))
+      << "precondition: the first batch reaches a socket, or no send is held";
+  const bool secondPosted = postMessage(kSecondMessageFrames);
+  bool overtook = false;
+  {
+    std::unique_lock<std::mutex> lock(mtx);
+    const uint16_t firstMsn = sent.front().msn;
+    overtook = cv.wait_for(lock, kOvertakeWindow, [&sent, firstMsn] {
+      return std::any_of(sent.begin(), sent.end(), [firstMsn](const auto& f) {
+        return f.msn != firstMsn;
+      });
+    });
+  }
+  release.post();
+  {
+    std::unique_lock<std::mutex> lock(mtx);
+    cv.wait_for(lock, std::chrono::seconds(30), [&sent] {
+      return sent.size() >= kFrames;
+    });
+  }
+  qp.reset(); // leave the arbiter before sender/arbiter tear down
+
+  ASSERT_TRUE(secondPosted)
+      << "precondition: the QP accepts the second message, or no thread can "
+         "take a turn behind the held batch";
+  ASSERT_EQ(sent.size(), kFrames)
+      << "the sender wrote " << sent.size() << " of " << kFrames
+      << " frames, so a frame never reached its socket";
+  const uint16_t heldFlow = sent.front().flowId;
+  std::set<uint16_t> otherFlowMsns;
+  for (const auto& frame : sent) {
+    if (frame.flowId != heldFlow) {
+      otherFlowMsns.insert(frame.msn);
+    }
+  }
+  ASSERT_EQ(otherFlowMsns.size(), 2u)
+      << "precondition: the flow the held call left unsent carries frames of "
+         "both messages, or no frame on it had another to overtake";
+  for (uint16_t flowId = 0; flowId < kNumFlows; ++flowId) {
+    std::vector<uint16_t> fsns;
+    for (const auto& frame : sent) {
+      if (frame.flowId == flowId) {
+        fsns.push_back(frame.fsn);
+      }
+    }
+    std::vector<uint16_t> inOrder = fsns;
+    std::sort(inOrder.begin(), inOrder.end());
+    EXPECT_EQ(fsns, inOrder)
+        << "flow " << flowId << " reached its socket out of fsn order, so the "
+        << "receiver sees a gap and then a late frame; a second-message frame "
+        << (overtook ? "went out" : "did not go out")
+        << " while the first batch was held";
+  }
+}
+
 namespace {
 // One coalesced write as the wire would see it: which path carried it (by
 // destination) and how many packets the datagram segments into.

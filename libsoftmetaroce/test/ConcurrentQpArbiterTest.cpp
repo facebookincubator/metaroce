@@ -280,42 +280,45 @@ CO_TEST(ConcurrentQpArbiterTest, ShutdownUnblocksClaimWithEmptyPacket) {
          "consumers exit instead of blocking";
 }
 
-CO_TEST(ConcurrentQpArbiterTest, BuildBatchStopsAtCapThenSettlesWhenDry) {
+CO_TEST(ConcurrentQpArbiterTest, BuildBatchStopsAtCapAndKeepsTheTurn) {
   ConcurrentQpArbiter arbiter;
   int packetsLeft = 5;
   auto* signal = arbiter.addQp(7, [&]() -> std::unique_ptr<EgressPacket> {
     return packetsLeft-- > 0 ? makeTestPacket(7) : nullptr;
   });
+  auto* other = arbiter.addQp(8, [] { return makeTestPacket(8); });
   signal->postSignal();
   auto claimed = co_await arbiter.claimNextPacketToSend();
   CO_ASSERT_EQ(claimed.qpNum, 7u)
       << "precondition: the claimed packet is the signaled QP's";
 
   EXPECT_EQ(
-      arbiter.buildBatchOrIdle(7, std::move(claimed.packet), /*batchCap=*/3)
-          .size(),
+      arbiter.buildBatch(7, std::move(claimed.packet), /*batchCap=*/3).size(),
       3u)
       << "a QP with packets to spare fills the batch to its cap and no further";
 
   auto more = arbiter.nextPacketOrIdle(7);
   CO_ASSERT_NE(more, nullptr)
       << "precondition: the QP has one packet left to start the next batch";
-  EXPECT_EQ(
-      arbiter.buildBatchOrIdle(7, std::move(more), /*batchCap=*/8).size(), 2u)
+  EXPECT_EQ(arbiter.buildBatch(7, std::move(more), /*batchCap=*/8).size(), 2u)
       << "the batch takes every packet the QP still has, then stops when it "
          "runs dry";
 
   packetsLeft = 1;
   signal->postSignal();
-  auto again = co_await arbiter.claimNextPacketToSend();
-  EXPECT_EQ(again.qpNum, 7u)
-      << "running dry must settle the QP to idle, or this signal would be a "
-         "no-op bump and the QP would never return to the queue";
+  other->postSignal();
+  auto next = co_await arbiter.claimNextPacketToSend();
+  EXPECT_EQ(next.qpNum, 8u)
+      << "a dry build must keep the turn, so a signal during the send is "
+         "recorded rather than queuing the QP for another send thread";
+  EXPECT_NE(arbiter.nextPacketOrIdle(7), nullptr)
+      << "the same turn builds the packet that signal readied";
+  EXPECT_EQ(arbiter.nextPacketOrIdle(7), nullptr)
+      << "with no packet left, the QP settles to idle, ending the turn";
 
   const uint64_t staleBefore = arbiter.getStaleSignalDropCount();
   EXPECT_EQ(
-      arbiter.buildBatchOrIdle(99, makeTestPacket(99), /*batchCap=*/8).size(),
-      1u)
+      arbiter.buildBatch(99, makeTestPacket(99), /*batchCap=*/8).size(), 1u)
       << "a QP the arbiter does not hold adds no packets to the one it was "
          "given";
   EXPECT_EQ(arbiter.getStaleSignalDropCount(), staleBefore + 1)
@@ -329,8 +332,7 @@ TEST(ConcurrentQpArbiterTest, ABatchOfOneLooksUpNoQp) {
   ConcurrentQpArbiter arbiter;
 
   EXPECT_EQ(
-      arbiter.buildBatchOrIdle(99, makeTestPacket(99), /*batchCap=*/1).size(),
-      1u)
+      arbiter.buildBatch(99, makeTestPacket(99), /*batchCap=*/1).size(), 1u)
       << "a cap of one is filled by the packet the caller already holds";
   EXPECT_EQ(arbiter.getStaleSignalDropCount(), 0u)
       << "a batch of one needs no registry lookup, so a QP removed mid-turn "

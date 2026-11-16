@@ -80,7 +80,7 @@ class ConcurrentQpArbiter : public QpArbiterIface {
   [[nodiscard]] bool reenqueueQp(uint32_t qpNum) noexcept override;
   std::unique_ptr<struct EgressPacket> nextPacketOrIdle(
       uint32_t qpNum) override;
-  std::vector<std::unique_ptr<struct EgressPacket>> buildBatchOrIdle(
+  std::vector<std::unique_ptr<struct EgressPacket>> buildBatch(
       uint32_t qpNum,
       std::unique_ptr<struct EgressPacket> first,
       size_t batchCap) override;
@@ -144,6 +144,13 @@ class ConcurrentQpArbiter : public QpArbiterIface {
   static std::unique_ptr<struct EgressPacket> buildOrIdle(
       RegisteredQp& regQp,
       const RegistryReadLock& registryHeld);
+  // Returns nullptr if the QP has no packet ready.
+  static std::unique_ptr<struct EgressPacket> buildWithoutSettling(
+      RegisteredQp& regQp,
+      const RegistryReadLock& registryHeld);
+  // Returns nullptr if the QP has no packet ready.
+  static std::unique_ptr<struct EgressPacket> applyAcksAndBuild(
+      RegisteredQp& regQp);
 
   // F14NodeMap gives each RegisteredQp a stable address (nodes do not move on
   // rehash), so it is stored by value -- no extra indirection. registryMutex_

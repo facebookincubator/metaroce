@@ -298,12 +298,25 @@ folly::coro::Task<bool> Sender::sendClaimedBatchInRuns(
     std::unique_ptr<struct EgressPacket> first,
     SameRunFn sameRun,
     EmitRunFn emitRunFn) {
+  // The turn lasts until the batch is sent, so no other send thread can send a
+  // flow's later frames ahead of this batch.
   std::vector<std::unique_ptr<struct EgressPacket>> batch =
-      arbiter_.buildBatchOrIdle(qpNum, std::move(first), sendBatch_);
+      arbiter_.buildBatch(qpNum, std::move(first), sendBatch_);
   const bool ranDry = batch.size() < sendBatch_;
-  const bool faulted = co_await emitInRuns(batch, sameRun, emitRunFn);
-  if (faulted || ranDry) {
-    co_return faulted;
+  if (co_await emitInRuns(batch, sameRun, emitRunFn)) {
+    co_return true;
+  }
+  if (ranDry) {
+    // Usually settles the QP. A packet readied during the send is a full batch
+    // of one.
+    std::unique_ptr<struct EgressPacket> readied =
+        arbiter_.nextPacketOrIdle(qpNum);
+    if (!readied) {
+      co_return false;
+    }
+    if (co_await writeEgress(std::move(readied))) {
+      co_return true;
+    }
   }
   co_return co_await yieldForAnotherTurn(qpNum);
 }

@@ -275,7 +275,7 @@ CO_TEST(QpArbiterTest, StaleSignalForRemovedQpIsDroppedAndCounted) {
   co_await arbiter.shutdown();
 }
 
-// Overrides nextPacketOrIdle alone, so buildBatchOrIdle is the interface's.
+// Overrides nextPacketOrIdle alone, so buildBatch is the interface's.
 class PacketsLeftArbiter : public QpArbiter {
  public:
   explicit PacketsLeftArbiter(int packetsLeft) : packetsLeft_{packetsLeft} {}
@@ -288,25 +288,16 @@ class PacketsLeftArbiter : public QpArbiter {
   int packetsLeft_;
 };
 
-TEST(QpArbiterTest, DefaultBuildBatchTakesPacketsFromNextPacketOrIdle) {
+TEST(QpArbiterTest, DefaultBuildBatchLeavesTheTurnOpen) {
   constexpr uint32_t kQpNum = 1;
   PacketsLeftArbiter arbiter(/*packetsLeft=*/5);
 
   EXPECT_EQ(
-      arbiter
-          .buildBatchOrIdle(
-              kQpNum, makeArbiterTestPacket(kQpNum), /*batchCap=*/3)
+      arbiter.buildBatch(kQpNum, makeArbiterTestPacket(kQpNum), /*batchCap=*/8)
           .size(),
-      3u)
-      << "an arbiter that implements only nextPacketOrIdle still fills a "
-         "batch, or sendmmsg would carry one packet per call";
-  EXPECT_EQ(
-      arbiter
-          .buildBatchOrIdle(
-              kQpNum, makeArbiterTestPacket(kQpNum), /*batchCap=*/8)
-          .size(),
-      4u)
-      << "the batch ends at the first null, which has settled the QP to idle";
+      1u)
+      << "the default batch takes no packet from nextPacketOrIdle, which "
+         "would end the turn the sender holds until the batch is out";
 }
 
 TEST(QpArbiterTest, PostSignalDropsAndCountsWhenIntakeFull) {

@@ -128,7 +128,7 @@ std::unique_ptr<struct EgressPacket> ConcurrentQpArbiter::nextPacketOrIdle(
 }
 
 std::vector<std::unique_ptr<struct EgressPacket>>
-ConcurrentQpArbiter::buildBatchOrIdle(
+ConcurrentQpArbiter::buildBatch(
     uint32_t qpNum,
     std::unique_ptr<struct EgressPacket> first,
     size_t batchCap) {
@@ -145,7 +145,7 @@ ConcurrentQpArbiter::buildBatchOrIdle(
   }
   std::unique_ptr<struct EgressPacket> packet;
   while (batch.size() < batchCap &&
-         (packet = buildOrIdle(*regQp, lock)) != nullptr) {
+         (packet = buildWithoutSettling(*regQp, lock)) != nullptr) {
     batch.push_back(std::move(packet));
   }
   return batch;
@@ -174,15 +174,8 @@ std::unique_ptr<struct EgressPacket> ConcurrentQpArbiter::buildOrIdle(
     // Applied inside the loop, so a retry re-applies: an ACK handed over after
     // the last attempt would otherwise have its signal consumed by the exchange
     // below without ever being applied.
-    if (regQp.applyHandedOffAcks) {
-      regQp.applyHandedOffAcks();
-    }
-    // buildNextPacket() must not throw: enforce it here (a throw terminates) so
-    // a throwing build can never leave the QP dedup-stranded with pending >= 1.
-    std::unique_ptr<struct EgressPacket> packet = [&]() noexcept {
-      return regQp.buildNextPacket();
-    }();
-    if (packet && packet->packet) {
+    if (std::unique_ptr<struct EgressPacket> packet =
+            applyAcksAndBuild(regQp)) {
       return packet;
     }
     // No packet built: settle the QP to idle (pending -> 0) iff no signal() has
@@ -192,6 +185,26 @@ std::unique_ptr<struct EgressPacket> ConcurrentQpArbiter::buildOrIdle(
   } while (!regQp.pending.compare_exchange_strong(
       regQp.pendingBeforeBuild, 0, std::memory_order_acq_rel));
   return nullptr;
+}
+
+std::unique_ptr<struct EgressPacket> ConcurrentQpArbiter::buildWithoutSettling(
+    RegisteredQp& regQp,
+    const RegistryReadLock& /*registryHeld*/) {
+  regQp.pendingBeforeBuild = regQp.pending.load(std::memory_order_acquire);
+  return applyAcksAndBuild(regQp);
+}
+
+std::unique_ptr<struct EgressPacket> ConcurrentQpArbiter::applyAcksAndBuild(
+    RegisteredQp& regQp) {
+  if (regQp.applyHandedOffAcks) {
+    regQp.applyHandedOffAcks();
+  }
+  // buildNextPacket() must not throw: enforce it here (a throw terminates) so
+  // a throwing build can never leave the QP dedup-stranded with pending >= 1.
+  std::unique_ptr<struct EgressPacket> packet = [&]() noexcept {
+    return regQp.buildNextPacket();
+  }();
+  return packet && packet->packet ? std::move(packet) : nullptr;
 }
 
 bool ConcurrentQpArbiter::reenqueueQp(uint32_t qpNum) noexcept {
