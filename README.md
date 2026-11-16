@@ -53,6 +53,25 @@ and the exact build command is in [build.sh](build.sh).
 > [NOTE] Make sure that your default compiler is gcc, not clang,
 > otherwise folly/coro (required) will not be built.
 
+### Build with Nix
+
+With [Nix](https://nixos.org/) (flakes enabled), the dependencies come
+prebuilt from the binary cache, so there is no `getdeps` step:
+
+```sh
+nix build            # result/bin/rdma_gen
+nix develop          # toolchain + libraries, then:
+cmake -S . -B build-nix -G Ninja && ninja -C build-nix
+```
+
+The Nix-built binary links against `/nix/store`, so it is meant to run
+on the machine that built it (or one with the same closure).
+
+> [NOTE] The dependency versions come from the nixpkgs revision pinned in
+> `flake.lock`, not from the versions pinned by `getdeps.py`, so they are
+> not exactly the same. The Nix build is expected to work for most uses,
+> but `getdeps.py` remains the reference build.
+
 ## License
 
 MetaRoCE is Apache-2.0 licensed; see [LICENSE](LICENSE). Contributions
