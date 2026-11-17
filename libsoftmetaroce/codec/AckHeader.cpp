@@ -127,7 +127,8 @@ AckStatus uint8_tToAckStatus(uint8_t bits) {
       case static_cast<uint8_t>(AckStatus::NAK_INVALID_REQUEST):
         return AckStatus::NAK_INVALID_REQUEST;
       default:
-        LOG(WARNING) << "Reserved ack status: " << std::bitset<8>(bits);
+        LOG_FIRST_N(WARNING, 10)
+            << "Reserved ack status: " << std::bitset<8>(bits);
         return AckStatus::RESERVED;
     }
   }

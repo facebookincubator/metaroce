@@ -2102,6 +2102,82 @@ TEST_F(QpTest, AFatalNakErrorsOnlyTheTagItCarries) {
 }
 
 /*
+ * Spec 8.5.6: an Ack Status the initiator does not recognize is a NAK, so an
+ * ack carrying one errors the tag and work request its Tag, Cumulative FSN
+ * and CDMSN name.
+ */
+TEST_F(QpTest, AReservedAckStatusErrorsTheTagAndWorkRequestItNames) {
+  constexpr uint8_t kOtherTag = kMetaRoceInitialTag + 1;
+  qp.addTag(kOtherTag, &cq, &otherIbvQpStorage);
+
+  qp.setCongestionController(std::make_unique<MockCongestionController>());
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 1, &mockSender);
+  auto flow = qp.getTxFlowById(0);
+
+  std::array<char, 4096> payload{};
+  Wqe* rejectedWqe = postWqeHelper(
+      &qp,
+      {.workType = Wqe::WorkType::kSend,
+       .msgSizeBytes = payload.size(),
+       .tagNum = kMetaRoceInitialTag,
+       .workReqId = 100,
+       .address = payload.data()});
+  Wqe* bystanderWqe = postWqeHelper(
+      &qp,
+      {.workType = Wqe::WorkType::kSend,
+       .msgSizeBytes = payload.size(),
+       .tagNum = kOtherTag,
+       .workReqId = 200,
+       .address = payload.data()});
+  ASSERT_NE(rejectedWqe, nullptr)
+      << "the tag the ack carries must have work of its own to fail";
+  ASSERT_NE(bystanderWqe, nullptr)
+      << "without work on the other tag this test has no survivor to check";
+
+  // Both tags have a packet in flight on the shared flow.
+  auto& txState = flow->getTxState();
+  txState.sndUna = 0;
+  *(txState.sndCur.wlock()) = 0;
+  txState.sndNxt = 2;
+  txState.tracker.emplace_back(
+      PacketId(
+          rejectedWqe,
+          kMetaRoceInitialTag,
+          rejectedWqe->allocateNextPosn(),
+          mtu),
+      Flow::FsnState::UNACKED);
+  txState.tracker.emplace_back(
+      PacketId(bystanderWqe, kOtherTag, bystanderWqe->allocateNextPosn(), mtu),
+      Flow::FsnState::UNACKED);
+
+  const AckHeader ack =
+      AckHeader::AckHeaderBuilder()
+          .setTag(kMetaRoceInitialTag)
+          .setCumulativeFsn(0)
+          .setMaxRcvdFsn(0)
+          .setCumulRespDeliveredMsn(rejectedWqe->getMsn().value())
+          .setAckStatus(AckStatus::RESERVED)
+          .setTimestamp(0)
+          .build();
+  flow->processAckPacket(ack, simulatedProcessedAtNs(ack.getTimestamp()));
+
+  EXPECT_TRUE(qp.getTag(kMetaRoceInitialTag)->isInErrorState())
+      << "the tag the ack names must enter the error state, or its work "
+         "stays posted for a message the peer rejected";
+  EXPECT_TRUE(rejectedWqe->isFailing())
+      << "the work request on the tag the ack names must be failing";
+  EXPECT_EQ(rejectedWqe->getCompletionStatusOverride(), kWcGenErr)
+      << "the ack carries no subtype to report, so the work request reports "
+         "a general error rather than a specific rejection it never received";
+  EXPECT_FALSE(bystanderWqe->isFailing())
+      << "another tag's work must survive a failure on a tag it merely shares "
+         "a wire with";
+  EXPECT_EQ(qp.getTag(kOtherTag)->getNumPendingWqes(), 1u)
+      << "the other tag's work request must still be pending, not flushed";
+}
+
+/*
  * A responder NAKs the frames of a failed message as they reach it, so one tag
  * can draw several naks. Only the first has work to fail. Several things
  * enforce that between them -- the early return on the tag's state, and the

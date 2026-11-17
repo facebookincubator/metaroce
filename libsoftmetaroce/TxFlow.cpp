@@ -109,6 +109,8 @@ WorkCompletionStatus ackStatusToWorkCompletionStatus(AckStatus ackStatus) {
         return kWrRemOpsErr;
       case AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR:
         return kWrRemAccErr;
+      case AckStatus::RESERVED:
+        return kWcGenErr;
       default:
         LOG(DFATAL) << "Unexpected AckStatus for error completion: "
                     << static_cast<int>(ackStatus);
@@ -684,8 +686,8 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
   // not have is turned away on that alone rather than on the check's verdict.
   Tag* const nackedTag = qp_.getTag(ack.getTag());
   if (nackedTag == nullptr) {
-    LOG(WARNING) << "discarding fatal NAK for unknown Tag: "
-                 << (uint32_t)ack.getTag();
+    LOG_FIRST_N(WARNING, 10)
+        << "discarding fatal NAK for unknown Tag: " << (uint32_t)ack.getTag();
     return;
   }
 
@@ -829,11 +831,6 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
           << " maxRcvdFsn: " << ack.getMaxRcvdFsn()
           << " cumulativeRespDeliveredMsn: " << ack.getCumulRespDeliveredMsn();
 
-  if (ack.getAckStatus() == AckStatus::RESERVED) {
-    LOG(WARNING) << "Received an ACK with reserved status";
-    return;
-  }
-
   if (ack.getAckStatus() == AckStatus::NAK_FLOW_ID_ERROR) {
     processNakFlowIdError();
     reportAckReturningNoFrames(ack);
@@ -842,7 +839,8 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
 
   if (ack.getAckStatus() == AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR ||
       ack.getAckStatus() == AckStatus::NAK_OPERATIONAL_ERROR ||
-      ack.getAckStatus() == AckStatus::NAK_INVALID_REQUEST) {
+      ack.getAckStatus() == AckStatus::NAK_INVALID_REQUEST ||
+      ack.getAckStatus() == AckStatus::RESERVED) {
     processNakFatalError(ack);
     return;
   }
