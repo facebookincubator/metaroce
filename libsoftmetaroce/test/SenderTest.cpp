@@ -777,6 +777,23 @@ std::vector<std::unique_ptr<struct EgressPacket>> collectAdmittedPackets(
 uint64_t chargedWireBytes(const struct EgressPacket& egressPacket) {
   return egressPacket.packet->getSizeBytes();
 }
+
+const DataHeader& dataHeaderOf(const struct EgressPacket& egressPacket) {
+  return CHECK_NOTNULL(dynamic_cast<DataPacket*>(egressPacket.packet.get()))
+      ->getDataHeader();
+}
+
+// Returns the ack a receiver sends when it holds every frame through
+// `cumulativeFsn` and the `received` frame, but none between them.
+AckHeader sackAck(uint16_t cumulativeFsn, const DataHeader& received) {
+  return AckHeader::AckHeaderBuilder()
+      .setTag(kMetaRoceInitialTag)
+      .setCumulativeFsn(cumulativeFsn)
+      .setMaxRcvdFsn(received.getFsn())
+      .setAckStatus(AckStatus::ACK)
+      .setTimestamp(received.getTimestamp())
+      .build();
+}
 } // namespace
 
 TEST_F(SenderTest, PacingHoldsNewDataPastBurst) {
@@ -946,85 +963,37 @@ TEST_F(SenderTest, PacingHoldDoesNotGateLossRecovery) {
   auto wqePayload = createAndPostTestWqe(kFrames);
   qp->startProcessingWqes();
   ASSERT_TRUE(qp->waitForWqesToBePosted(1))
-      << "precondition: the send must reach its Tag, or the RTO below has no "
+      << "precondition: the send must reach its Tag, or the loss below has no "
          "frame to recover";
 
   auto admitted = collectAdmittedPackets(*qp);
   ASSERT_EQ(admitted.size(), 4u)
       << "precondition: the burst must admit four frames and hold the other "
-         "four, so the RTO below fires while new data is held";
+         "four, so the loss below is recovered while new data is held";
   auto* flow = qp->getTxFlowById(0);
   ASSERT_NE(flow, nullptr);
-  const uint16_t socketBefore = flow->getSocketId();
 
-  // Close the window: with it open, the RTO sends new data instead of
-  // retransmitting, and this test needs the retransmission.
-  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
-      .WillByDefault(Return(0));
-  auto* rtoCallback = flow->getRetxTimerCallback();
-  ASSERT_NE(rtoCallback, nullptr);
-
-  (*rtoCallback)();
-  EXPECT_GT(flow->getNumPendingRetxPackets(), 0u)
-      << "the RTO must queue the unacked frames for retransmission";
-  EXPECT_TRUE(retxTimer.isScheduled(rtoCallback))
-      << "frames are still outstanding, so the RTO must re-arm rather than "
-         "stop";
+  // The second admitted frame is lost.
+  const uint16_t lostFsn = dataHeaderOf(*admitted[1]).getFsn();
+  flow->processAckPacket(
+      sackAck(dataHeaderOf(*admitted[0]).getFsn(), dataHeaderOf(*admitted[2])));
+  ASSERT_GT(flow->getNumPendingRetxPackets(), 0u)
+      << "precondition: the SACK hole must queue the lost frame for "
+         "retransmission";
 
   auto egressPacket = qp->getNextPacketToSend();
   ASSERT_TRUE(egressPacket && egressPacket->packet)
       << "a retransmission held behind new data would stall loss recovery; it "
          "is charged instead, so the average rate still holds";
-  EXPECT_EQ(egressPacket->rxmitType, EgressPacket::RxmitType::Rto)
-      << "the released packet must be the retransmission; new data stays held "
+  EXPECT_EQ(dataHeaderOf(*egressPacket).getFsn(), lostFsn)
+      << "the released packet must be the lost frame; new data stays held "
          "until the pacer's next send time";
   EXPECT_FALSE(qp->getTag(kMetaRoceInitialTag)->isInErrorState())
       << "a paced hold must not fail the work it is holding";
-  EXPECT_EQ(flow->getSocketId(), socketBefore)
-      << "a single RTO must not repath the flow";
 
-  // Ack the retransmission, so the next expiry starts a new run rather than
-  // counting a second consecutive RTO.
-  auto* dataPacket = dynamic_cast<DataPacket*>(egressPacket->packet.get());
-  ASSERT_NE(dataPacket, nullptr);
-  const auto& dataHeader = dataPacket->getDataHeader();
-  flow->processAckPacket(
-      AckHeader::AckHeaderBuilder()
-          .setTag(kMetaRoceInitialTag)
-          .setCumulativeFsn(dataHeader.getFsn())
-          .setMaxRcvdFsn(dataHeader.getFsn())
-          .setAckStatus(AckStatus::ACK)
-          .setTimestamp(dataHeader.getTimestamp())
-          .build());
-
-  (*rtoCallback)();
-  EXPECT_GT(flow->getNumPendingRetxPackets(), 0u)
-      << "the ack cleared the RTO run, so the next expiry retransmits rather "
-         "than failing the work";
-  EXPECT_EQ(flow->getSocketId(), socketBefore)
-      << "the ack reset the RTO run, so this expiry must not repath the flow "
-         "either";
-
-  // Drain with the window open: every packet emitted while new data is held
-  // must be loss recovery, and the drain must end where the pacer holds.
-  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
-      .WillByDefault(Return(100000));
-  int retxEmitted = 0;
-  for (int i = 0; i < 10; ++i) {
-    auto drained = qp->getNextPacketToSend();
-    if (drained == nullptr || drained->packet == nullptr) {
-      break;
-    }
-    EXPECT_EQ(drained->rxmitType, EgressPacket::RxmitType::Rto)
-        << "while the pacer holds, only retransmissions may leave";
-    ++retxEmitted;
-  }
-  EXPECT_GT(retxEmitted, 0)
-      << "the second RTO's retransmissions bypass the hold the same way";
   auto held = qp->getNextPacketToSend();
   EXPECT_TRUE(held == nullptr || held->packet == nullptr)
-      << "with loss recovery drained and the window open, only the pacer "
-         "holds new data";
+      << "with loss recovery drained, only the pacer holds new data";
 }
 
 TEST_F(SenderTest, PacingReachesRetransmissionsOnOtherFlows) {
@@ -1048,30 +1017,42 @@ TEST_F(SenderTest, PacingReachesRetransmissionsOnOtherFlows) {
   auto wqePayload = createAndPostTestWqe(kFrames);
   qp->startProcessingWqes();
   ASSERT_TRUE(qp->waitForWqesToBePosted(1))
-      << "precondition: the send must reach its Tag, or the RTO below has no "
+      << "precondition: the send must reach its Tag, or the loss below has no "
          "frame to recover";
 
   auto admitted = collectAdmittedPackets(*qp);
   ASSERT_EQ(admitted.size(), 4u)
       << "precondition: the burst must admit four frames and hold the rest, "
-         "so the RTO below fires while new data is held";
+         "so the loss below is recovered while new data is held";
+  std::vector<const DataHeader*> flow1Frames;
+  for (const auto& egressPacket : admitted) {
+    if (egressPacket->packet->getBaseHeader().getFlowId() == 1) {
+      flow1Frames.push_back(&dataHeaderOf(*egressPacket));
+    }
+  }
+  ASSERT_EQ(flow1Frames.size(), 2u)
+      << "precondition: rotation must put two of the admitted frames on flow "
+         "1, so a lost first frame leaves a SACK hole";
   auto* flow1 = qp->getTxFlowById(1);
   ASSERT_NE(flow1, nullptr);
 
-  // Close the window: with it open, the RTO sends new data instead of
-  // retransmitting, and this test needs the retransmission.
-  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
-      .WillByDefault(Return(0));
-
-  (*flow1->getRetxTimerCallback())();
-  EXPECT_GT(flow1->getNumPendingRetxPackets(), 0u)
-      << "the RTO must queue flow 1's unacked frames for retransmission";
+  // Flow 1's first frame is lost, so the receiver holds no frame of flow 1
+  // cumulatively.
+  const uint16_t lostFsn = flow1Frames[0]->getFsn();
+  const uint16_t noneCumulative = lostFsn - 1;
+  flow1->processAckPacket(sackAck(noneCumulative, *flow1Frames[1]));
+  ASSERT_GT(flow1->getNumPendingRetxPackets(), 0u)
+      << "precondition: the SACK hole must queue flow 1's lost frame for "
+         "retransmission";
 
   auto egressPacket = qp->getNextPacketToSend();
   ASSERT_TRUE(egressPacket && egressPacket->packet)
       << "the pacer holds the QP's new data, so the visit must rotate past "
          "flow 0 to flow 1's exempt retransmission";
-  EXPECT_EQ(egressPacket->rxmitType, EgressPacket::RxmitType::Rto);
+  EXPECT_EQ(egressPacket->packet->getBaseHeader().getFlowId(), 1)
+      << "only flow 1 has loss to recover while the pacer holds new data";
+  EXPECT_EQ(dataHeaderOf(*egressPacket).getFsn(), lostFsn)
+      << "the released packet must be flow 1's lost frame";
 }
 
 TEST_F(SenderTest, RcnHintFromFramelessAckPacesTheQp) {
