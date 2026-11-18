@@ -172,6 +172,8 @@ class PingReceiverTest : public ::testing::Test {
     LimitedTestSender mocksender(*arbiter, mockUDPSocketMaker);
     mocksender.setLimitNumSockets(2);
     qp->setupFlows(1, 1, &mocksender);
+    qp->setIbvQpState(IBV_QPS_INIT);
+    qp->setIbvQpState(IBV_QPS_RTR);
     // Add the QP to the qp map
     qpNumToQp_.wlock()->emplace(456, std::move(qp));
   }

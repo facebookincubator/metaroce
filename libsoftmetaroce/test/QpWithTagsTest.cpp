@@ -153,6 +153,7 @@ TEST_F(QpWithTagsTest, VirtualWqeCreationWithTags) {
 TEST_F(QpWithTagsTest, ReceiveWqeAssignmentPerTag) {
   qp.addTag(1, &cq, ibvQp);
   qp.addTag(2, &cq, ibvQp);
+  qp.setIbvQpState(IBV_QPS_RTR);
   qp.setIbvQpState(IBV_QPS_RTS);
 
   auto tag1 = qp.getTag(1);

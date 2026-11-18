@@ -1084,6 +1084,7 @@ TEST_F(TagSetTest, ErroringTheQpSucceedsWhenATagIsAlreadyInError) {
   struct ibv_qp mockQp2 = makeMockQp(IBV_QPS_RESET);
   tagSet_->add(1, cqs_[0].get(), &mockQp1);
   tagSet_->add(2, cqs_[1].get(), &mockQp2);
+  tagSet_->setIbvQpState(IBV_QPS_RTR);
   tagSet_->setIbvQpState(IBV_QPS_RTS);
 
   // Tag 1 fails on its own, as a fatal NAK for it would leave it.
@@ -1122,6 +1123,35 @@ TEST_F(TagSetTest, ATransitionDoesNotBringATagInErrorBackOutOfIt) {
       << "the Tag that had not failed must still take the transition";
 }
 
+/*
+ * A transition reports the state it applied, from the compare-and-set
+ * in the walk rather than a re-read afterward: a Tag already in error
+ * must not hide that the requested state reached another Tag, and a
+ * transition that reached no Tag must report ERR.
+ */
+TEST_F(TagSetTest, SetIbvQpStateReturnsRequestedStateIfApplied) {
+  struct ibv_qp mockQp1 = makeMockQp(IBV_QPS_RESET);
+  struct ibv_qp mockQp2 = makeMockQp(IBV_QPS_RESET);
+  tagSet_->add(1, cqs_[0].get(), &mockQp1);
+  tagSet_->add(2, cqs_[1].get(), &mockQp2);
+
+  // Tag 1 fails on its own, as a fatal NAK for it would leave it.
+  mockQp1.state = IBV_QPS_ERR;
+
+  EXPECT_EQ(tagSet_->setIbvQpState(IBV_QPS_RTR), IBV_QPS_RTR)
+      << "a Tag in error must not hide that RTR reached the other Tag";
+  EXPECT_TRUE(tagSet_->hasCompletedReceiveSetup())
+      << "the applied RTR must publish setup, or the receiver would keep "
+         "answering HRNR for a QP that can receive";
+
+  // Tag 2 fails on its own, as a fatal NAK for it would leave it.
+  mockQp2.state = IBV_QPS_ERR;
+
+  EXPECT_EQ(tagSet_->setIbvQpState(IBV_QPS_RTR), IBV_QPS_ERR)
+      << "with every Tag in error the transition applied RTR to no Tag, so "
+         "it must report ERR";
+}
+
 TEST_F(TagSetTest, SetIbvQpStateMultipleTags) {
   struct ibv_qp mockQp1 = makeMockQp(IBV_QPS_RESET);
   struct ibv_qp mockQp2 = makeMockQp(IBV_QPS_RESET);
@@ -1133,6 +1163,7 @@ TEST_F(TagSetTest, SetIbvQpStateMultipleTags) {
   tagSet_->add(3, cqs_[2].get(), &mockQp3);
 
   // Change the state on all tags
+  tagSet_->setIbvQpState(IBV_QPS_RTR);
   tagSet_->setIbvQpState(IBV_QPS_RTS);
 
   // Verify all tags have the new state
@@ -1426,7 +1457,7 @@ TEST_F(TagSetTest, NormalTransitionRacingErrorPublicationKeepsErr) {
   std::thread transitioner([&]() {
     start.arrive_and_wait();
     for (int i = 0; i < kTransitionRounds; ++i) {
-      tagSet_->setIbvQpState(IBV_QPS_RTS);
+      tagSet_->setIbvQpState(i == 0 ? IBV_QPS_RTR : IBV_QPS_RTS);
     }
   });
   std::thread poster([&]() {

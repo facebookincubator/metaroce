@@ -709,17 +709,6 @@ void Qp::setupFlows(
       rxFlows_.emplace_back(*this, flowId, rxFlowSocketId, portPairIdx);
     }
   }
-
-  // If an HRNR NAK was sent before flows were set up, the sender is
-  // waiting in HRNR backoff. Now that flows are ready, send an RNR cancel
-  // to allow the sender to resume immediately. An HRNR holds the QP rather
-  // than a tag, so one cancel releases it whichever tag it carries.
-  if (rnrCancelPending_) {
-    rnrCancelPending_ = false;
-    scheduleRnrCancelPacket(
-        kMetaRoceInitialTag,
-        existingTag(kMetaRoceInitialTag).getNextRxCsn() - 1);
-  }
 }
 
 void Qp::setHrnrState(HrnrState newState) {
@@ -1007,14 +996,6 @@ std::unique_ptr<RnrCancelPacket> Qp::buildRnrCancelPacket(
           .setFlowsAvailable(static_cast<uint8_t>(rxFlows_.size()))
           .build();
   return std::make_unique<RnrCancelPacket>(baseHeader, rnrCancelHeader);
-}
-
-void Qp::setRnrCancelPending(bool pending) {
-  rnrCancelPending_ = pending;
-}
-
-bool Qp::hasRnrCancelPending() const {
-  return rnrCancelPending_;
 }
 
 void Qp::scheduleRnrCancelPacket(uint8_t tag, uint16_t postedCsn) {

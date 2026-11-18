@@ -763,6 +763,83 @@ TEST_F(ReceiverTest, SendNakForNonExistentFlow) {
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 }
 
+TEST_F(ReceiverTest, DataArrivingDuringSetupFlowsSendsHrnrNotFlowIdNak) {
+  constexpr uint32_t kRaceQpn = 791;
+  constexpr uint32_t kFlowCount = 64;
+  constexpr uint16_t kLastFlow = kFlowCount - 1;
+  constexpr int kIterations = 50;
+  std::atomic<int> hrnrCount{0};
+  std::atomic<int> flowIdNakCount{0};
+  EXPECT_CALL(*mockSocket_, write(_, _))
+      .WillRepeatedly([&](const folly::SocketAddress&,
+                          const std::unique_ptr<folly::IOBuf>& buf) {
+        folly::io::Cursor cursor(buf.get());
+        BaseHeader baseHeader(cursor);
+        AckHeader ackHeader(cursor);
+        if (ackHeader.getAckStatus() == AckStatus::HRNR) {
+          hrnrCount.fetch_add(1, std::memory_order_relaxed);
+        } else if (ackHeader.getAckStatus() == AckStatus::NAK_FLOW_ID_ERROR) {
+          flowIdNakCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return buf->computeChainDataLength();
+      });
+
+  for (int i = 0; i < kIterations; ++i) {
+    SCOPED_TRACE(i);
+    LimitedTestSender mockSender(*arbiter, mockUDPSocketMaker);
+    mockSender.setLimitNumSockets(2);
+    struct ibv_qp raceIbvQp{};
+    auto raceQp = std::make_unique<Qp>(
+        kRaceQpn, *retxTimer, *arbiter, mrs, cq.get(), &raceIbvQp);
+    raceQp->setIbvQpState(IBV_QPS_INIT);
+    raceQp->setMtu(4096);
+    raceQp->addPortPair(
+        folly::IPAddress("fc00::1"), folly::IPAddress("fc00::101"));
+    raceQp->setRemoteQpNum(srcQp);
+    const bool configured =
+        raceQp->getTag(kMetaRoceInitialTag)
+            ->setReceiveSequenceNumbers(
+                {.nextMsn = kFixtureCdmsn + 1, .nextCsn = kFixtureRxCsn});
+    ASSERT_TRUE(configured)
+        << "precondition: the queue pair must hold the sequencing the "
+           "packets are written against";
+    auto congestionController =
+        std::make_unique<NiceMock<MockCongestionController>>();
+    ON_CALL(*congestionController, getAvailableWindowSize(_))
+        .WillByDefault(Return(100));
+    raceQp->setCongestionController(std::move(congestionController));
+    auto* qpRawPtr = raceQp.get();
+    qpNumToQp_.wlock()->emplace(kRaceQpn, std::move(raceQp));
+
+    std::atomic<bool> setupDone{false};
+    std::thread setup([&] {
+      qpRawPtr->setupFlows(kFlowCount, kFlowCount, &mockSender);
+      qpRawPtr->setIbvQpState(IBV_QPS_RTR);
+      setupDone.store(true, std::memory_order_relaxed);
+    });
+    std::thread reader([&] {
+      while (!setupDone.load(std::memory_order_relaxed)) {
+        mockReceiver_->simulateReceivePacket(
+            buildTestDataPacket(srcQp, kRaceQpn, kLastFlow, fsn, msn),
+            kEcnECT0);
+      }
+    });
+    setup.join();
+    reader.join();
+    EXPECT_EQ(qpRawPtr->getNumRxFlows(), kFlowCount)
+        << "setup must publish every receive flow it was asked to build";
+    EXPECT_NE(qpRawPtr->getRxFlowById(kLastFlow), nullptr)
+        << "the last receive flow must be reachable once setup completes";
+    qpNumToQp_.wlock()->erase(kRaceQpn);
+  }
+  EXPECT_EQ(flowIdNakCount.load(std::memory_order_relaxed), 0)
+      << "a flow-ID NAK during setup disables a flow that is about to exist "
+         "on the sender, whose repathed frames the receiver then sees twice";
+  EXPECT_GT(hrnrCount.load(std::memory_order_relaxed), 0)
+      << "at least one packet must land during setup, or the race was not "
+         "exercised";
+}
+
 TEST_F(ReceiverTest, APacketFromAnotherSourceQpIsDiscardedSilently) {
   constexpr uint32_t kSize = 64;
   char recvBuffer[kSize] = {};
@@ -3970,15 +4047,7 @@ TEST_F(ReceiverTest, MatchedReadRespWithOutOfRangePosnIsRejected) {
          "moved to error), not delivered through a CHECK-aborting posn";
 }
 
-/*
- * End-to-end HRNR cancel test:
- * 1. Data packet arrives for a QP with no paths → Receiver sends HRNR NAK
- *    and sets rnrCancelPending on the QP.
- * 2. setupFlows() is called on the QP → rnrCancelPending is cleared and an
- *    RNR Cancel packet is scheduled.
- * 3. getNextPacketToSend() produces an RnrCancelPacket with correct fields.
- */
-TEST_F(ReceiverTest, HrnrCancelOnSetupFlowsEndToEnd) {
+TEST_F(ReceiverTest, HrnrCancelOnBringUpEndToEnd) {
   constexpr uint32_t noFlowsQpn = 790;
   struct ibv_qp noFlowsIbvQp{};
   auto noFlowsQp = std::make_unique<Qp>(
@@ -4003,28 +4072,306 @@ TEST_F(ReceiverTest, HrnrCancelOnSetupFlowsEndToEnd) {
   EXPECT_CALL(*mockSocket_, write(_, _))
       .WillOnce([](const folly::SocketAddress&,
                    const std::unique_ptr<folly::IOBuf>& buf) {
+        folly::io::Cursor cursor(buf.get());
+        BaseHeader baseHeader(cursor);
+        AckHeader ackHeader(cursor);
+        EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::HRNR)
+            << "data arriving before the flows exist must get an HRNR";
         return buf->computeChainDataLength();
       });
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
-  ASSERT_TRUE(qpRawPtr->hasRnrCancelPending())
-      << "rnrCancelPending should be set after HRNR NAK";
 
   LimitedTestSender hrnrMockSender(*arbiter, mockUDPSocketMaker);
   qpRawPtr->setupFlows(1, 1, &hrnrMockSender);
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "no cancel leaves before RTR; setup alone must schedule none";
 
-  EXPECT_FALSE(qpRawPtr->hasRnrCancelPending())
-      << "rnrCancelPending should be cleared after setupFlows()";
+  qpRawPtr->setIbvQpState(IBV_QPS_INIT);
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
 
   auto egressPacket = qpRawPtr->getNextPacketToSend();
   ASSERT_TRUE(egressPacket)
-      << "RNR cancel packet should be available after setupFlows()";
+      << "RNR cancel packet should be available after the RTR transition";
   auto* rnrCancelPacket =
       dynamic_cast<RnrCancelPacket*>(egressPacket->packet.get());
   ASSERT_NE(rnrCancelPacket, nullptr) << "Packet should be an RnrCancelPacket";
 
   EXPECT_EQ(rnrCancelPacket->getRnrCancelHeader().getTag(), kMetaRoceInitialTag)
       << "HRNR cancel should target the initial tag";
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "bring-up sends one cancel; a second visit must find none";
+
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
+  auto repeatedPacket = qpRawPtr->getNextPacketToSend();
+  ASSERT_TRUE(repeatedPacket)
+      << "sending a cancel must not clear the recorded HRNR, so a repeated "
+         "RTR result schedules another";
+  ASSERT_NE(
+      dynamic_cast<RnrCancelPacket*>(repeatedPacket->packet.get()), nullptr)
+      << "Packet should be an RnrCancelPacket";
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "one RTR transition schedules one cancel; a second visit must find "
+         "none";
+}
+
+TEST_F(ReceiverTest, RtrTransitionSendsNoCancelWithoutPriorHrnr) {
+  constexpr uint32_t noHrnrQpn = 793;
+  struct ibv_qp noHrnrIbvQp{};
+  auto noHrnrQp = std::make_unique<Qp>(
+      noHrnrQpn, *retxTimer, *arbiter, mrs, cq.get(), &noHrnrIbvQp);
+  noHrnrQp->setMtu(4096);
+  noHrnrQp->addPortPair(
+      folly::IPAddress("fc00::1"), folly::IPAddress("fc00::101"));
+  noHrnrQp->setRemoteQpNum(srcQp);
+
+  auto congestionController =
+      std::make_unique<NiceMock<MockCongestionController>>();
+  ON_CALL(*congestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100));
+  noHrnrQp->setCongestionController(std::move(congestionController));
+
+  auto* qpRawPtr = noHrnrQp.get();
+  qpNumToQp_.wlock()->emplace(noHrnrQpn, std::move(noHrnrQp));
+
+  LimitedTestSender noHrnrMockSender(*arbiter, mockUDPSocketMaker);
+  qpRawPtr->setupFlows(1, 1, &noHrnrMockSender);
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "no cancel leaves before RTR; setup alone must schedule none";
+
+  qpRawPtr->setIbvQpState(IBV_QPS_INIT);
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "no cancel may leave where no HRNR was sent; bring-up cancels only "
+         "backoff this receiver requested";
+
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "a repeated RTR result must still schedule no cancel where no HRNR "
+         "was sent";
+}
+
+TEST_F(ReceiverTest, HrnrAfterSetupFlowsBeforeRtrIsCancelledOnBringUp) {
+  constexpr uint32_t raceQpn = 794;
+  struct ibv_qp raceIbvQp{};
+  auto raceQp = std::make_unique<Qp>(
+      raceQpn, *retxTimer, *arbiter, mrs, cq.get(), &raceIbvQp);
+  raceQp->setMtu(4096);
+  raceQp->addPortPair(
+      folly::IPAddress("fc00::1"), folly::IPAddress("fc00::101"));
+  raceQp->setRemoteQpNum(srcQp);
+  const bool configured =
+      raceQp->getTag(kMetaRoceInitialTag)
+          ->setReceiveSequenceNumbers(
+              {.nextMsn = kFixtureCdmsn + 1, .nextCsn = kFixtureRxCsn});
+  ASSERT_TRUE(configured)
+      << "precondition: the queue pair must hold the sequencing the "
+         "packets are written against";
+
+  auto congestionController =
+      std::make_unique<NiceMock<MockCongestionController>>();
+  ON_CALL(*congestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100));
+  raceQp->setCongestionController(std::move(congestionController));
+
+  auto* qpRawPtr = raceQp.get();
+  qpNumToQp_.wlock()->emplace(raceQpn, std::move(raceQp));
+
+  LimitedTestSender raceMockSender(*arbiter, mockUDPSocketMaker);
+  qpRawPtr->setupFlows(1, 1, &raceMockSender);
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "no RNR cancel is pending before any HRNR is sent, so setup "
+         "alone must schedule none";
+
+  EXPECT_CALL(*mockSocket_, write(_, _))
+      .Times(3)
+      .WillRepeatedly([](const folly::SocketAddress&,
+                         const std::unique_ptr<folly::IOBuf>& buf) {
+        folly::io::Cursor cursor(buf.get());
+        BaseHeader baseHeader(cursor);
+        AckHeader ackHeader(cursor);
+        EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::HRNR)
+            << "every packet arriving before RTR must get an HRNR";
+        return buf->computeChainDataLength();
+      });
+  for (int i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    mockReceiver_->simulateReceivePacket(
+        buildTestDataPacket(srcQp, raceQpn, /*flowId=*/0, fsn, msn), kEcnECT0);
+  }
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "the cancel must wait for RTR publication, not be sent while the "
+         "QP is still in INIT";
+
+  qpRawPtr->setIbvQpState(IBV_QPS_INIT);
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
+  auto egressPacket = qpRawPtr->getNextPacketToSend();
+  ASSERT_TRUE(egressPacket)
+      << "bring-up must send an RNR cancel for the HRNR sent after "
+         "setup; without it the sender waits out the full HRNR backoff";
+  auto* rnrCancelPacket =
+      dynamic_cast<RnrCancelPacket*>(egressPacket->packet.get());
+  ASSERT_NE(rnrCancelPacket, nullptr) << "Packet should be an RnrCancelPacket";
+  EXPECT_EQ(rnrCancelPacket->getRnrCancelHeader().getTag(), kMetaRoceInitialTag)
+      << "HRNR cancel should target the initial tag";
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "bring-up sends one cancel; a second visit must find none";
+
+  constexpr uint32_t kRecvBufferSize = 4;
+  char recvBuffer[kRecvBufferSize] = {};
+  const uint32_t recvLkey =
+      mrs.reg_mr(
+             nullptr,
+             recvBuffer,
+             kRecvBufferSize,
+             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE)
+          ->lkey;
+  postToTag(
+      *qpRawPtr->getTag(kMetaRoceInitialTag),
+      std::make_unique<ReceiveWqe>(
+          /*workReqId=*/42,
+          oneSge(recvBuffer, kRecvBufferSize, recvLkey),
+          qpRawPtr->getMtu()),
+      qpRawPtr->getMtu());
+  char payload[1] = {'S'};
+  EXPECT_CALL(*mockSocket_, write(_, _)).Times(0);
+  mockReceiver_->simulateReceivePacket(
+      buildTestDataPacket(
+          srcQp,
+          raceQpn,
+          /*flowId=*/0,
+          fsn,
+          msn,
+          /*tag=*/0,
+          /*posn=*/0,
+          payload,
+          sizeof(payload),
+          BaseHeader::Opcode::OperationType::SEND_IMM_P,
+          /*maybeImmData=*/0x12345678,
+          /*padding=*/0),
+      kEcnECT0);
+  EXPECT_TRUE(qpRawPtr->hasCompletedReceiveSetup())
+      << "receive setup stays complete once the RTR transition publishes it";
+  ASSERT_EQ(cq->getNumCompletedWqes(), 1)
+      << "the data arriving after RTR should complete the posted receive";
+  const auto cqe = folly::coro::blockingWait(cq->pollCq());
+  EXPECT_EQ(cqe.status, kSuccess)
+      << "the data arriving after RTR should complete successfully";
+  EXPECT_EQ(cqe.workReqId, 42)
+      << "the completion should correspond to the posted receive WQE";
+  EXPECT_EQ(std::memcmp(recvBuffer, payload, sizeof(payload)), 0)
+      << "the receiver should deliver the payload arriving after RTR";
+}
+
+TEST_F(ReceiverTest, DataBeforeSetupWithErroredTagGetsHrnr) {
+  constexpr uint32_t errQpn = 795;
+  struct ibv_qp errIbvQp{};
+  auto errQp = std::make_unique<Qp>(
+      errQpn, *retxTimer, *arbiter, mrs, cq.get(), &errIbvQp);
+  errQp->setMtu(4096);
+  errQp->addPortPair(
+      folly::IPAddress("fc00::1"), folly::IPAddress("fc00::101"));
+  errQp->setRemoteQpNum(srcQp);
+
+  auto congestionController =
+      std::make_unique<NiceMock<MockCongestionController>>();
+  ON_CALL(*congestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100));
+  errQp->setCongestionController(std::move(congestionController));
+
+  auto* qpRawPtr = errQp.get();
+  qpNumToQp_.wlock()->emplace(errQpn, std::move(errQp));
+
+  qpRawPtr->setIbvQpState(IBV_QPS_ERR);
+  EXPECT_FALSE(qpRawPtr->hasCompletedReceiveSetup())
+      << "an error reached before setup completes must leave receive "
+         "setup incomplete, or the receiver would read flow tables that "
+         "were never built";
+
+  std::atomic<int> hrnrCount{0};
+  std::atomic<int> otherCount{0};
+  EXPECT_CALL(*mockSocket_, write(_, _))
+      .WillRepeatedly([&](const folly::SocketAddress&,
+                          const std::unique_ptr<folly::IOBuf>& buf) {
+        folly::io::Cursor cursor(buf.get());
+        BaseHeader baseHeader(cursor);
+        AckHeader ackHeader(cursor);
+        if (ackHeader.getAckStatus() == AckStatus::HRNR) {
+          hrnrCount.fetch_add(1, std::memory_order_relaxed);
+        } else {
+          otherCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return buf->computeChainDataLength();
+      });
+  mockReceiver_->simulateReceivePacket(
+      buildTestDataPacket(srcQp, errQpn, /*flowId=*/0, fsn, msn), kEcnECT0);
+  EXPECT_EQ(hrnrCount.load(std::memory_order_relaxed), 1)
+      << "data for an errored QP before setup must get HRNR, not an error "
+         "NAK for flows that were never built";
+  EXPECT_EQ(otherCount.load(std::memory_order_relaxed), 0)
+      << "no other reply may leave for a QP whose setup never completed";
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "no cancel leaves for a QP that never reached RTR";
+
+  LimitedTestSender errMockSender(*arbiter, mockUDPSocketMaker);
+  qpRawPtr->setupFlows(1, 1, &errMockSender);
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
+  EXPECT_FALSE(qpRawPtr->hasCompletedReceiveSetup())
+      << "an RTR transition over errored Tags publishes no setup";
+  mockReceiver_->simulateReceivePacket(
+      buildTestDataPacket(srcQp, errQpn, /*flowId=*/0, fsn, msn), kEcnECT0);
+  EXPECT_EQ(hrnrCount.load(std::memory_order_relaxed), 2)
+      << "data must still get HRNR after a failed RTR transition over "
+         "errored Tags";
+  EXPECT_EQ(otherCount.load(std::memory_order_relaxed), 0)
+      << "no other reply may leave for a QP whose setup never completed";
+  EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
+      << "no cancel leaves for a QP that never reached RTR";
+}
+
+TEST_F(ReceiverTest, DataAfterSetupWithErroredTagGetsOperationalErrorNak) {
+  constexpr uint32_t errQpn = 796;
+  struct ibv_qp errIbvQp{};
+  auto errQp = std::make_unique<Qp>(
+      errQpn, *retxTimer, *arbiter, mrs, cq.get(), &errIbvQp);
+  errQp->setMtu(4096);
+  errQp->addPortPair(
+      folly::IPAddress("fc00::1"), folly::IPAddress("fc00::101"));
+  errQp->setRemoteQpNum(srcQp);
+  const bool configured =
+      errQp->getTag(kMetaRoceInitialTag)
+          ->setReceiveSequenceNumbers(
+              {.nextMsn = kFixtureCdmsn + 1, .nextCsn = kFixtureRxCsn});
+  ASSERT_TRUE(configured)
+      << "precondition: the queue pair must hold the sequencing the "
+         "packets are written against";
+
+  auto congestionController =
+      std::make_unique<NiceMock<MockCongestionController>>();
+  ON_CALL(*congestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100));
+  errQp->setCongestionController(std::move(congestionController));
+
+  auto* qpRawPtr = errQp.get();
+  qpNumToQp_.wlock()->emplace(errQpn, std::move(errQp));
+
+  LimitedTestSender errMockSender(*arbiter, mockUDPSocketMaker);
+  qpRawPtr->setupFlows(1, 1, &errMockSender);
+  qpRawPtr->setIbvQpState(IBV_QPS_INIT);
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
+  EXPECT_TRUE(qpRawPtr->hasCompletedReceiveSetup())
+      << "receive setup is complete once the RTR transition publishes it";
+
+  qpRawPtr->setIbvQpState(IBV_QPS_ERR);
+  EXPECT_TRUE(qpRawPtr->hasCompletedReceiveSetup())
+      << "an error reached after setup completes must leave receive setup "
+         "complete, so the receiver still answers with an error NAK";
+
+  expectNakOperationalError();
+  mockReceiver_->simulateReceivePacket(
+      buildTestDataPacket(srcQp, errQpn, /*flowId=*/0, fsn, msn), kEcnECT0);
+  EXPECT_TRUE(qpRawPtr->hasCompletedReceiveSetup())
+      << "error handling must not unpublish completed setup";
 }
 
 TEST_F(ReceiverTest, HrnrCancelCarriesThePostedCsn) {
@@ -4047,7 +4394,6 @@ TEST_F(ReceiverTest, HrnrCancelCarriesThePostedCsn) {
   auto* qpRawPtr = noFlowsQp.get();
   qpNumToQp_.wlock()->emplace(noFlowsQpn, std::move(noFlowsQp));
 
-  // Posted before the flows exist, so the cancel has a real CSN to carry.
   auto tag = qpRawPtr->getTag(kMetaRoceInitialTag);
   for (int i = 0; i < kReceivesPosted; ++i) {
     postToTag(
@@ -4067,16 +4413,16 @@ TEST_F(ReceiverTest, HrnrCancelCarriesThePostedCsn) {
         return buf->computeChainDataLength();
       });
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
-  ASSERT_TRUE(qpRawPtr->hasRnrCancelPending())
-      << "precondition: the data packet arriving before the flows exist is "
-         "what arms the cancel; without it the QP coming up sends nothing for "
-         "the rest of this test to inspect";
 
   LimitedTestSender hrnrMockSender(*arbiter, mockUDPSocketMaker);
   qpRawPtr->setupFlows(1, 1, &hrnrMockSender);
+  qpRawPtr->setIbvQpState(IBV_QPS_INIT);
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
 
   auto egressPacket = qpRawPtr->getNextPacketToSend();
-  ASSERT_TRUE(egressPacket);
+  ASSERT_TRUE(egressPacket)
+      << "bring-up must send an RNR cancel for the HRNR sent before the "
+         "flows existed";
   auto* rnrCancelPacket =
       dynamic_cast<RnrCancelPacket*>(egressPacket->packet.get());
   ASSERT_NE(rnrCancelPacket, nullptr);
@@ -4110,6 +4456,8 @@ TEST_F(ReceiverTest, RnrCancelIsHandedToTheSenderNotAppliedOnReceipt) {
   qpNumToQp_.wlock()->emplace(cancelQpn, std::move(cancelQp));
   LimitedTestSender cancelMockSender(*arbiter, mockUDPSocketMaker);
   qpRawPtr->setupFlows(1, 1, &cancelMockSender);
+  qpRawPtr->setIbvQpState(IBV_QPS_INIT);
+  qpRawPtr->setIbvQpState(IBV_QPS_RTR);
   ASSERT_TRUE(qpRawPtr->usesSingleOwnerRxRing())
       << "the ring must exist for the receiver to defer the cancel onto it";
 

@@ -527,8 +527,21 @@ bool TagSet::allTagsInStateWithLockHeld(ibv_qp_state state) const {
   });
 }
 
-void TagSet::setIbvQpState(ibv_qp_state state) {
+bool TagSet::shouldSendStartupHrnr() {
+  if (hasCompletedReceiveSetup()) {
+    return false;
+  }
   std::scoped_lock lock(stateLock_);
+  if (hasCompletedReceiveSetup()) {
+    return false;
+  }
+  startupHrnrSent_.store(true, std::memory_order_release);
+  return true;
+}
+
+ibv_qp_state TagSet::setIbvQpState(ibv_qp_state state) {
+  std::scoped_lock lock(stateLock_);
+  ibv_qp_state resultingState = IBV_QPS_ERR;
   for (auto& tag : tags_) {
     // IBV_QPS_ERR is terminal, so a Tag already there keeps it.
     if (tag->isInErrorState()) {
@@ -543,8 +556,9 @@ void TagSet::setIbvQpState(ibv_qp_state state) {
       // compare-and-set moves only a Tag not already in error, and
       // either outcome leaves the Tag where it belongs.
       ibv_qp_state observed = loadQpState(tag->getIbvQp());
-      if (observed != IBV_QPS_ERR) {
-        std::ignore = compareAndSetQpState(tag->getIbvQp(), observed, state);
+      if (observed != IBV_QPS_ERR &&
+          compareAndSetQpState(tag->getIbvQp(), observed, state)) {
+        resultingState = state;
       }
     }
   }
@@ -554,6 +568,10 @@ void TagSet::setIbvQpState(ibv_qp_state state) {
     // publication visible to it.
     notifySenderTagEnteredError();
   }
+  if (resultingState == IBV_QPS_RTR) {
+    receiveSetupComplete_.store(true, std::memory_order_release);
+  }
+  return resultingState;
 }
 
 void TagSet::addUnsentPosns(uint32_t count) {

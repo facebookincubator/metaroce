@@ -315,10 +315,21 @@ class Qp {
     return tagSet_.allTagsInState(state);
   }
 
+  // Once true, the flow tables may be inspected, including after a
+  // subsequent error.
+  [[nodiscard]] bool hasCompletedReceiveSetup() const {
+    return tagSet_.hasCompletedReceiveSetup();
+  }
+
   // Signals inline on an error transition, so the caller must not hold a Tag
   // semaphore, sndCur or a TagSet lock.
   void setIbvQpState(ibv_qp_state state) {
-    tagSet_.setIbvQpState(state);
+    const auto resultingState = tagSet_.setIbvQpState(state);
+    if (resultingState == IBV_QPS_RTR && tagSet_.startupHrnrSent()) {
+      scheduleRnrCancelPacket(
+          kMetaRoceInitialTag,
+          existingTag(kMetaRoceInitialTag).getNextRxCsn() - 1);
+    }
     if (state == IBV_QPS_ERR) {
       // After setIbvQpState() has returned and dropped its TagSet lock: the
       // sender fails a tag in error at its next visit, and a QP with every
@@ -635,10 +646,9 @@ class Qp {
   // other sequence number rather than as the large value it wraps to.
   void scheduleRnrCancelPacket(uint8_t tag, uint16_t postedCsn);
 
-  // Track that an RNR cancel needs to be sent for this QP (e.g., after an
-  // HRNR NAK was sent before flows were set up).
-  void setRnrCancelPending(bool pending);
-  [[nodiscard]] bool hasRnrCancelPending() const;
+  [[nodiscard]] bool shouldSendStartupHrnr() {
+    return tagSet_.shouldSendStartupHrnr();
+  }
 
   // Build RNR-Cancel packet
   std::unique_ptr<RnrCancelPacket> buildRnrCancelPacket(
@@ -923,7 +933,6 @@ class Qp {
   // dequeued by the sender inside a build it may already be part way through.
   folly::Synchronized<std::queue<PendingRnrCancel>, std::mutex>
       pendingRnrCancels_;
-  bool rnrCancelPending_{false};
   std::mutex receiveLock_;
   // The whole-QP transmit lock of lockForInlineAckApply(); unused when the
   // sender owns transmit state alone.

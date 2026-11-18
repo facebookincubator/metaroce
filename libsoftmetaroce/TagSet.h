@@ -154,8 +154,20 @@ class TagSet {
   // Set the QP state of every Tag in this TagSet. A Tag already in
   // IBV_QPS_ERR is left there, and one that enters error mid-walk wins over
   // the compare-and-set: the state is terminal, and a Tag already in error
-  // is not brought back by a transition meant for the others.
-  void setIbvQpState(ibv_qp_state state);
+  // is not brought back by a transition meant for the others. Returns the
+  // requested state if it was applied to at least one Tag; otherwise
+  // returns ERR.
+  ibv_qp_state setIbvQpState(ibv_qp_state state);
+
+  // Returns true while receive setup is incomplete and records that a
+  // startup HRNR was sent.
+  [[nodiscard]] bool shouldSendStartupHrnr();
+  [[nodiscard]] bool hasCompletedReceiveSetup() const {
+    return receiveSetupComplete_.load(std::memory_order_acquire);
+  }
+  [[nodiscard]] bool startupHrnrSent() const {
+    return startupHrnrSent_.load(std::memory_order_acquire);
+  }
 
   // Track the number of unsent POSNs across all WQEs in this TagSet.
   void addUnsentPosns(uint32_t count);
@@ -250,6 +262,10 @@ class TagSet {
   // Serializes tag additions with QP state transitions and tag errors, and
   // with the readers that may run while a Tag is added.
   mutable folly::MicroLock stateLock_;
+  // Set, under stateLock_, when RTR is established.
+  std::atomic<bool> receiveSetupComplete_{false};
+  // Set, under stateLock_, on a startup HRNR before setup completes.
+  std::atomic<bool> startupHrnrSent_{false};
   // Serializes the sender's turns with the retransmit timer's peek.
   folly::MicroLock schedulerLock_;
   // Raised when a Tag enters the error state, cleared by the sweep that fails

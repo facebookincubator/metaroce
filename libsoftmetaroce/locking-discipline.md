@@ -11,7 +11,7 @@ around `Tag`, `TagSet`, `TxFlow`, or QP teardown.
 |---|---|---|---|
 | `Tag::freeSem_` | count-1 semaphore used as a busy token (`waitForFree` / `markFree`) | exclusive use of one `Tag`: its WQEs while a packet from it is being prepared, sent, or retransmitted, or the Tag is being torn down; and the per-tag BRNR state (`brnr_`), read and written only under it | per-Tag (fine) |
 | `Tag::wqeRetirementMutex_` | `folly::SharedMutex` (`accessForReceive` / `lockForWqeRetirement`) | the boundary between receive processing and WQE retirement: held shared while the receive path uses a `Wqe*` the Tag owns, exclusively while the Tag moves to error or retires one -- with the one exception below | per-Tag (fine) |
-| `TagSet::stateLock_` | `folly::MicroLock` | Tag additions, against QP state transitions (`setIbvQpState`), a Tag entering error (`enterTagErrorWithTagHeld`), and the readers that may run while a Tag is added (`contains`, `protectionDomain`, `getTagInAnyState`) | per-TagSet |
+| `TagSet::stateLock_` | `folly::MicroLock` | Tag additions, against QP state transitions (`setIbvQpState`), a Tag entering error (`enterTagErrorWithTagHeld`), the readers that may run while a Tag is added (`contains`, `protectionDomain`, `getTagInAnyState`), and the startup-HRNR and receive-setup flags (`shouldSendStartupHrnr`, `setIbvQpState`) | per-TagSet |
 | `TagSet::schedulerLock_` | `folly::MicroLock` | round-robin state (`scheduler_`): the sender's turns against the retransmit timer's peek | per-TagSet |
 | `Tag::pendingReceives_` | `folly::Synchronized` r/w lock | the receives waiting by csn (`receivesByCsn`) and the dedicated-queue RNR-Cancel request (`rnrCancelRequested`); receive lookup and request recording are atomic with receive insertion and request clearing | per-Tag (fine) |
 | `Tag::msnSpan_` | `folly::Synchronized` r/w lock | the msn span: the posted send-WQE map and the three cursors that bound it (`nextMsn`, `inOrderCompletedMsn`, `inOrderRetiredMsn`) | per-Tag (fine) |
@@ -264,6 +264,12 @@ thread so the reader observes the initialized entry.
    before destroying Tags. Lookups using peer-supplied tag numbers must still
    validate membership. A received packet reads Tags only once its QP has
    flows: until then a Tag can still be added.
+7. **Record a startup HRNR under `stateLock_`, and schedule its cancel
+   only from an RTR result.** The lock serializes the recording with the
+   walk that publishes setup: a recording made before the walk is visible
+   to the RTR result, and a check after publication is refused. The flag
+   is never cleared, so a later RTR result schedules another cancel, and
+   `Qp` schedules it after the transition returns.
 
 ## Testing lock order
 

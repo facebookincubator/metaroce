@@ -439,6 +439,10 @@ void Receiver::processIngress(
   }
 
   if (opcode.isAnAck()) {
+    if (!qp.hasCompletedReceiveSetup()) {
+      // No data has been sent yet, so this ACK is not for this QP.
+      return;
+    }
     const auto flowId = rxBaseHeader.getFlowId();
     if (flowId >= qp.getNumTxFlows()) {
       LOG(WARNING) << "ack for unknown flow id: " << flowId
@@ -469,21 +473,20 @@ void Receiver::processIngress(
     }
 
   } else if (opcode.isData()) {
+    if (qp.shouldSendStartupHrnr()) {
+      // The QP has not reached RTR, so its flows may still be building.
+      LOG_FIRST_N(INFO, 10)
+          << "qp: " << qpn << " is not ready to receive yet, sending HRNR.";
+      replyWithHrnr(packet, ingress.sourceSocketAddress);
+      return;
+    }
     RxFlow* rxFlow = qp.getRxFlowById(rxBaseHeader.getFlowId());
     if (!rxFlow) {
-      if (qp.getNumRxFlows() == 0) {
-        // we have not initialized flows, and thus are not yet in RTR state.
-        LOG(INFO) << "qp: " << qpn
-                  << " is not ready to receive yet, sending HRNR.";
-        qp.setRnrCancelPending(true);
-        replyWithHrnr(packet, ingress.sourceSocketAddress);
-      } else {
-        // we have some initialized flows, but this is not one of them.
-        VLOG(1) << "flow id: " << rxBaseHeader.getFlowId()
-                << " not found for qp: " << qpn;
-        replyWithFlowIdNak(
-            packet, ingress.sourceSocketAddress, (uint16_t)qp.getNumRxFlows());
-      }
+      VLOG(1) << "flow id: " << rxBaseHeader.getFlowId()
+              << " not found for qp: " << qpn << " with " << qp.getNumRxFlows()
+              << " flows";
+      replyWithFlowIdNak(
+          packet, ingress.sourceSocketAddress, (uint16_t)qp.getNumRxFlows());
       return;
     }
 
@@ -516,7 +519,7 @@ void Receiver::processIngress(
     auto rnrCancelHeader = rnrCancel.getRnrCancelHeader();
     // Tags can be added until flows exist, and applyRnrCancel reads them
     // unlocked. Before then the QP has sent no data, so it holds no RNR block.
-    if (qp.getNumTxFlows() == 0) {
+    if (!qp.hasCompletedReceiveSetup()) {
       VLOG(1) << "rnr cancel before flows exist on qp: " << qpn;
       return;
     }
@@ -696,6 +699,8 @@ void Receiver::handlePing(
   if (qp != nullptr && (multiReader_ || modifierDefersReceive_)) {
     recvGuard = std::unique_lock<std::mutex>(qp->receiveLock());
   }
+  const uint32_t receiveFlowCount =
+      qp != nullptr && qp->hasCompletedReceiveSetup() ? qp->getNumRxFlows() : 0;
   if (!qp) {
     errorState = PingErrorState::QP_NOT_PRESENT_OR_UNKNOWN;
   } else if (!qp->containsTag(pingTag)) {
@@ -704,8 +709,7 @@ void Receiver::handlePing(
                  echoDestinationSocketAddress.getIPAddress())) {
     errorState = PingErrorState::SOURCE_ADDRESS_NOT_ASSOCIATED_WITH_QP;
   } else if (
-      pingFlowId >= pingSupportedFlowCount ||
-      pingFlowId >= qp->getNumRxFlows()) {
+      pingFlowId >= pingSupportedFlowCount || pingFlowId >= receiveFlowCount) {
     errorState = PingErrorState::FLOW_ID_UNSUPPORTED_OR_TOO_LARGE;
   }
 
@@ -719,8 +723,7 @@ void Receiver::handlePing(
   pingPacket.getControlHeader().setType(
       static_cast<uint16_t>(ControlPacketType::PING_RESPONSE));
   pingPacket.getPingHeader().setErrorState(errorState);
-  pingPacket.getPingHeader().setSupportedFlowCount(
-      qp ? qp->getNumRxFlows() : 0);
+  pingPacket.getPingHeader().setSupportedFlowCount(receiveFlowCount);
   pingPacket.getPingHeader().setActivePortSet(loadActivePortSet());
 
   folly::SocketAddress echoDestinationSocketAddr = echoDestinationSocketAddress;
