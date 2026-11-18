@@ -235,6 +235,8 @@ class TxFlow : public Flow {
   [[nodiscard]] bool isBlockedMsn(const Tag& tag, uint16_t msn) const;
 
  private:
+  using SndCurWriteLock = folly::Synchronized<uint16_t>::WLockedPtr;
+
   // Body of retxTimerCallback_, so it runs on the timer thread.
   void onRetransmissionTimeout();
 
@@ -257,7 +259,8 @@ class TxFlow : public Flow {
   // Caller must hold sndCur.wlock(): this advances sndCur-guarded state.
   std::unique_ptr<struct EgressPacket> getNextPacketToSendFromWqe(
       Wqe& wqe,
-      uint8_t tagNum);
+      uint8_t tagNum,
+      const SndCurWriteLock& sndCurHeld);
 
   // Move the window past the frames at its head that are resolved -- acked,
   // BRNR'd or abandoned. Leaving any of them stalls snd_una behind work that

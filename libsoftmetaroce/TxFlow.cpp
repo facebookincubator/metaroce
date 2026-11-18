@@ -389,7 +389,7 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
       CHECK_NOTNULL(wqe); // for lint(facebook-hte-NullableDereference)
       if (!tag->isInErrorState()) {
         try {
-          packet = getNextPacketToSendFromWqe(*wqe, tagNum);
+          packet = getNextPacketToSendFromWqe(*wqe, tagNum, lockedSndCur);
           VLOG(2) << "TxFlow::tryGetNewPacketFromWqe() found a packet on WQE";
           tag->markProbeSentIfBlockedMsn(*wqe);
           // Release the tag semaphore acquired by findNextWqe().
@@ -488,7 +488,8 @@ bool TxFlow::hasUnackedData() const {
  */
 std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSendFromWqe(
     Wqe& wqe,
-    uint8_t tagNum) {
+    uint8_t tagNum,
+    const SndCurWriteLock& /*sndCurHeld*/) {
   auto posn = wqe.allocateNextPosn();
   qp_.tagSet_.decrementUnsentPosns();
   const uint32_t sendPayloadSize = wqe.canHaveSendPayload()
