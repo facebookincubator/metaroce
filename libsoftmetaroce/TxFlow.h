@@ -131,7 +131,7 @@ class TxFlow : public Flow {
   TxFlow& operator=(const TxFlow&) = delete;
   TxFlow& operator=(TxFlow&& other) = delete;
 
-  void setRetransmissionTimer();
+  void restartRetransmissionTimerForTest();
   void destroyRetransmissionTimer();
 
   ~TxFlow();
@@ -210,6 +210,8 @@ class TxFlow : public Flow {
   [[nodiscard]] HighResTimer::Callback* getRetxTimerCallback() const {
     return retxTimerCallback_.get();
   }
+  void setRtoExpiryNsForTest(uint64_t expiryNs);
+  [[nodiscard]] uint64_t getRtoExpiryNsForTest() const;
 
   void purgeRetxPktsToSend() {
     retxPktsToSend_.wlock()->clear();
@@ -238,7 +240,11 @@ class TxFlow : public Flow {
   using SndCurWriteLock = folly::Synchronized<uint16_t>::WLockedPtr;
 
   // Body of retxTimerCallback_, so it runs on the timer thread.
-  void onRetransmissionTimeout();
+  void onRtoWake();
+  [[nodiscard]] uint64_t rtoExpiryFrom(uint64_t nowNs) const;
+  void resetRtoExpiry(const SndCurWriteLock& sndCurHeld);
+  [[nodiscard]] bool rtoExpired(const SndCurWriteLock& sndCurHeld) const;
+  void scheduleRtoWake(const SndCurWriteLock& sndCurHeld);
 
   void applyRtoRepath();
   void tryMoveToFailoverPortPair(uint32_t priorMoves);
@@ -279,9 +285,9 @@ class TxFlow : public Flow {
   std::unique_ptr<DataPacket> popQueuedRetxPacket();
   // Returns the next queued retransmission worth sending, discarding those
   // whose frame is already resolved or whose work must stop being
-  // retransmitted, or nullptr when none is left. Caller must hold sndCur: the
-  // tracker decides whether a queued frame is still unresolved.
-  std::unique_ptr<struct EgressPacket> tryGetRetransmissionPacket();
+  // retransmitted, or nullptr when none is left.
+  std::unique_ptr<struct EgressPacket> tryGetRetransmissionPacket(
+      const SndCurWriteLock& sndCurHeld);
 
   // A message: an msn within a tag. Value-typed on purpose, so resolving a
   // frame hands out no Wqe* to be followed once sndCur is dropped.
@@ -323,6 +329,9 @@ class TxFlow : public Flow {
   // Protocol / runtime state.
   TxState txState_;
   folly::relaxed_atomic<uint16_t> consecutiveRtosWithoutAck_{0};
+  // Guarded by sndCur.
+  uint64_t rtoExpiryNs_{0};
+  bool retxTimerRunning_{false};
   // With queued ACKs, sender visits serialize access to this count.
   // With inline ACKs, Qp::txStateLock_ guards reads and writes.
   uint16_t lastConsumedRtoCount_{0}; // Last RTO count processed by repathing.

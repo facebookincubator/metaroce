@@ -19,6 +19,7 @@
 #include <folly/synchronization/Baton.h>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
+#include <libsoftmetaroce/ClockSource.h>
 #include <libsoftmetaroce/Ecn.h>
 #include <libsoftmetaroce/Flow.h>
 #include <libsoftmetaroce/ProtocolCompatibility.h>
@@ -3311,15 +3312,20 @@ TEST_F(QpTest, AnRtoScanInTheFailureWindowQueuesNoRetransmission) {
  * queue when the sender reaches it. Sending it puts a packet back on
  * the wire for a message it has just abandoned, and dropping the packet is not
  * enough on its own: the frame it carried stays outstanding, so the timer that
- * brings the scan to abandon it has to be armed again on the way out.
+ * brings the scan to abandon it must still be scheduled when the sender moves
+ * on.
  */
 TEST_F(QpTest, ARetransmissionQueuedBeforeTheFailureIsNotSent) {
-  // The re-arming this test reads has to outlast the read.
+  // The timer this test reads has to stay scheduled through the read.
   ScopedSuppressedTxTimers suppressTimers;
   TrackedMessageFixture fixture(
       arbiter, qp, mtu, initialTag, {Flow::FsnState::UNACKED}, /*sndCur=*/10);
   auto* const flow = fixture.flow;
   auto* const wqe = fixture.wqe.get();
+  flow->restartRetransmissionTimerForTest();
+  SCOPE_EXIT {
+    retxTimer.cancelCallback(flow->getRetxTimerCallback());
+  };
 
   // A retransmission is prepared while the message is still healthy.
   flow->prepareRetxPacketsIfAny(true /*isRtoEvent*/);
@@ -3328,12 +3334,6 @@ TEST_F(QpTest, ARetransmissionQueuedBeforeTheFailureIsNotSent) {
 
   wqe->markFailing(kWcRetryExcErr);
 
-  auto* const callback = flow->retxTimerCallback_.get();
-  retxTimer.cancelCallback(callback);
-  ASSERT_FALSE(retxTimer.isScheduled(callback))
-      << "the timer has to start disarmed, or the arming below shows nothing "
-         "this test can read";
-
   auto egressPacket = flow->getNextPacketToSend();
 
   EXPECT_EQ(flow->getNumPendingRetxPackets(), 0)
@@ -3341,9 +3341,9 @@ TEST_F(QpTest, ARetransmissionQueuedBeforeTheFailureIsNotSent) {
   EXPECT_EQ(egressPacket, nullptr)
       << "it must not go out: the message it belongs to is failing, so the "
          "wire time buys no progress";
-  EXPECT_TRUE(retxTimer.isScheduled(callback))
-      << "and the timer must be armed again on the way out: its frame is still "
-         "outstanding, and this scan is the only path that will abandon it";
+  EXPECT_TRUE(retxTimer.isScheduled(flow->getRetxTimerCallback()))
+      << "the timer must still be scheduled: the frame is still outstanding, "
+         "and the timer's scan is what will abandon it";
 }
 
 /*
@@ -9514,11 +9514,202 @@ TEST_F(QpTest, AFencedSendDoesNotStopTheRtoRetransmittingItsPrior) {
 
   auto* const callback = flow->retxTimerCallback_.get();
   retxTimer.cancelCallback(callback);
+  flow->setRtoExpiryNsForTest(getNowNs64());
   (*callback)();
 
   EXPECT_EQ(flow->getNumPendingRetxPackets(), 1u)
       << "the fenced send cannot go until its prior is acked, so the RTO must "
          "retransmit the prior rather than wait for new data to be sent";
+}
+
+class RetxTimerExpiryTest : public QpTest {
+ protected:
+  void SetUp() override {
+    QpTest::SetUp();
+    createAlwaysSendingMockCongestionController(qp);
+    qp.setupFlows(1, 1, &mockSender_);
+    flow_ = qp.getTxFlowById(0);
+    ASSERT_NE(flow_, nullptr);
+  }
+
+  void TearDown() override {
+    retxTimer.cancelCallback(flow_->getRetxTimerCallback());
+    QpTest::TearDown();
+  }
+
+  void sendAndAckOneFrame(uint16_t fsn) {
+    ASSERT_NE(postWqeHelper(&qp, oneFrameSend_), nullptr);
+    ASSERT_TRUE(flow_->getNextPacketToSend())
+        << "precondition: the frame goes out";
+    const AckHeader ack = AckHeader::AckHeaderBuilder()
+                              .setCumulativeFsn(fsn)
+                              .setMaxRcvdFsn(fsn)
+                              .setAckStatus(AckStatus::ACK)
+                              .setTimestamp(0)
+                              .build();
+    flow_->processAckPacket(ack, simulatedProcessedAtNs(ack.getTimestamp()));
+    ASSERT_FALSE(flow_->hasUnackedData())
+        << "precondition: the ack leaves the flow with nothing unacked";
+  }
+
+  void expireRto() {
+    flow_->setRtoExpiryNsForTest(getNowNs64());
+  }
+
+  // What the protocol clock stepping back by a day does to the expiry; a day is
+  // longer than the RTO suppressTimers_ sets.
+  void moveRtoExpiryAhead() {
+    flow_->setRtoExpiryNsForTest(getNowNs64() + 86'400 * kNsPerSecond);
+  }
+
+  void fireRetxTimer() {
+    auto* const callback = flow_->getRetxTimerCallback();
+    retxTimer.cancelCallback(callback);
+    (*callback)();
+  }
+
+  // One current RTO after the wake, bounded by clock readings either side.
+  struct ExpiryWindow {
+    uint64_t earliestNs;
+    uint64_t latestNs;
+  };
+  ExpiryWindow fireRetxTimerAndBoundOneRto() {
+    const uint64_t rtoNs = uint64_t{flow_->computeRtoIntervalUs()} * kNsPerUs;
+    const uint64_t beforeNs = getNowNs64();
+    fireRetxTimer();
+    return {.earliestNs = beforeNs + rtoNs, .latestNs = getNowNs64() + rtoNs};
+  }
+
+  bool retxTimerScheduled() {
+    return retxTimer.isScheduled(flow_->getRetxTimerCallback());
+  }
+
+  ScopedSuppressedTxTimers suppressTimers_;
+  LimitedTestSender mockSender_{arbiter, mockUDPSocketMaker};
+  std::unique_ptr<char[]> payload_ = std::make_unique<char[]>(mtu);
+  const WqeData oneFrameSend_{
+      .workType = Wqe::WorkType::kSend,
+      .msgSizeBytes = mtu,
+      .address = payload_.get()};
+  TxFlow* flow_ = nullptr;
+};
+
+TEST_F(
+    RetxTimerExpiryTest,
+    ATimerFiringBeforeTheExpiryASendMovedRetransmitsNothing) {
+  ASSERT_NE(postWqeHelper(&qp, oneFrameSend_), nullptr);
+  ASSERT_TRUE(flow_->getNextPacketToSend())
+      << "precondition: the frame goes out and stays unacked";
+
+  fireRetxTimer();
+
+  EXPECT_EQ(flow_->getNumPendingRetxPackets(), 0u)
+      << "the send moved the RTO expiry later, so the timer firing before it "
+         "has no RTO to act on; retransmitting would resend a busy flow's "
+         "frames every time its timer fires";
+  EXPECT_TRUE(retxTimerScheduled())
+      << "the frame is still unacked, so the timer must re-arm for the rest of "
+         "the RTO rather than stop";
+}
+
+TEST_F(RetxTimerExpiryTest, AWakeAfterAClockStepBackPullsTheExpiryInToOneRto) {
+  ASSERT_NE(postWqeHelper(&qp, oneFrameSend_), nullptr);
+  ASSERT_TRUE(flow_->getNextPacketToSend())
+      << "precondition: the frame goes out and stays unacked";
+  moveRtoExpiryAhead();
+
+  const ExpiryWindow window = fireRetxTimerAndBoundOneRto();
+
+  EXPECT_LE(flow_->getRtoExpiryNsForTest(), window.latestNs)
+      << "a protocol clock step back leaves the expiry the whole step ahead; "
+         "the wake must pull it in to one RTO, or the frame waits out the step "
+         "before it is retransmitted";
+  EXPECT_GE(flow_->getRtoExpiryNsForTest(), window.earliestNs)
+      << "the pulled-in expiry is a full RTO from the wake, so the frame still "
+         "has that long to be acked before it is retransmitted";
+  EXPECT_EQ(flow_->getNumPendingRetxPackets(), 0u)
+      << "the expiry had not passed, so the wake retransmits nothing";
+  EXPECT_TRUE(retxTimerScheduled())
+      << "the frame is still unacked, so the timer must stay scheduled";
+}
+
+TEST_F(
+    RetxTimerExpiryTest,
+    AnExpirySetUnderALongerRtoMovesInToTheCurrentRtoAtTheWake) {
+  ASSERT_NE(postWqeHelper(&qp, oneFrameSend_), nullptr);
+  ASSERT_TRUE(flow_->getNextPacketToSend())
+      << "precondition: the frame goes out and stays unacked";
+  // The expiry a send set while the RTO was twice what it is now, as when an
+  // ack has since lowered the RTT estimate or cleared the backoff.
+  const uint64_t rtoNs = uint64_t{flow_->computeRtoIntervalUs()} * kNsPerUs;
+  flow_->setRtoExpiryNsForTest(getNowNs64() + 2 * rtoNs);
+
+  const ExpiryWindow window = fireRetxTimerAndBoundOneRto();
+
+  EXPECT_LE(flow_->getRtoExpiryNsForTest(), window.latestNs)
+      << "the wake adopts the RTO in force now, so the frame is not left "
+         "waiting out the longer one its send was given";
+  EXPECT_GE(flow_->getRtoExpiryNsForTest(), window.earliestNs)
+      << "the shorter RTO still runs in full from the wake, so the timer does "
+         "not retransmit before the current estimate allows";
+  EXPECT_EQ(flow_->getNumPendingRetxPackets(), 0u)
+      << "the expiry had not passed, so the wake retransmits nothing";
+  EXPECT_TRUE(retxTimerScheduled())
+      << "the frame is still unacked, so the timer must stay scheduled";
+}
+
+TEST_F(RetxTimerExpiryTest, AnIdleFlowWhoseRtoExpiredStopsItsTimer) {
+  sendAndAckOneFrame(0);
+  expireRto();
+
+  fireRetxTimer();
+
+  EXPECT_FALSE(retxTimerScheduled())
+      << "a flow with nothing unacked has no frame for the timer to return to, "
+         "so its timer must stop rather than wake the timer thread for nothing";
+}
+
+TEST_F(RetxTimerExpiryTest, ASendAfterTheTimerStoppedArmsItAgain) {
+  sendAndAckOneFrame(0);
+  expireRto();
+  fireRetxTimer();
+  ASSERT_FALSE(retxTimerScheduled())
+      << "precondition: the idle flow's timer has stopped";
+
+  ASSERT_NE(postWqeHelper(&qp, oneFrameSend_), nullptr);
+  ASSERT_TRUE(flow_->getNextPacketToSend())
+      << "precondition: the new frame goes out";
+
+  EXPECT_TRUE(retxTimerScheduled())
+      << "the new frame is outstanding and only the timer retransmits it if it "
+         "is lost, so the send must arm the stopped timer";
+}
+
+TEST_F(RetxTimerExpiryTest, AnIdleFlowWhoseRtoHasNotExpiredKeepsItsTimer) {
+  sendAndAckOneFrame(0);
+
+  fireRetxTimer();
+
+  EXPECT_TRUE(retxTimerScheduled())
+      << "an RTO expiry still ahead means a send found the timer running and "
+         "did not arm it, so the timer must stay armed until that expiry";
+}
+
+TEST_F(RetxTimerExpiryTest, ASendArmsAStoppedTimerWhateverTheExpiryReads) {
+  sendAndAckOneFrame(0);
+  expireRto();
+  fireRetxTimer();
+  ASSERT_FALSE(retxTimerScheduled())
+      << "precondition: the idle flow's timer has stopped";
+  moveRtoExpiryAhead();
+
+  ASSERT_NE(postWqeHelper(&qp, oneFrameSend_), nullptr);
+  ASSERT_TRUE(flow_->getNextPacketToSend())
+      << "precondition: the new frame goes out";
+
+  EXPECT_TRUE(retxTimerScheduled())
+      << "the timer stopped, so the send must arm it however the expiry reads, "
+         "or the new frame has no timer to retransmit it if it is lost";
 }
 
 /*

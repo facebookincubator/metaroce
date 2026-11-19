@@ -144,8 +144,8 @@ TxFlow::TxFlow(
       minRtoNs_{uint64_t{FLAGS_libsoftmetaroce_min_rto_us} * kNsPerUs},
       maxRtoNs_{resolveMaxRtoNs(kDefaultMaxRtoNs)},
       rhoNs_{FLAGS_libsoftmetaroce_rto_rho_us * kNsPerUs} {
-  retxTimerCallback_ = std::make_unique<HighResTimer::Callback>(
-      [this]() { onRetransmissionTimeout(); });
+  retxTimerCallback_ =
+      std::make_unique<HighResTimer::Callback>([this]() { onRtoWake(); });
   txState_.estRttNs = FLAGS_libsoftmetaroce_initial_est_rtt_us * kNsPerUs;
   txState_.mdevRttNs = FLAGS_libsoftmetaroce_initial_mdev_rtt_us * kNsPerUs;
   // Slow-receiver mode supplies a prior, so an operator who set a mdev wins.
@@ -175,6 +175,8 @@ TxFlow::TxFlow(TxFlow&& other) noexcept
       rhoNs_{other.rhoNs_},
       txState_{std::move(other.txState_)},
       consecutiveRtosWithoutAck_{other.consecutiveRtosWithoutAck_.load()},
+      rtoExpiryNs_{other.rtoExpiryNs_},
+      retxTimerRunning_{false},
       lastConsumedRtoCount_{other.lastConsumedRtoCount_} {
   other.qpRetxTimer_ = nullptr;
 }
@@ -206,7 +208,7 @@ uint32_t TxFlow::computeRtoIntervalUs() const {
   return rtoNs / kNsPerUs;
 }
 
-void TxFlow::onRetransmissionTimeout() {
+void TxFlow::onRtoWake() {
   if (qp_.isTearingDown()) {
     return;
   }
@@ -216,52 +218,60 @@ void TxFlow::onRetransmissionTimeout() {
     return;
   }
 
-  // If we can still send new data (CC window available, not HRNR blocked,
-  // and have WQEs ready), skip retransmission and just signal to send.
-  // This avoids wasteful retransmission when we simply haven't had CPU
-  // time to send due to other transmissions or local contention.
-  if (qp_.getHrnrState() != HrnrState::HRNR_PROBING &&
-      qp_.getHrnrState() != HrnrState::HRNR_BLOCKED_TX &&
-      qp_.congestionController_ &&
-      qp_.congestionController_->getAvailableWindowSize(flowId_) > 0 &&
-      static_cast<uint16_t>(txState_.sndNxt - txState_.sndUna) <
-          kRtoSkipWindowThreshold) {
-    if (auto wqeAndTag = qp_.tagSet_.findNextWqe(false /* intendToSend */)) {
-      auto rtoUs = computeRtoIntervalUs();
-      // Release the tag semaphore acquired by findNextWqe().
-      wqeAndTag->second->markFree();
-      // The QP may be out of the ready set (see handleFaultOnEgress), and a
-      // dropped signal for an unsent WQE with no frame outstanding behind it
-      // leaves no other path to retry it.
-      setRetransmissionTimer();
-      LOG_FIRST_N(INFO, 20)
-          << "RetxTimer expired (rto=" << rtoUs << "us) for qp "
-          << qp_.getLocalQpNum() << " flow " << flowId_
-          << " but can still send (window="
-          << qp_.congestionController_->getAvailableWindowSize(flowId_)
-          << "); rescheduling";
-      qp_.signalReadyAsync();
+  {
+    // sndUna, sndNxt, rtoExpiryNs_, retxTimerRunning_ and
+    // consecutiveRtosWithoutAck_ change only under sndCur.
+    auto lockedSndCur = txState_.sndCur.wlock();
+    // A send moved the expiry later after this wake was scheduled.
+    if (!rtoExpired(lockedSndCur)) {
+      scheduleRtoWake(lockedSndCur);
       return;
     }
-  }
 
-  bool watchdogExpired;
-  {
-    // Keep the outstanding check and count increment ordered with ACK resets.
-    auto lockedSndCur = txState_.sndCur.rlock();
+    // If we can still send new data (CC window available, not HRNR blocked,
+    // and have WQEs ready), skip retransmission and just signal to send.
+    // This avoids wasteful retransmission when we simply haven't had CPU
+    // time to send due to other transmissions or local contention.
+    if (qp_.getHrnrState() != HrnrState::HRNR_PROBING &&
+        qp_.getHrnrState() != HrnrState::HRNR_BLOCKED_TX &&
+        qp_.congestionController_ &&
+        qp_.congestionController_->getAvailableWindowSize(flowId_) > 0 &&
+        static_cast<uint16_t>(txState_.sndNxt - txState_.sndUna) <
+            kRtoSkipWindowThreshold) {
+      if (auto wqeAndTag = qp_.tagSet_.findNextWqe(false /* intendToSend */)) {
+        auto rtoUs = computeRtoIntervalUs();
+        // Release the tag semaphore acquired by findNextWqe().
+        wqeAndTag->second->markFree();
+        // The QP may be out of the ready set (see handleFaultOnEgress), and a
+        // dropped signal for an unsent WQE with no frame outstanding behind it
+        // leaves no other path to retry it.
+        resetRtoExpiry(lockedSndCur);
+        scheduleRtoWake(lockedSndCur);
+        lockedSndCur.unlock();
+        LOG_FIRST_N(INFO, 20)
+            << "RetxTimer expired (rto=" << rtoUs << "us) for qp "
+            << qp_.getLocalQpNum() << " flow " << flowId_
+            << " but can still send (window="
+            << qp_.congestionController_->getAvailableWindowSize(flowId_)
+            << "); rescheduling";
+        qp_.signalReadyAsync();
+        return;
+      }
+    }
+
     if (txState_.sndUna == txState_.sndNxt) {
+      retxTimerRunning_ = false;
       return;
     }
     // The first RTO retransmits; only a later one may fail the work.
-    watchdogExpired =
-        consecutiveRtosWithoutAck_ > 0 && qp_.hasWatchdogExpired();
-    if (!watchdogExpired) {
-      ++consecutiveRtosWithoutAck_;
+    const bool retransmissionWentUnacked = consecutiveRtosWithoutAck_ > 0;
+    if (retransmissionWentUnacked && qp_.hasWatchdogExpired()) {
+      retxTimerRunning_ = false;
+      lockedSndCur.unlock();
+      qp_.processWatchdogExpiryAsync();
+      return;
     }
-  }
-  if (watchdogExpired) {
-    qp_.processWatchdogExpiryAsync();
-    return;
+    ++consecutiveRtosWithoutAck_;
   }
 
   VLOG(2) << "RetxTimer expired for qp: " << qp_.getLocalQpNum()
@@ -269,24 +279,59 @@ void TxFlow::onRetransmissionTimeout() {
           << " una: " << txState_.sndUna << " nxt: " << txState_.sndNxt;
   prepareRetxPacketsIfAny(true /*isRtoEvent*/);
 
-  // Frames are still outstanding while sndUna trails sndNxt, and this timer
-  // is the only thing that returns to them. Locked because reading the pair
-  // unlocked could catch them equal mid-update and stop the timer for good.
-  auto lockedSndCur = txState_.sndCur.rlock();
+  auto lockedSndCur = txState_.sndCur.wlock();
   if (txState_.sndUna != txState_.sndNxt) {
-    setRetransmissionTimer();
-  }
-}
-
-void TxFlow::setRetransmissionTimer() {
-  if (qp_.isTearingDown()) {
+    resetRtoExpiry(lockedSndCur);
+  } else if (rtoExpired(lockedSndCur)) {
+    retxTimerRunning_ = false;
     return;
   }
-  if (qpRetxTimer_ && retxTimerCallback_) {
-    qpRetxTimer_->scheduleTimeout(
-        std::chrono::microseconds(computeRtoIntervalUs()),
-        retxTimerCallback_.get());
+  scheduleRtoWake(lockedSndCur);
+}
+
+void TxFlow::restartRetransmissionTimerForTest() {
+  auto lockedSndCur = txState_.sndCur.wlock();
+  resetRtoExpiry(lockedSndCur);
+  scheduleRtoWake(lockedSndCur);
+}
+
+void TxFlow::setRtoExpiryNsForTest(uint64_t expiryNs) {
+  auto lockedSndCur = txState_.sndCur.wlock();
+  rtoExpiryNs_ = expiryNs;
+}
+
+uint64_t TxFlow::getRtoExpiryNsForTest() const {
+  auto lockedSndCur = txState_.sndCur.rlock();
+  return rtoExpiryNs_;
+}
+
+uint64_t TxFlow::rtoExpiryFrom(uint64_t nowNs) const {
+  return nowNs + uint64_t{computeRtoIntervalUs()} * kNsPerUs;
+}
+
+void TxFlow::resetRtoExpiry(const SndCurWriteLock& /*sndCurHeld*/) {
+  rtoExpiryNs_ = rtoExpiryFrom(getNowNs64());
+}
+
+bool TxFlow::rtoExpired(const SndCurWriteLock& /*sndCurHeld*/) const {
+  return getNowNs64() >= rtoExpiryNs_;
+}
+
+void TxFlow::scheduleRtoWake(const SndCurWriteLock& /*sndCurHeld*/) {
+  if (qp_.isTearingDown() || !qpRetxTimer_ || !retxTimerCallback_) {
+    retxTimerRunning_ = false;
+    return;
   }
+  retxTimerRunning_ = true;
+  const uint64_t nowNs = getNowNs64();
+  // A protocol clock step back, or an ACK that shrank the RTO, can leave the
+  // expiry more than one RTO ahead.
+  rtoExpiryNs_ = std::min(rtoExpiryNs_, rtoExpiryFrom(nowNs));
+  const uint64_t untilExpiryUs = rtoExpiryNs_ > nowNs
+      ? (rtoExpiryNs_ - nowNs + kNsPerUs - 1) / kNsPerUs
+      : 0;
+  qpRetxTimer_->scheduleTimeout(
+      std::chrono::microseconds(untilExpiryUs), retxTimerCallback_.get());
 }
 
 void TxFlow::destroyRetransmissionTimer() {
@@ -317,7 +362,8 @@ std::unique_ptr<DataPacket> TxFlow::popQueuedRetxPacket() {
   return retxPacket;
 }
 
-std::unique_ptr<struct EgressPacket> TxFlow::tryGetRetransmissionPacket() {
+std::unique_ptr<struct EgressPacket> TxFlow::tryGetRetransmissionPacket(
+    const SndCurWriteLock& sndCurHeld) {
   // Popped before the tag is taken: the queueing path owns a tag and then
   // takes this deque, so taking them the other way round here would deadlock.
   for (auto retxPacket = popQueuedRetxPacket(); retxPacket != nullptr;
@@ -349,13 +395,13 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetRetransmissionPacket() {
       VLOG(2) << "Dropping queued retx packet for qp: " << qp_.getLocalQpNum()
               << " fsn: " << fsn
               << " whose work request has no posn left to send";
-      // The frame stays outstanding, and the scan that abandons it runs from
-      // this timer; no other path arms it once we stop sending.
-      setRetransmissionTimer();
+      // The frame stays outstanding, and the scan that abandons it runs when
+      // the RTO expires.
+      resetRtoExpiry(sndCurHeld);
       continue;
     }
 
-    setRetransmissionTimer();
+    resetRtoExpiry(sndCurHeld);
     retxPacket->getDataHeader().setTimestamp(getNowNs());
     VLOG(1) << "Sending retx packet for qp: " << qp_.getLocalQpNum()
             << " fsn: " << retxPacket->getDataHeader().getFsn()
@@ -448,10 +494,10 @@ std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSend() {
   maybeFailoverRemotePort();
 
   // sndCur is held across the attempt so the tracker can be consulted, in the
-  // sndCur->retx order the queueing code uses; released before the write lock.
+  // sndCur->retx order the queueing code uses.
   {
-    auto lockedSndCur = txState_.sndCur.rlock();
-    if (auto retxPacket = tryGetRetransmissionPacket()) {
+    auto lockedSndCur = txState_.sndCur.wlock();
+    if (auto retxPacket = tryGetRetransmissionPacket(lockedSndCur)) {
       return retxPacket;
     }
   }
@@ -489,7 +535,7 @@ bool TxFlow::hasUnackedData() const {
 std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSendFromWqe(
     Wqe& wqe,
     uint8_t tagNum,
-    const SndCurWriteLock& /*sndCurHeld*/) {
+    const SndCurWriteLock& sndCurHeld) {
   auto posn = wqe.allocateNextPosn();
   qp_.tagSet_.decrementUnsentPosns();
   const uint32_t sendPayloadSize = wqe.canHaveSendPayload()
@@ -507,7 +553,10 @@ std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSendFromWqe(
   txState_.tracker.push_back(
       {PacketId(&wqe, tagNum, posn, sendPayloadSize), FsnState::UNACKED});
 
-  setRetransmissionTimer();
+  resetRtoExpiry(sndCurHeld);
+  if (!retxTimerRunning_) {
+    scheduleRtoWake(sndCurHeld);
+  }
 
   uint32_t qwndAfterSend = 0;
   if (qp_.congestionController_) {
@@ -588,7 +637,7 @@ void TxFlow::processNakFlowIdError() {
   // Release all posns for frames that have been sent
   // Note: signalReadyAsync() must be called OUTSIDE the sndCur lock to avoid
   // deadlock with the arbiter which holds arbiterMutex_ while calling
-  // getNextPacketToSend() which acquires sndCur.rlock().
+  // getNextPacketToSend() which acquires sndCur.
   int numReleasedForRetry = 0;
   std::bitset<kMetaRoceTagCount> tagsWithAbandonedFrames;
   {

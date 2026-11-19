@@ -600,7 +600,7 @@ TEST_P(RtoRepathTest, TimeoutPublishesWorkOnlyWithOutstandingFrames) {
   const auto original = route(*flow);
   const auto creationsBefore = socketCreations;
   for (int i = 0; i < 3; ++i) {
-    flow->setRetransmissionTimer();
+    flow->restartRetransmissionTimerForTest();
     ASSERT_TRUE(advanceTimeouts(1))
         << "the owned marker must park after the explicitly armed idle callback returns";
     EXPECT_EQ(flow->getNumPendingRetxPackets(), 0u)
