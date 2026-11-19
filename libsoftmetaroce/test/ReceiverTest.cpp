@@ -606,7 +606,6 @@ class ReceiverTest : public ::testing::Test {
     postToTag(*tag, std::move(rwqe), qp->getMtu());
   }
 
-  // Parses a reply's status; the single place that reads it off the wire.
   static AckStatus replyStatus(const std::unique_ptr<folly::IOBuf>& buf) {
     folly::io::Cursor cursor(buf.get());
     BaseHeader baseHeader(cursor);
@@ -614,19 +613,16 @@ class ReceiverTest : public ::testing::Test {
     return ackHeader.getAckStatus();
   }
 
-  // Header routing fields are validated by SendNakAddressError;
-  // this helper checks only the reply status.
-  void expectReplyStatus(AckStatus expected) {
+  void expectReplyStatus(AckStatus expected, std::string reason) {
     EXPECT_CALL(*mockSocket_, write(_, _))
-        .WillOnce([expected](
+        .WillOnce([expected, reason = std::move(reason)](
                       const folly::SocketAddress&,
                       const std::unique_ptr<folly::IOBuf>& buf) {
-          EXPECT_EQ(replyStatus(buf), expected);
+          EXPECT_EQ(replyStatus(buf), expected) << reason;
           return buf->computeChainDataLength();
         });
   }
 
-  // Appends the status of each reply the receiver writes to its socket.
   void recordReplyStatuses(std::vector<AckStatus>& statuses) {
     EXPECT_CALL(*mockSocket_, write(_, _))
         .Times(AnyNumber())
@@ -942,7 +938,9 @@ TEST_F(ReceiverTest, AReadOfARegionWithoutRemoteReadGetsAnAddressNak) {
       nullptr, region, kSize, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   ASSERT_NE(mr, nullptr);
 
-  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
+  expectReplyStatus(
+      AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR,
+      "a read of a region without remote read access must be refused");
   mockReceiver_->simulateReceivePacket(
       buildTestReadRequestPacket(
           srcQp,
@@ -1047,8 +1045,9 @@ TEST_F(ReceiverTest, ValidationFailureLeavesTheTrackedSendWqeAlive) {
       Flow::FsnState::UNACKED);
   txState.sndNxt = txState.sndUna + 1;
 
-  // A write arrives for a memory region that does not exist.
-  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
+  expectReplyStatus(
+      AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR,
+      "a write targeting an unregistered memory region must be refused");
   mockReceiver_->simulateReceivePacket(
       buildTestWritePacket(
           srcQp,
@@ -1116,8 +1115,9 @@ TEST_F(ReceiverTest, AnRtoBeforeTheSendersVisitAbandonsTheErroredTagsFrame) {
   txState.sndNxt = txState.sndUna + 1;
   const uint16_t sndUnaBefore = txState.sndUna;
 
-  // A write arrives for a memory region that does not exist.
-  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
+  expectReplyStatus(
+      AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR,
+      "a write targeting an unregistered memory region must be refused");
   mockReceiver_->simulateReceivePacket(
       buildTestWritePacket(
           srcQp,
@@ -1208,7 +1208,9 @@ TEST_F(ReceiverTest, AWriteThenWriteWithImmediateOnOneMsnIsRejected) {
          "running for the second packet to be what fails it";
 
   // The second packet claims the same message is a write with immediate.
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "one message cannot be both a plain write and a write with immediate");
   mockReceiver_->simulateReceivePacket(
       buildTestWritePacket(
           srcQp,
@@ -1262,7 +1264,9 @@ TEST_F(ReceiverTest, SendNakAddressErrorForWritePosnOutOfRange) {
       payload.data(),
       kMessageLength);
 
-  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
+  expectReplyStatus(
+      AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR,
+      "a write past the end of the registered region must be refused");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1287,7 +1291,10 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForSendPosnOutOfRange) {
   auto dataPacket = buildTestDataPacket(
       srcQp, dstQp, flowId, fsn, msn, /*tag=*/0, kOutOfRangePosn);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "a send posn that starts beyond the posted receive buffer must be "
+      "rejected");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1326,7 +1333,9 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForOversizedSendPayload) {
       payload,
       kPayloadSize);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "a send larger than the posted receive buffer must be rejected");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1387,7 +1396,10 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForUndersizedLastPosnPayload) {
       posn1Payload,
       kUndersizedPayload);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "a plain SEND carries no end-of-message marker, so its last posn must "
+      "fill the rest of the posted receive buffer");
   mockReceiver_->simulateReceivePacket(std::move(posn1Packet), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1677,7 +1689,9 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForMisalignedAtomic) {
   auto dataPacket = buildTestAtomicPacket(
       srcQp, dstQp, flowId, fsn, msn, kMisalignedAddr, kAnyRkey);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "an atomic must target an 8-byte-aligned address (spec 5.5)");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1696,7 +1710,9 @@ TEST_F(ReceiverTest, SendNakAddressErrorForAtomicBadRkey) {
   auto dataPacket = buildTestAtomicPacket(
       srcQp, dstQp, flowId, fsn, msn, kAlignedAddr, kBadRkey);
 
-  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
+  expectReplyStatus(
+      AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR,
+      "an atomic whose rkey matches no registered region must be refused");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1721,7 +1737,9 @@ TEST_F(ReceiverTest, SendNakAddressErrorForAtomicOnRegionWithoutRemoteAtomic) {
   auto dataPacket = buildTestAtomicPacket(
       srcQp, dstQp, flowId, fsn, msn, (uint64_t)regionBuffer, mr->rkey);
 
-  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
+  expectReplyStatus(
+      AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR,
+      "an atomic on a region without remote atomic access must be refused");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -2231,7 +2249,9 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForAtomicNonzeroPosn) {
       BaseHeader::Opcode::OperationType::ATOMIC_FETCH_ADD,
       /*posn=*/1);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "an atomic occupies a single posn, so a nonzero posn is malformed");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -2246,7 +2266,9 @@ TEST_F(ReceiverTest, RejectDataForQpInErrorState) {
   qpNumToQp_.rlock()->at(dstQp)->setIbvQpState(IBV_QPS_ERR);
   auto dataPacket = buildTestDataPacket(srcQp, dstQp, flowId, fsn, msn);
 
-  expectReplyStatus(AckStatus::NAK_OPERATIONAL_ERROR);
+  expectReplyStatus(
+      AckStatus::NAK_OPERATIONAL_ERROR,
+      "a queue pair in the error state cannot accept data");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 }
 
@@ -2389,7 +2411,9 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForZeroPayloadWrite) {
       nullptr,
       0);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "spec 8.2.3 forbids a zero-byte plain write");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -2406,7 +2430,9 @@ TEST_F(ReceiverTest, ASendOnASkippedCsnFailsTheTag) {
   postReceiveWqe(recvBuffer, kRecvBufferSize);
 
   std::array<char, kRecvBufferSize> payload{};
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "a send on a csn two past the one the sequence expects must be rejected");
   mockReceiver_->simulateReceivePacket(
       buildTestDataPacket(
           srcQp,
@@ -2512,7 +2538,9 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForZeroPayloadWriteImm) {
       0,
       BaseHeader::Opcode::OperationType::WRITE_IMM);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "spec 8.2.3 forbids a zero-byte WRITE_IMM");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -2555,7 +2583,9 @@ TEST_F(ReceiverTest, ZeroPayloadWriteImmDrawsNoSharedReceive) {
       0,
       BaseHeader::Opcode::OperationType::WRITE_IMM);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "spec 8.2.3 forbids a zero-byte WRITE_IMM");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(sharedQueue.getNumPosted(), 1u)
@@ -3432,7 +3462,10 @@ TEST_F(ReceiverTest, PaddingInferenceRequiresZeroPaddingField) {
       std::nullopt,
       kPadding);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "padding inference requires a zero Padding field, so the payload beyond "
+      "the disclosed padding is a length error");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -3466,7 +3499,9 @@ TEST_F(ReceiverTest, RejectPaddedNonLastPosnPacket) {
       payload,
       kBadPayloadSize);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "a posn before the message's last must carry exactly one MTU");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -3500,7 +3535,9 @@ TEST_F(ReceiverTest, RejectExcessivePaddingOnLastPosn) {
       payload,
       kExcessPaddedPayloadSize);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "padding may extend the last posn only to the next 4-byte boundary");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -3532,7 +3569,9 @@ TEST_F(ReceiverTest, RejectNonAlignedPaddingOnLastPosn) {
       payload,
       kNonAlignedPayloadSize);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "a padded last posn must end on a 4-byte boundary");
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -4035,7 +4074,10 @@ TEST_F(ReceiverTest, HrnrCancelOnBringUpEndToEnd) {
   auto dataPacket =
       buildTestDataPacket(srcQp, noFlowsQpn, /*flowId=*/0, fsn, msn);
 
-  expectReplyStatus(AckStatus::HRNR);
+  expectReplyStatus(
+      AckStatus::HRNR,
+      "a queue pair that has not completed receive setup is not ready yet, "
+      "which the sender can recover from");
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
@@ -4314,7 +4356,10 @@ TEST_F(ReceiverTest, DataAfterSetupWithErroredTagGetsOperationalErrorNak) {
       << "an error reached after setup completes must leave receive setup "
          "complete, so the receiver still answers with an error NAK";
 
-  expectReplyStatus(AckStatus::NAK_OPERATIONAL_ERROR);
+  expectReplyStatus(
+      AckStatus::NAK_OPERATIONAL_ERROR,
+      "the queue pair entered the error state after completing receive setup, "
+      "and that error is terminal rather than not-ready");
   mockReceiver_->simulateReceivePacket(
       buildTestDataPacket(srcQp, errQpn, /*flowId=*/0, fsn, msn), kEcnECT0);
   EXPECT_TRUE(qpRawPtr->hasCompletedReceiveSetup())
@@ -4638,7 +4683,9 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForUnsupportedOpcode) {
       /*tag=*/0,
       BaseHeader::Opcode::OperationType::ATOMIC_RESERVED_0);
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "ATOMIC_RESERVED_0 is a defined opcode the responder does not implement");
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
@@ -4688,7 +4735,9 @@ TEST_F(ReceiverTest, SendNakAndErrorQpForUndefinedOpcode) {
       /*tag=*/0,
       static_cast<BaseHeader::Opcode::OperationType>(0b00011));
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "the responder must reject an undefined opcode");
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
@@ -4711,7 +4760,10 @@ TEST_F(ReceiverTest, NakButNoErrorForUnsupportedOpcodeWithUnknownTag) {
       /*tag=*/5,
       static_cast<BaseHeader::Opcode::OperationType>(0b00011));
 
-  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
+  expectReplyStatus(
+      AckStatus::NAK_INVALID_REQUEST,
+      "the responder must reject an undefined opcode even when its tag is not "
+      "on the queue pair");
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
