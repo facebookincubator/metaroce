@@ -606,46 +606,34 @@ class ReceiverTest : public ::testing::Test {
     postToTag(*tag, std::move(rwqe), qp->getMtu());
   }
 
+  // Parses a reply's status; the single place that reads it off the wire.
+  static AckStatus replyStatus(const std::unique_ptr<folly::IOBuf>& buf) {
+    folly::io::Cursor cursor(buf.get());
+    BaseHeader baseHeader(cursor);
+    AckHeader ackHeader(cursor);
+    return ackHeader.getAckStatus();
+  }
+
   // Header routing fields are validated by SendNakAddressError;
-  // this helper checks only the NAK status.
-  void expectNakAddressError() {
+  // this helper checks only the reply status.
+  void expectReplyStatus(AckStatus expected) {
     EXPECT_CALL(*mockSocket_, write(_, _))
-        .WillOnce([](const folly::SocketAddress&,
-                     const std::unique_ptr<folly::IOBuf>& buf) {
-          folly::io::Cursor cursor(buf.get());
-          BaseHeader baseHeader(cursor);
-          AckHeader ackHeader(cursor);
-          EXPECT_EQ(
-              ackHeader.getAckStatus(),
-              AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
-              << "address violation should produce NAK_ADDRESS_INVALID_ACCESS_ERROR";
+        .WillOnce([expected](
+                      const folly::SocketAddress&,
+                      const std::unique_ptr<folly::IOBuf>& buf) {
+          EXPECT_EQ(replyStatus(buf), expected);
           return buf->computeChainDataLength();
         });
   }
 
-  void expectNakInvalidRequest() {
+  // Appends the status of each reply the receiver writes to its socket.
+  void recordReplyStatuses(std::vector<AckStatus>& statuses) {
     EXPECT_CALL(*mockSocket_, write(_, _))
-        .WillOnce([](const folly::SocketAddress&,
-                     const std::unique_ptr<folly::IOBuf>& buf) {
-          folly::io::Cursor cursor(buf.get());
-          BaseHeader baseHeader(cursor);
-          AckHeader ackHeader(cursor);
-          EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::NAK_INVALID_REQUEST)
-              << "length violation should produce NAK_INVALID_REQUEST per spec 5.5";
-          return buf->computeChainDataLength();
-        });
-  }
-
-  void expectNakOperationalError() {
-    EXPECT_CALL(*mockSocket_, write(_, _))
-        .WillOnce([](const folly::SocketAddress&,
-                     const std::unique_ptr<folly::IOBuf>& buf) {
-          folly::io::Cursor cursor(buf.get());
-          BaseHeader baseHeader(cursor);
-          AckHeader ackHeader(cursor);
-          EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::NAK_OPERATIONAL_ERROR)
-              << "a request the responder cannot serve should produce "
-                 "NAK_OPERATIONAL_ERROR";
+        .Times(AnyNumber())
+        .WillRepeatedly([&statuses](
+                            const folly::SocketAddress&,
+                            const std::unique_ptr<folly::IOBuf>& buf) {
+          statuses.push_back(replyStatus(buf));
           return buf->computeChainDataLength();
         });
   }
@@ -773,12 +761,10 @@ TEST_F(ReceiverTest, DataArrivingDuringSetupFlowsSendsHrnrNotFlowIdNak) {
   EXPECT_CALL(*mockSocket_, write(_, _))
       .WillRepeatedly([&](const folly::SocketAddress&,
                           const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-        if (ackHeader.getAckStatus() == AckStatus::HRNR) {
+        const AckStatus status = replyStatus(buf);
+        if (status == AckStatus::HRNR) {
           hrnrCount.fetch_add(1, std::memory_order_relaxed);
-        } else if (ackHeader.getAckStatus() == AckStatus::NAK_FLOW_ID_ERROR) {
+        } else if (status == AckStatus::NAK_FLOW_ID_ERROR) {
           flowIdNakCount.fetch_add(1, std::memory_order_relaxed);
         }
         return buf->computeChainDataLength();
@@ -956,7 +942,7 @@ TEST_F(ReceiverTest, AReadOfARegionWithoutRemoteReadGetsAnAddressNak) {
       nullptr, region, kSize, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
   ASSERT_NE(mr, nullptr);
 
-  expectNakAddressError();
+  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
   mockReceiver_->simulateReceivePacket(
       buildTestReadRequestPacket(
           srcQp,
@@ -1062,7 +1048,7 @@ TEST_F(ReceiverTest, ValidationFailureLeavesTheTrackedSendWqeAlive) {
   txState.sndNxt = txState.sndUna + 1;
 
   // A write arrives for a memory region that does not exist.
-  expectNakAddressError();
+  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
   mockReceiver_->simulateReceivePacket(
       buildTestWritePacket(
           srcQp,
@@ -1131,7 +1117,7 @@ TEST_F(ReceiverTest, AnRtoBeforeTheSendersVisitAbandonsTheErroredTagsFrame) {
   const uint16_t sndUnaBefore = txState.sndUna;
 
   // A write arrives for a memory region that does not exist.
-  expectNakAddressError();
+  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
   mockReceiver_->simulateReceivePacket(
       buildTestWritePacket(
           srcQp,
@@ -1222,7 +1208,7 @@ TEST_F(ReceiverTest, AWriteThenWriteWithImmediateOnOneMsnIsRejected) {
          "running for the second packet to be what fails it";
 
   // The second packet claims the same message is a write with immediate.
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(
       buildTestWritePacket(
           srcQp,
@@ -1276,7 +1262,7 @@ TEST_F(ReceiverTest, SendNakAddressErrorForWritePosnOutOfRange) {
       payload.data(),
       kMessageLength);
 
-  expectNakAddressError();
+  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1301,7 +1287,7 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForSendPosnOutOfRange) {
   auto dataPacket = buildTestDataPacket(
       srcQp, dstQp, flowId, fsn, msn, /*tag=*/0, kOutOfRangePosn);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1340,7 +1326,7 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForOversizedSendPayload) {
       payload,
       kPayloadSize);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1401,7 +1387,7 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForUndersizedLastPosnPayload) {
       posn1Payload,
       kUndersizedPayload);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(posn1Packet), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1691,7 +1677,7 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForMisalignedAtomic) {
   auto dataPacket = buildTestAtomicPacket(
       srcQp, dstQp, flowId, fsn, msn, kMisalignedAddr, kAnyRkey);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1710,7 +1696,7 @@ TEST_F(ReceiverTest, SendNakAddressErrorForAtomicBadRkey) {
   auto dataPacket = buildTestAtomicPacket(
       srcQp, dstQp, flowId, fsn, msn, kAlignedAddr, kBadRkey);
 
-  expectNakAddressError();
+  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -1735,7 +1721,7 @@ TEST_F(ReceiverTest, SendNakAddressErrorForAtomicOnRegionWithoutRemoteAtomic) {
   auto dataPacket = buildTestAtomicPacket(
       srcQp, dstQp, flowId, fsn, msn, (uint64_t)regionBuffer, mr->rkey);
 
-  expectNakAddressError();
+  expectReplyStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -2245,7 +2231,7 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForAtomicNonzeroPosn) {
       BaseHeader::Opcode::OperationType::ATOMIC_FETCH_ADD,
       /*posn=*/1);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -2260,24 +2246,14 @@ TEST_F(ReceiverTest, RejectDataForQpInErrorState) {
   qpNumToQp_.rlock()->at(dstQp)->setIbvQpState(IBV_QPS_ERR);
   auto dataPacket = buildTestDataPacket(srcQp, dstQp, flowId, fsn, msn);
 
-  expectNakOperationalError();
+  expectReplyStatus(AckStatus::NAK_OPERATIONAL_ERROR);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 }
 
 TEST_F(ReceiverTest, AQpInErrorStateSendsOneNakPerInterval) {
   qpNumToQp_.rlock()->at(dstQp)->setIbvQpState(IBV_QPS_ERR);
   std::vector<AckStatus> replies;
-  EXPECT_CALL(*mockSocket_, write(_, _))
-      .Times(AnyNumber())
-      .WillRepeatedly([&replies](
-                          const folly::SocketAddress&,
-                          const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-        replies.push_back(ackHeader.getAckStatus());
-        return buf->computeChainDataLength();
-      });
+  recordReplyStatuses(replies);
 
   mockReceiver_->simulateReceivePacket(
       buildTestDataPacket(srcQp, dstQp, flowId, fsn, msn), kEcnECT0);
@@ -2312,17 +2288,7 @@ TEST_F(ReceiverTest, AnAlreadyAckedFrameIsReackedAfterItsTagEntersError) {
   postReceiveWqe(/*buffer=*/nullptr, /*bufferSize=*/0);
 
   std::vector<AckStatus> replies;
-  EXPECT_CALL(*mockSocket_, write(_, _))
-      .Times(AnyNumber())
-      .WillRepeatedly([&replies](
-                          const folly::SocketAddress&,
-                          const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-        replies.push_back(ackHeader.getAckStatus());
-        return buf->computeChainDataLength();
-      });
+  recordReplyStatuses(replies);
 
   mockReceiver_->simulateReceivePacket(
       buildTestDataPacket(srcQp, dstQp, flowId, fsn, msn), kEcnECT0);
@@ -2423,7 +2389,7 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForZeroPayloadWrite) {
       nullptr,
       0);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -2440,7 +2406,7 @@ TEST_F(ReceiverTest, ASendOnASkippedCsnFailsTheTag) {
   postReceiveWqe(recvBuffer, kRecvBufferSize);
 
   std::array<char, kRecvBufferSize> payload{};
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(
       buildTestDataPacket(
           srcQp,
@@ -2546,7 +2512,7 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForZeroPayloadWriteImm) {
       0,
       BaseHeader::Opcode::OperationType::WRITE_IMM);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -2589,7 +2555,7 @@ TEST_F(ReceiverTest, ZeroPayloadWriteImmDrawsNoSharedReceive) {
       0,
       BaseHeader::Opcode::OperationType::WRITE_IMM);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(sharedQueue.getNumPosted(), 1u)
@@ -3466,7 +3432,7 @@ TEST_F(ReceiverTest, PaddingInferenceRequiresZeroPaddingField) {
       std::nullopt,
       kPadding);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -3500,7 +3466,7 @@ TEST_F(ReceiverTest, RejectPaddedNonLastPosnPacket) {
       payload,
       kBadPayloadSize);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -3534,7 +3500,7 @@ TEST_F(ReceiverTest, RejectExcessivePaddingOnLastPosn) {
       payload,
       kExcessPaddedPayloadSize);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -3566,7 +3532,7 @@ TEST_F(ReceiverTest, RejectNonAlignedPaddingOnLastPosn) {
       payload,
       kNonAlignedPayloadSize);
 
-  expectNakInvalidRequest();
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
   EXPECT_EQ(ibvQpStorage.state, IBV_QPS_ERR)
@@ -4069,16 +4035,7 @@ TEST_F(ReceiverTest, HrnrCancelOnBringUpEndToEnd) {
   auto dataPacket =
       buildTestDataPacket(srcQp, noFlowsQpn, /*flowId=*/0, fsn, msn);
 
-  EXPECT_CALL(*mockSocket_, write(_, _))
-      .WillOnce([](const folly::SocketAddress&,
-                   const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-        EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::HRNR)
-            << "data arriving before the flows exist must get an HRNR";
-        return buf->computeChainDataLength();
-      });
+  expectReplyStatus(AckStatus::HRNR);
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
@@ -4183,22 +4140,15 @@ TEST_F(ReceiverTest, HrnrAfterSetupFlowsBeforeRtrIsCancelledOnBringUp) {
       << "no RNR cancel is pending before any HRNR is sent, so setup "
          "alone must schedule none";
 
-  EXPECT_CALL(*mockSocket_, write(_, _))
-      .Times(3)
-      .WillRepeatedly([](const folly::SocketAddress&,
-                         const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-        EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::HRNR)
-            << "every packet arriving before RTR must get an HRNR";
-        return buf->computeChainDataLength();
-      });
+  std::vector<AckStatus> replies;
+  recordReplyStatuses(replies);
   for (int i = 0; i < 3; ++i) {
     SCOPED_TRACE(i);
     mockReceiver_->simulateReceivePacket(
         buildTestDataPacket(srcQp, raceQpn, /*flowId=*/0, fsn, msn), kEcnECT0);
   }
+  EXPECT_EQ(replies, std::vector<AckStatus>(3, AckStatus::HRNR))
+      << "every packet arriving before RTR must get an HRNR";
   EXPECT_EQ(qpRawPtr->getNextPacketToSend(), nullptr)
       << "the cancel must wait for RTR publication, not be sent while the "
          "QP is still in INIT";
@@ -4293,10 +4243,7 @@ TEST_F(ReceiverTest, DataBeforeSetupWithErroredTagGetsHrnr) {
   EXPECT_CALL(*mockSocket_, write(_, _))
       .WillRepeatedly([&](const folly::SocketAddress&,
                           const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-        if (ackHeader.getAckStatus() == AckStatus::HRNR) {
+        if (replyStatus(buf) == AckStatus::HRNR) {
           hrnrCount.fetch_add(1, std::memory_order_relaxed);
         } else {
           otherCount.fetch_add(1, std::memory_order_relaxed);
@@ -4367,7 +4314,7 @@ TEST_F(ReceiverTest, DataAfterSetupWithErroredTagGetsOperationalErrorNak) {
       << "an error reached after setup completes must leave receive setup "
          "complete, so the receiver still answers with an error NAK";
 
-  expectNakOperationalError();
+  expectReplyStatus(AckStatus::NAK_OPERATIONAL_ERROR);
   mockReceiver_->simulateReceivePacket(
       buildTestDataPacket(srcQp, errQpn, /*flowId=*/0, fsn, msn), kEcnECT0);
   EXPECT_TRUE(qpRawPtr->hasCompletedReceiveSetup())
@@ -4691,18 +4638,7 @@ TEST_F(ReceiverTest, SendNakInvalidRequestForUnsupportedOpcode) {
       /*tag=*/0,
       BaseHeader::Opcode::OperationType::ATOMIC_RESERVED_0);
 
-  EXPECT_CALL(*mockSocket_, write(_, _))
-      .WillOnce([](const folly::SocketAddress&,
-                   const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-
-        EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::NAK_INVALID_REQUEST)
-            << "spec 5.5 requires NAK_INVALID_REQUEST for unsupported opcodes";
-
-        return buf->computeChainDataLength();
-      });
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
@@ -4752,16 +4688,7 @@ TEST_F(ReceiverTest, SendNakAndErrorQpForUndefinedOpcode) {
       /*tag=*/0,
       static_cast<BaseHeader::Opcode::OperationType>(0b00011));
 
-  EXPECT_CALL(*mockSocket_, write(_, _))
-      .WillOnce([](const folly::SocketAddress&,
-                   const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-        EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::NAK_INVALID_REQUEST)
-            << "an undefined opcode must draw NAK_INVALID_REQUEST";
-        return buf->computeChainDataLength();
-      });
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
@@ -4784,16 +4711,7 @@ TEST_F(ReceiverTest, NakButNoErrorForUnsupportedOpcodeWithUnknownTag) {
       /*tag=*/5,
       static_cast<BaseHeader::Opcode::OperationType>(0b00011));
 
-  EXPECT_CALL(*mockSocket_, write(_, _))
-      .WillOnce([](const folly::SocketAddress&,
-                   const std::unique_ptr<folly::IOBuf>& buf) {
-        folly::io::Cursor cursor(buf.get());
-        BaseHeader baseHeader(cursor);
-        AckHeader ackHeader(cursor);
-        EXPECT_EQ(ackHeader.getAckStatus(), AckStatus::NAK_INVALID_REQUEST)
-            << "an unsupported opcode must draw NAK_INVALID_REQUEST";
-        return buf->computeChainDataLength();
-      });
+  expectReplyStatus(AckStatus::NAK_INVALID_REQUEST);
 
   mockReceiver_->simulateReceivePacket(std::move(dataPacket), kEcnECT0);
 
