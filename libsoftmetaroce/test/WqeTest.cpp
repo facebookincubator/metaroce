@@ -909,6 +909,49 @@ TEST_F(WqeTest, AReleasedReadRequestFrameMayBeSentAgain) {
       << "is still outstanding";
 }
 
+TEST_F(
+    WqeTest,
+    AReleasedReadRequestFrameReallocatesWithoutTouchingTheResponse) {
+  constexpr uint16_t mtu = 4096;
+  constexpr uint32_t numPackets = 3;
+  constexpr uint32_t size = numPackets * mtu;
+  std::array<char, size> payload{};
+  ReadWriteWqe wqe(
+      Wqe::WorkType::kRead, 1, oneSge(payload), mtu, 0xDEAD0000, 42);
+  const uint32_t posn = wqe.allocateNextPosn();
+  wqe.releaseFrame(posn);
+
+  EXPECT_EQ(wqe.allocateNextPosn(), Wqe::kRequestFrameWirePosn)
+      << "a retried read request frame must carry posn zero on the wire, "
+         "where its response starts";
+  EXPECT_TRUE(wqe.hasBeenSent())
+      << "otherwise the sender would put the read request on the wire twice";
+  EXPECT_EQ(wqe.getOutstandingPosnCount(), numPackets)
+      << "the response posns are the responder's to fill, so a retry must leave "
+         "their count alone";
+}
+
+TEST_F(WqeTest, AReadFailingAfterItsRequestFrameWasReleasedSettlesAtOnce) {
+  constexpr uint16_t mtu = 4096;
+  std::array<char, mtu> payload{};
+  ReadWriteWqe wqe(
+      Wqe::WorkType::kRead, 1, oneSge(payload), mtu, 0xDEAD0000, 42);
+  const uint32_t posn = wqe.allocateNextPosn();
+  wqe.releaseFrame(posn);
+
+  EXPECT_EQ(wqe.markFailing(kWcRetryExcErr), 1u)
+      << "a REJECTED request frame is unsent, so failing the read removes it "
+         "from the unsent count";
+  EXPECT_TRUE(wqe.isFailingAndSettled())
+      << "no packet on the wire can resolve a REJECTED request frame, so the "
+         "read settles at once";
+  EXPECT_TRUE(wqe.hasBeenSent())
+      << "a failing read must not offer its request to the sender again";
+  EXPECT_EQ(wqe.markFailing(kWrFlushErr), 0u)
+      << "the first call abandoned the request frame, so a second call must "
+         "not subtract it from the unsent count again";
+}
+
 /*
  * A read marked failing before its request went out: a pending request reads
  * as unsent, so without the failing state the sender would be offered a

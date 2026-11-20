@@ -66,14 +66,15 @@ it.
 | PENDING | ALLOCATED | the sender claims it for a frame (`allocateNextPosn()`) |
 | PENDING | ACKED | a packet the peer sent fills it (`onPosnReceived()`) |
 | ALLOCATED | ACKED | the peer accounts for it (`acknowledgePosn()`) |
-| ALLOCATED | REJECTED | a BRNR hands the frame back, unless the work request is failing (`releasePosn()`) |
+| ALLOCATED | REJECTED | a BRNR hands the frame back, unless the work request is failing (`releasePosn()`, `releaseFrame()`) |
 | REJECTED | ALLOCATED | the sender takes it for another frame, before any posn the cursor has yet to reach |
 | any unresolved | ABANDONED | the sender stops waiting for it, whether or not it went out (`abandonPosn()`) |
 
 ACKED and ABANDONED are terminal: a posn reaches one of them exactly once and
-leaves the outstanding count when it does. An abandoned posn has no status
-of its own, since the status rides on the work request. A read's request frame
-is acked independently of the response posns it asks for.
+leaves the outstanding count when it does. An abandoned posn has no status of
+its own, since the status rides on the work request. A read or atomic request
+frame moves through the same states in `requestFrameStatus_`, REJECTED included,
+and is acked independently of the response posns it asks for.
 
 A read's response posns and a receive work request's posns are never
 allocated: a posn is claimed only to put a frame on the wire, and this side
@@ -95,16 +96,15 @@ for a read or atomic, whose response posns stay PENDING and counted -- which
 is why `isFailingAndSettled()` ignores the count for those.
 
 **Unsent** is client transmit work waiting for allocation: a pending or rejected
-send or write posn, or a pending read or atomic request frame, counted across
-the TagSet as a rate hint (`unsentPosnCount_`). A client's send enters its posns
-on post; a virtual work request's never enter at all. A posn leaves the count
-when it is claimed for sending, and also when it is abandoned having never been
-sent (`subtractUnsentPosns()`). It re-enters only when a BRNR hands a claimed
-frame back: a send or write posn as REJECTED, a request frame as PENDING
-(`addUnsentPosns()`).
+send or write posn, or a pending or rejected read or atomic request frame,
+counted across the TagSet as a rate hint (`unsentPosnCount_`). A client's send
+enters its posns on post; a virtual work request's never enter at all. A posn
+leaves the count when it is claimed for sending, and also when it is abandoned
+having never been sent (`subtractUnsentPosns()`). It re-enters only when a BRNR
+hands a claimed frame back as REJECTED, whether a send or write posn or a read
+or atomic request frame (`addUnsentPosns()`).
 
-For a client send or write posn, the counts and the tracker line up like this. A
-read or atomic request frame is never REJECTED: a BRNR returns it to PENDING.
+For a client send or write posn, the counts and the tracker line up like this.
 
 | Posn status | Outstanding | Unsent | Its tracker entry |
 |---|---|---|---|
@@ -144,18 +144,16 @@ acknowledges or refuses it.
 
 Resolved is asked of a frame from two sides: the tracker's own state, every one
 but UNACKED, and the frame's posn status, which has no BRNR. So a BRNR'd frame
-is resolved in the tracker while its posn is REJECTED (a request frame,
-PENDING) and unresolved.
+is resolved in the tracker while its posn is REJECTED and unresolved.
 
 An entry leaves UNACKED when the peer acknowledges or refuses the frame, or the
 sender abandons it. The retransmission scan abandons a frame due to be resent if
 its work request is failing or its tag is in error (`mustStopRetransmitting()`),
 since resending only delays the error the client is waiting for. A BRNR abandons
 an allocated frame of a failing work request rather than handing it back: a
-returned posn is REJECTED (a request frame, PENDING) and outstanding again,
-which undoes the allocation freeze `markFailing()` set and leaves a work request
-that can never settle. Tearing a path down abandons the posn with no entry left
-to mark.
+returned posn is REJECTED and unsent again, which undoes the allocation
+freeze `markFailing()` set and leaves a work request that can never settle.
+Tearing a path down abandons the posn with no entry left to mark.
 
 ## Work request states
 
@@ -174,10 +172,10 @@ settled spans acked, abandoned **and never sent**. The response posns are the
 responder's to fill, and settling does not wait for them.
 
 "Never sent" is a request the sender never claimed, and it reaches settled as
-ABANDONED rather than as PENDING: `markFailing()` abandons a pending request on
-the spot, and every path that takes a frame back abandons it too when the work
-request is failing. So a failing request is never found PENDING, and
-`isFailingAndSettled()` asserts as much.
+ABANDONED rather than as PENDING: `markFailing()` immediately abandons a PENDING
+or REJECTED request frame, and every path that takes a frame back abandons it
+too when the work request is failing. So a failing request frame is never found
+PENDING or REJECTED, and `isFailingAndSettled()` asserts as much.
 
 **Served** is the responder having performed the operation, and the requester
 reads it off the first response to land: the responder fills the response

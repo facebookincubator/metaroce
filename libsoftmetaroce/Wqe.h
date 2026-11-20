@@ -240,7 +240,7 @@ struct Wqe {
     if (hasRequestFrame()) {
       DCHECK_EQ(requestFrameStatus_, PosnStatus::ALLOCATED)
           << "Can only release an ALLOCATED request frame";
-      requestFrameStatus_ = PosnStatus::PENDING;
+      requestFrameStatus_ = PosnStatus::REJECTED;
       return;
     }
     releasePosn(posn);
@@ -385,7 +385,7 @@ struct Wqe {
     sndNxtPosn_ = static_cast<uint32_t>(numPosn_);
 
     if (hasRequestFrame()) {
-      if (requestFrameStatus_ != PosnStatus::PENDING) {
+      if (!isRequestFrameUnsent()) {
         return 0;
       }
       abandonFrame(kRequestFrameWirePosn);
@@ -446,7 +446,7 @@ struct Wqe {
   }
 
   // Settled spans acked and abandoned, which is where a frame never sent ends
-  // up: marking abandons it rather than leaving it pending. A read or atomic
+  // up: marking abandons it rather than leaving it unsent. A read or atomic
   // waits only on its request frame; no responder will fill its response posns
   // now.
   [[nodiscard]] bool isFailingAndSettled() const {
@@ -454,8 +454,8 @@ struct Wqe {
       return false;
     }
     if (hasRequestFrame()) {
-      DCHECK_NE(requestFrameStatus_, PosnStatus::PENDING)
-          << "markFailing() abandons a PENDING request at once, and every path "
+      DCHECK(!isRequestFrameUnsent())
+          << "markFailing() abandons an unsent request at once, and every path "
              "that takes a frame back abandons it for a failing work request";
       return isRequestFrameResolved();
     }
@@ -541,10 +541,10 @@ struct Wqe {
 
   [[nodiscard]] bool hasBeenSent() const {
     if (hasRequestFrame()) {
-      // A read that fails before its request went out has no packet on the
-      // wire to resolve that frame, so the failing state is what keeps it from
-      // being offered again.
-      return isFailing_ || requestFrameStatus_ != PosnStatus::PENDING;
+      // A read that fails while its request frame is unsent has no packet on
+      // the wire to resolve that frame, so the failing state is what keeps it
+      // from being offered again.
+      return isFailing_ || !isRequestFrameUnsent();
     }
     return sndNxtPosn_ == numPosn_ && rejectedPosns_.empty();
   }
@@ -738,6 +738,12 @@ struct Wqe {
   // Instrumentation: the full state, recorded where the audit flag is set,
   // and off otherwise.
   std::unique_ptr<PosnAuditor> auditor_;
+
+ private:
+  [[nodiscard]] bool isRequestFrameUnsent() const {
+    return requestFrameStatus_ == PosnStatus::PENDING ||
+        requestFrameStatus_ == PosnStatus::REJECTED;
+  }
 };
 
 struct SendWqe : public Wqe {
