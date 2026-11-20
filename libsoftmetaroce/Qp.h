@@ -393,7 +393,7 @@ class Qp {
       // A refused post is not progress.
       return false;
     }
-    // The deadline covers transmit work, which a receive post does not advance.
+    // The watchdog covers transmit work, which a receive post does not advance.
     if (!isReceive) {
       watchdog_.recordProgress();
     }
@@ -601,7 +601,7 @@ class Qp {
   [[nodiscard]] bool hasWatchdogExpired() const;
 
   // What the QP settles on the move to RTS, before any Tag can post a send:
-  // the watchdog deadline, from every Tag, so the QP holds one view of it.
+  // the watchdog interval, from every Tag, so the QP holds one view of it.
   void onEnteringRts();
 
   void configureWatchdogInterval(std::chrono::milliseconds intervalMs) {

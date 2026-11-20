@@ -258,7 +258,7 @@ class TimerFD : public folly::EventHandler {
         std::this_thread::yield();
       }
 
-      // Only fire if this timer wasn't cancelled or rescheduled
+      // Only fire if this timer wasn't canceled or rescheduled
       if (generation_.load() == gen) {
         uint64_t val = 1;
         auto const ret = folly::fileops::write(fd_, &val, sizeof(val));

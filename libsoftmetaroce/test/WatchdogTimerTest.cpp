@@ -30,19 +30,19 @@ class WatchdogTimerTest : public ::testing::Test {
 
 TEST_F(WatchdogTimerTest, AnExponentDerivesTheWaitOneAttemptGets) {
   // 4.096us * 2^14 = 67.108864ms.
-  const auto derived = deadlinesFromQpAttributes(
+  const auto derived = intervalsFromQpAttributes(
       /*localAckTimeoutExponent=*/14, /*retryCount=*/0);
   // One attempt of 4.096us << 14, rounded up.
   EXPECT_EQ(derived.watchdogIntervalMs, std::chrono::milliseconds(68))
-      << "the deadline is built from that wait, so reading the exponent wrong "
+      << "the interval is built from that wait, so reading the exponent wrong "
          "derives it from a duration the client never specified";
 }
 
-// The IBTA local ack timeout is an exponent, and the deadline covers the first
+// The IBTA local ack timeout is an exponent, and the interval covers the first
 // send plus one wait per retry.
 TEST_F(WatchdogTimerTest, AnIbtaExponentBecomesItsDurationOncePerAttempt) {
   // 4.096us * 2^14 = 67.108ms, and 3 attempts of it, rounded up.
-  const auto derived = deadlinesFromQpAttributes(
+  const auto derived = intervalsFromQpAttributes(
       /*localAckTimeoutExponent=*/14, /*retryCount=*/2);
   EXPECT_EQ(derived.watchdogIntervalMs, std::chrono::milliseconds(202))
       << "a client that asked to wait 4.096us*2^14 three times should have "
@@ -50,37 +50,37 @@ TEST_F(WatchdogTimerTest, AnIbtaExponentBecomesItsDurationOncePerAttempt) {
 }
 
 TEST_F(WatchdogTimerTest, AnExponentAboveTheCeilingIsCutToIt) {
-  // The longest single wait the ceiling admits, rounded up so the deadline
+  // The longest single wait the ceiling admits, rounded up so the interval
   // covers it. Derived here so moving the ceiling does not move this test.
   const auto kAtCeiling =
       std::chrono::ceil<std::chrono::milliseconds>(std::chrono::nanoseconds(
           kLocalAckTimeoutBaseNs << kLocalAckTimeoutExponentCeiling));
-  const auto atCeiling = deadlinesFromQpAttributes(
+  const auto atCeiling = intervalsFromQpAttributes(
       kLocalAckTimeoutExponentCeiling, /*retryCount=*/0);
   const auto aboveCeiling =
-      deadlinesFromQpAttributes(kMaxLocalAckTimeoutExponent, /*retryCount=*/0);
+      intervalsFromQpAttributes(kMaxLocalAckTimeoutExponent, /*retryCount=*/0);
   EXPECT_EQ(atCeiling.watchdogIntervalMs, kAtCeiling)
       << "the ceiling exponent has to derive the wait it specifies, or the "
          "value everything above it is cut to is itself wrong";
   EXPECT_EQ(aboveCeiling.watchdogIntervalMs, kAtCeiling)
-      << "without a ceiling a client could push the deadline out arbitrarily "
+      << "without a ceiling a client could push the interval out arbitrarily "
          "by specifying a wider exponent, so the widest one IBTA allows must "
          "wait no longer than the ceiling does";
 }
 
 TEST_F(WatchdogTimerTest, TheZeroExponentDerivesTheDisabledWatchdog) {
   EXPECT_EQ(
-      deadlinesFromQpAttributes(
+      intervalsFromQpAttributes(
           kDisabledLocalAckTimeoutExponent, /*retryCount=*/7)
           .watchdogIntervalMs,
       kDisabledTimeoutWatchdogMs)
       << "IBTA's zero asks for no timeout, and a QP that never ends is worse "
-         "than one held to a deadline long enough not to be reached";
+         "than one held to an interval long enough never to pass";
 }
 
 TEST_F(
     WatchdogTimerTest,
-    AnUnconfiguredQpReportsAttributesThatDeriveItsDeadline) {
+    AnUnconfiguredQpReportsAttributesThatDeriveItsWatchdogInterval) {
   // The ceiling exponent alone would round every one of these up to 2148ms.
   for (const auto intervalMs :
        {std::chrono::milliseconds(20),
@@ -90,14 +90,14 @@ TEST_F(
     EXPECT_LE(reported.retryCount, kMaxTransportRetryCount)
         << "a count past three bits is not portable, so a client writing back "
            "what it read would ask rxe to retry forever";
-    const auto round = deadlinesFromQpAttributes(
+    const auto round = intervalsFromQpAttributes(
         reported.localAckTimeoutExponent, reported.retryCount);
     EXPECT_GE(round.watchdogIntervalMs, intervalMs)
-        << "the pair has to cover at least the deadline the QP is held to, or "
-           "a client reading it back would shorten its own deadline, at "
+        << "the pair has to cover at least the interval the QP is held to, or "
+           "a client reading it back would shorten its own interval, at "
         << intervalMs.count() << "ms";
     EXPECT_LE(round.watchdogIntervalMs.count(), intervalMs.count() * 2)
-        << "the pair stands for this deadline, so reporting more than double "
+        << "the pair stands for this interval, so reporting more than double "
            "it describes a QP the client does not have, at "
         << intervalMs.count() << "ms";
   }
@@ -127,31 +127,31 @@ TEST_F(
   EXPECT_EQ(reported.localAckTimeoutExponent, kLocalAckTimeoutExponentCeiling)
       << "no narrower exponent reaches " << intervalMs.count()
       << "ms within the retries IBTA allows, so the ceiling is the only "
-         "exponent that can reach this deadline";
+         "exponent that can reach this interval";
   EXPECT_LT(reported.retryCount, kMaxTransportRetryCount)
-      << "the widest count is what a deadline past every legal pair reports, "
+      << "the widest count is what an interval past every legal pair reports, "
          "so giving it for one the ceiling covers tells a client its queue "
          "pair waits "
       << ceilingReachMs.count() << "ms when it waits " << intervalMs.count()
       << "ms";
   EXPECT_GE(
-      deadlinesFromQpAttributes(
+      intervalsFromQpAttributes(
           reported.localAckTimeoutExponent, reported.retryCount)
           .watchdogIntervalMs,
       intervalMs)
-      << "the pair still has to cover the deadline the queue pair is held to, "
+      << "the pair still has to cover the interval the queue pair is held to, "
          "or a client reading it back would shorten its own";
 }
 
 TEST_F(WatchdogTimerTest, AnExponentShorterThanTheMinimumIsRaisedToIt) {
   // 4.096us * 2^1, even eight times over, is far under the minimum.
-  const auto derived = deadlinesFromQpAttributes(
+  const auto derived = intervalsFromQpAttributes(
       /*localAckTimeoutExponent=*/1, /*retryCount=*/7);
 
   WatchdogTimer timer;
   timer.configureInterval(derived.watchdogIntervalMs);
   EXPECT_EQ(timer.getIntervalMs(), kMinWatchdogIntervalMs)
-      << "a sub-millisecond deadline would fail work on ordinary scheduling "
+      << "a sub-millisecond interval would fail work on ordinary scheduling "
          "delay rather than on a stall";
 }
 

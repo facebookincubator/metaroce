@@ -249,7 +249,7 @@ void TxFlow::onRtoWake() {
         scheduleRtoWake(lockedSndCur);
         lockedSndCur.unlock();
         LOG_FIRST_N(INFO, 20)
-            << "RetxTimer expired (rto=" << rtoUs << "us) for qp "
+            << "RTO expired (rto=" << rtoUs << "us) for qp "
             << qp_.getLocalQpNum() << " flow " << flowId_
             << " but can still send (window="
             << qp_.congestionController_->getAvailableWindowSize(flowId_)
@@ -274,7 +274,7 @@ void TxFlow::onRtoWake() {
     ++consecutiveRtosWithoutAck_;
   }
 
-  VLOG(2) << "RetxTimer expired for qp: " << qp_.getLocalQpNum()
+  VLOG(2) << "RTO expired for qp: " << qp_.getLocalQpNum()
           << " flow: " << flowId_ << ". HRNR state is " << qp_.getHrnrState()
           << " una: " << txState_.sndUna << " nxt: " << txState_.sndNxt;
   prepareRetxPacketsIfAny(true /*isRtoEvent*/);

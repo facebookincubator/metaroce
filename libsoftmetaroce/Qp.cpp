@@ -282,7 +282,7 @@ Qp::Qp(
       receiveQueueDepth,
       sharedReceiveQueue);
   hrnrTimerCallback_ = std::make_unique<HighResTimer::Callback>([&]() {
-    VLOG(2) << "HrnrTimer expired for QP: " << localQpNum_;
+    VLOG(2) << "HRNR timer fired for QP: " << localQpNum_;
     if (isTearingDown()) {
       return;
     }
@@ -295,7 +295,7 @@ Qp::Qp(
     signalReadyAsync();
   });
   brnrTimerCallback_ = std::make_unique<HighResTimer::Callback>([&]() {
-    VLOG(2) << "BrnrTimer expired for QP: " << localQpNum_;
+    VLOG(2) << "BRNR timer fired for QP: " << localQpNum_;
     if (isTearingDown()) {
       return;
     }
@@ -430,7 +430,7 @@ Qp::~Qp() {
   // Waits out the sender, whose build the arbiter holds its lock across, and
   // frees the readiness handle the steps above drained the readers of.
   arbiter_.removeQp(localQpNum_);
-  // Durable now: the sender is gone, and a late expiry returns at its check.
+  // Durable now: the sender is gone, and a late wake returns at its check.
   for (auto& p : txFlows_) {
     p.destroyRetransmissionTimer();
   }
@@ -1389,17 +1389,17 @@ void Qp::retireTagsWithAbandonedFrames(
 
 void Qp::onEnteringRts() {
   // Every Tag's timeout and retry count are refused past RTR, and one timer
-  // serves the QP, so the longest deadline any Tag sets wins.
+  // serves the QP, so the longest watchdog interval any Tag sets wins.
   std::chrono::milliseconds longestIntervalMs{0};
   for (const Tag& tag : tagSet_.tags()) {
     const auto exponent = tag.getLocalAckTimeoutExponent();
     // A retry count multiplies a wait, so a Tag setting one without a timeout
-    // has set no wait for it to multiply and derives no deadline here.
+    // has set no wait for it to multiply and derives no interval here.
     if (exponent.has_value()) {
-      const auto deadlines = deadlinesFromQpAttributes(
+      const auto intervals = intervalsFromQpAttributes(
           exponent.value(), tag.getTransportRetryCount());
       longestIntervalMs =
-          std::max(longestIntervalMs, deadlines.watchdogIntervalMs);
+          std::max(longestIntervalMs, intervals.watchdogIntervalMs);
     }
   }
   // A QP no Tag configured keeps the interval its watchdog was built with.

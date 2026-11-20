@@ -42,13 +42,13 @@ QpAttributesForInterval qpAttributesForInterval(
     std::chrono::milliseconds intervalMs) {
   // The narrowest exponent that reaches the interval within the retries IBTA
   // allows, since a wider one reports in coarser steps: at the ceiling, every
-  // deadline under 2148ms rounds up to 2148ms.
+  // interval under 2148ms rounds up to 2148ms.
   const int64_t attemptsAllowed = kMaxTransportRetryCount + 1;
   const auto intervalNs =
       std::chrono::duration_cast<std::chrono::nanoseconds>(intervalMs).count();
   for (uint8_t exponent = 1; exponent <= kLocalAckTimeoutExponentCeiling;
        ++exponent) {
-    // In nanoseconds, as deadlinesFromQpAttributes rounds the product rather
+    // In nanoseconds, as intervalsFromQpAttributes rounds the product rather
     // than each attempt; rounding here first would report too few attempts.
     const int64_t perAttemptNs = kLocalAckTimeoutBaseNs << exponent;
     if (perAttemptNs * attemptsAllowed < intervalNs) {
@@ -64,11 +64,11 @@ QpAttributesForInterval qpAttributesForInterval(
       kLocalAckTimeoutExponentCeiling, kMaxTransportRetryCount};
 }
 
-QpAttributeDeadlines deadlinesFromQpAttributes(
+QpAttributeIntervals intervalsFromQpAttributes(
     uint8_t localAckTimeoutExponent,
     uint8_t retryCount) {
   if (localAckTimeoutExponent == kDisabledLocalAckTimeoutExponent) {
-    return QpAttributeDeadlines{
+    return QpAttributeIntervals{
         .watchdogIntervalMs = kDisabledTimeoutWatchdogMs};
   }
 
@@ -79,15 +79,15 @@ QpAttributeDeadlines deadlinesFromQpAttributes(
         << "cutting a local ack timeout exponent of "
         << static_cast<int>(localAckTimeoutExponent) << " to "
         << static_cast<int>(cappedExponent)
-        << ", so the deadline is shorter than the client asked for";
+        << ", so the watchdog interval is shorter than the client asked for";
   }
   const auto ackWaitNs =
       std::chrono::nanoseconds(kLocalAckTimeoutBaseNs << cappedExponent);
   const auto attempts = static_cast<uint64_t>(retryCount) + 1;
-  // Rounded up so the deadline is never shorter than the waits it covers.
-  const auto deadlineMs =
+  // Rounded up so the interval is never shorter than the waits it covers.
+  const auto intervalMs =
       std::chrono::ceil<std::chrono::milliseconds>(ackWaitNs * attempts);
-  return QpAttributeDeadlines{.watchdogIntervalMs = deadlineMs};
+  return QpAttributeIntervals{.watchdogIntervalMs = intervalMs};
 }
 
 WatchdogTimer::WatchdogTimer()
@@ -99,7 +99,8 @@ WatchdogTimer::WatchdogTimer()
     // One report serves: the flag is one setting however many QPs read it.
     LOG_FIRST_N(WARNING, 1)
         << "the watchdog flag of " << flagMs.count()
-        << "ms fires on scheduling delay rather than on a stall, so raising it to "
+        << "ms sets an interval that can expire during ordinary scheduling "
+           "delay, so raising it to "
         << flooredMs.count() << "ms";
   }
   configureInterval(flooredMs);
@@ -125,7 +126,7 @@ void WatchdogTimer::configureInterval(std::chrono::milliseconds intervalMs) {
   if (flooredMs != intervalMs) {
     LOG_FIRST_N(WARNING, 10)
         << "a watchdog interval of " << intervalMs.count()
-        << "ms fires on scheduling delay rather than on a stall, so raising it to "
+        << "ms can expire during ordinary scheduling delay, so raising it to "
         << flooredMs.count() << "ms";
   }
   intervalMs_.store(

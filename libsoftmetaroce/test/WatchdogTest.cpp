@@ -402,29 +402,25 @@ TEST_F(WatchdogTest, AReceivePostDoesNotStandInForTransmitProgress) {
   EXPECT_EQ(qp_->getLastProgressTime(), beforeReceive)
       << "receive queue entries come back as the peer's traffic arrives, so a "
          "queue pair still being sent to could hold its own stalled sender off "
-         "the deadline indefinitely";
+         "expiry indefinitely";
 
   std::array<char, 64> sendBuffer{};
   ASSERT_TRUE(qp_->postWqe(
       kMetaRoceInitialTag,
       std::make_unique<SendWqe>(
           /*workReqId=*/401, oneSge(sendBuffer), qp_->getMtu())))
-      << "precondition: the send has to be accepted for its post to reach the "
-         "deadline at all";
+      << "precondition: the send has to be accepted for its post to record "
+         "progress at all";
 
   EXPECT_GT(qp_->getLastProgressTime(), beforeReceive)
-      << "transmit work is what the deadline covers, so a send post has to go "
+      << "transmit work is what the watchdog covers, so a send post has to go "
          "on recording progress rather than the receive check above passing "
-         "against a deadline that never moves";
+         "against a progress time that never moves";
 }
 
-/*
- * On the RTO path, work is retransmitted once before the watchdog fails it,
- * however short a deadline the QP is given. The rto floor is derived from the
- * floor the deadline lands on, so the first RTO callback finds the watchdog
- * already expired however that floor moves.
- */
 TEST_F(WatchdogTest, TheFirstRtoIsNeverTheOneThatFailsTheWork) {
+  // The 1ms watchdog interval is raised to kMinWatchdogIntervalMs, and the RTO
+  // floor is twice that, so the watchdog has expired by the first RTO.
   FLAGS_libsoftmetaroce_min_rto_us = static_cast<uint32_t>(
       std::chrono::duration_cast<std::chrono::microseconds>(
           kMinWatchdogIntervalMs * 2)
@@ -471,7 +467,7 @@ TEST_F(WatchdogTest, TheFirstRtoIsNeverTheOneThatFailsTheWork) {
 TEST_F(WatchdogTest, WorkFailsAtTheConfiguredIntervalRatherThanTheFlag) {
   FLAGS_libsoftmetaroce_qp_watchdog_interval_ms = 60000;
   buildQp();
-  const auto derived = deadlinesFromQpAttributes(
+  const auto derived = intervalsFromQpAttributes(
       /*localAckTimeoutExponent=*/14,
       /*retryCount=*/0); // 4.096us * 2^14 = 67ms
   qp_->configureWatchdogInterval(derived.watchdogIntervalMs);
@@ -501,7 +497,7 @@ TEST_F(WatchdogTest, WorkFailsAtTheConfiguredIntervalRatherThanTheFlag) {
       folly::coro::timeout(cq_.pollCq(), kTestTimeout));
   EXPECT_EQ(cqe.status, kWcRetryExcErr)
       << "a configured interval must drive the same expiry the flag does, or a "
-         "client's deadline is recorded and never applied";
+         "client's interval is recorded and never applied";
 }
 
 } // namespace libsoftmetaroce

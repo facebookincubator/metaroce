@@ -3448,9 +3448,8 @@ TEST_F(QpTest, AnErroredTagsPartlySentWorkRequestOutlivesTheVisitThatFindsIt) {
 }
 
 /*
- * A failing message is not retransmitted. Whether its packets are ever
- * acknowledged stops mattering once it is failing, so the sender abandons them
- * itself and the message reports instead of retrying until the watchdog fires.
+ * A failing message's frames no longer need acks, so abandoning them at the
+ * RTO lets the message report then.
  */
 TEST_F(QpTest, RtoAbandonsAFailingWqesFrameInsteadOfRetransmitting) {
   // Half the message is on the wire; the rest has not been sent.
@@ -4708,8 +4707,8 @@ TEST_F(QpTest, ANewReadRequestRecordsWatchdogProgress) {
       << "precondition: the request is served rather than refused, or there "
          "is no response here to time";
   EXPECT_GT(qp.getLastProgressTime(), before)
-      << "a new read is transmit work, so the response's deadline must start "
-         "at the request rather than when the queue pair was built";
+      << "a new read is transmit work, so the response's watchdog interval must "
+         "start at the request frame rather than when the queue pair was built";
 }
 
 TEST_F(QpTest, ReadWithImmediateCarryingPayloadIsNakd) {

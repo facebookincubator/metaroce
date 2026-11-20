@@ -26,10 +26,10 @@ DECLARE_uint32(libsoftmetaroce_qp_watchdog_interval_ms);
 
 namespace libsoftmetaroce {
 
-// Below this a watchdog fires on ordinary scheduling delay.
+// Below this a watchdog interval can expire during ordinary scheduling delay.
 inline constexpr std::chrono::milliseconds kMinWatchdogIntervalMs{20};
 
-struct QpAttributeDeadlines {
+struct QpAttributeIntervals {
   // How long the QP tolerates no progress.
   std::chrono::milliseconds watchdogIntervalMs;
 };
@@ -39,14 +39,14 @@ struct QpAttributesForInterval {
   uint8_t retryCount;
 };
 
-// Returns a pair that deadlinesFromQpAttributes() maps to at least the
+// Returns a pair that intervalsFromQpAttributes() maps to at least the
 // interval. Saturates where no legal pair reaches the interval.
 [[nodiscard]] QpAttributesForInterval qpAttributesForInterval(
     std::chrono::milliseconds intervalMs);
 
 // Returns kDisabledTimeoutWatchdogMs for a zero exponent. Cuts an exponent
 // above kLocalAckTimeoutExponentCeiling to that ceiling.
-[[nodiscard]] QpAttributeDeadlines deadlinesFromQpAttributes(
+[[nodiscard]] QpAttributeIntervals intervalsFromQpAttributes(
     uint8_t localAckTimeoutExponent,
     uint8_t retryCount);
 

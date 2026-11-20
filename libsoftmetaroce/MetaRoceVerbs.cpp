@@ -2108,15 +2108,15 @@ int MetaRoceVerbs::ibv_query_qp(
   }
   if (attr_mask & IBV_QP_TIMEOUT) {
     // Zero means "no timeout", so an unconfigured Tag reports instead the pair
-    // deriving the deadline it is held to.
+    // deriving the watchdog interval it is held to.
     const auto configured = tag->getLocalAckTimeoutExponent();
     attr->timeout =
         configured.value_or(qpAttributesForInterval(qp->getWatchdogIntervalMs())
                                 .localAckTimeoutExponent);
   }
   if (attr_mask & IBV_QP_RETRY_CNT) {
-    // A count set without a timeout never reached the deadline, so the
-    // derived one is what the QP will actually spend its retries against.
+    // A count set without a timeout never entered the watchdog interval, so
+    // the derived one is what the QP will actually spend its retries against.
     attr->retry_cnt = tag->getLocalAckTimeoutExponent().has_value()
         ? tag->getTransportRetryCount()
         : qpAttributesForInterval(qp->getWatchdogIntervalMs()).retryCount;

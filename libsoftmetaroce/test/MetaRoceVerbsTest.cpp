@@ -1671,12 +1671,7 @@ TEST_F(VerbsTest, AnMtuOutsideTheSupportedRunIsRefused) {
          "asks for the 8192 this library frames at";
 }
 
-/*
- * A client may write the timeout and the retry count in one call or in two,
- * and both are refused past RTR. The deadline is derived on the move to RTS,
- * where each is final, so how the client split the writes cannot change it.
- */
-TEST_F(VerbsTest, SplittingTheAttributeWritesDoesNotChangeTheDeadline) {
+TEST_F(VerbsTest, SplittingTheAttributeWritesDoesNotChangeTheWatchdogInterval) {
   constexpr uint8_t kTimeoutExponent = 14;
   constexpr uint8_t kRetryCount = 2;
 
@@ -1707,8 +1702,6 @@ TEST_F(VerbsTest, SplittingTheAttributeWritesDoesNotChangeTheDeadline) {
       << "precondition: the QP must reach INIT, or the attribute writes below "
          "are refused for the state rather than accepted and derived from";
 
-  // The timeout first and alone, so a deadline derived at either write would
-  // take the retry count the QP was created with rather than the one below.
   attr.timeout = kTimeoutExponent;
   ASSERT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_TIMEOUT), 0)
       << "precondition: the timeout must be accepted on its own, since writing "
@@ -1716,7 +1709,7 @@ TEST_F(VerbsTest, SplittingTheAttributeWritesDoesNotChangeTheDeadline) {
   attr.retry_cnt = kRetryCount;
   ASSERT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_RETRY_CNT), 0)
       << "precondition: the retry count must be accepted in a later call, or "
-         "the deadline below is derived from one value rather than two";
+         "the interval below is derived from one value rather than two";
 
   attr.qp_state = IBV_QPS_RTR;
   ASSERT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_STATE), 0)
@@ -1724,19 +1717,19 @@ TEST_F(VerbsTest, SplittingTheAttributeWritesDoesNotChangeTheDeadline) {
          "taken from";
   attr.qp_state = IBV_QPS_RTS;
   ASSERT_EQ(verbs_.ibv_modify_qp(ibvqp, &attr, IBV_QP_STATE), 0)
-      << "the move to RTS is where the deadline is derived, so a refused "
+      << "the move to RTS is where the interval is derived, so a refused "
          "transition leaves nothing for the check below to read";
 
   // 4.096us << 14 is 67.108864ms, and three attempts of it round up to 202ms.
-  constexpr auto kExpectedDeadline = std::chrono::milliseconds(202);
+  constexpr auto kExpectedInterval = std::chrono::milliseconds(202);
   auto* qp = verbs_.getQpByNum(MetaRoceVerbs::qpAndTagToQp(ibvqp->qp_num));
   ASSERT_NE(qp, nullptr);
-  EXPECT_EQ(qp->getWatchdogIntervalMs(), kExpectedDeadline)
+  EXPECT_EQ(qp->getWatchdogIntervalMs(), kExpectedInterval)
       << "a client that writes the two attributes separately must get the "
-         "deadline both of them set";
+         "interval both of them set";
 }
 
-TEST_F(VerbsTest, TheLongestDeadlineAcrossTagsGovernsTheQp) {
+TEST_F(VerbsTest, TheLongestWatchdogIntervalAcrossTagsGovernsTheQp) {
   struct ibv_qp_init_attr qp_init_attr{};
   qp_init_attr.send_cq = cq_;
   qp_init_attr.recv_cq = cq_;
@@ -1784,14 +1777,14 @@ TEST_F(VerbsTest, TheLongestDeadlineAcrossTagsGovernsTheQp) {
   ASSERT_EQ(
       verbs_.ibv_modify_qp(tag0, &attr, IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT), 0)
       << "precondition: the longer pair has to be accepted, or there is no "
-         "deadline for the shorter one to lose to";
+         "interval for the shorter one to lose to";
   // 4.096us << 12, one attempt: 17ms.
   attr.timeout = 12;
   attr.retry_cnt = 0;
   ASSERT_EQ(
       verbs_.ibv_modify_qp(tag1, &attr, IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT), 0)
       << "precondition: the shorter pair has to be accepted on the second Tag, "
-         "or this case has only one deadline in play";
+         "or this case has only one interval in play";
 
   attr.qp_state = IBV_QPS_RTR;
   ASSERT_EQ(verbs_.ibv_modify_qp(tag0, &attr, IBV_QP_STATE), 0)
@@ -1799,23 +1792,22 @@ TEST_F(VerbsTest, TheLongestDeadlineAcrossTagsGovernsTheQp) {
          "taken from";
   attr.qp_state = IBV_QPS_RTS;
   ASSERT_EQ(verbs_.ibv_modify_qp(tag0, &attr, IBV_QP_STATE), 0)
-      << "the move to RTS is where the deadline is derived, so a refused "
+      << "the move to RTS is where the interval is derived, so a refused "
          "transition leaves nothing for the check below to read";
 
   auto* qp = verbs_.getQpByNum(baseQpNum);
   ASSERT_NE(qp, nullptr);
   EXPECT_EQ(qp->getWatchdogIntervalMs(), std::chrono::milliseconds(202))
       << "one timer serves every Tag, so the Tag asking for the shorter "
-         "deadline must not fail the work of the Tag that asked to wait "
+         "interval must not fail the work of the Tag that asked to wait "
          "longer";
 }
 
 /*
- * No timeout is a longer wait than any exponent can express, so a Tag asking
- * for it takes the same longest-wins rule and the QP is held to the disabled
- * watchdog rather than the other Tag's shorter deadline.
+ * No timeout derives kDisabledTimeoutWatchdogMs, longer than any exponent's
+ * interval, so the longest-interval rule picks it.
  */
-TEST_F(VerbsTest, ATagAskingForNoTimeoutGovernsTheQpsDeadline) {
+TEST_F(VerbsTest, ATagAskingForNoTimeoutGovernsTheQpsWatchdogInterval) {
   struct ibv_qp_init_attr qp_init_attr{};
   qp_init_attr.send_cq = cq_;
   qp_init_attr.recv_cq = cq_;
@@ -1873,14 +1865,14 @@ TEST_F(VerbsTest, ATagAskingForNoTimeoutGovernsTheQpsDeadline) {
          "taken from";
   attr.qp_state = IBV_QPS_RTS;
   ASSERT_EQ(verbs_.ibv_modify_qp(tag0, &attr, IBV_QP_STATE), 0)
-      << "the move to RTS is where the deadline is derived, so a refused "
+      << "the move to RTS is where the interval is derived, so a refused "
          "transition leaves nothing for the check below to read";
 
   auto* qp = verbs_.getQpByNum(baseQpNum);
   ASSERT_NE(qp, nullptr);
   EXPECT_EQ(qp->getWatchdogIntervalMs(), kDisabledTimeoutWatchdogMs)
       << "a Tag that asked for no timeout would otherwise have its work failed "
-         "at another Tag's deadline, which is the opposite of what it asked";
+         "at another Tag's interval, which is the opposite of what it asked";
 }
 
 /*
