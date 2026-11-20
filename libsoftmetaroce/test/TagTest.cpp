@@ -2277,7 +2277,8 @@ TEST_F(TagTest, HandleTxWqesCompletionCleansUpVirtualSendWqe) {
   // Allocate all POSNs on the virtual WQE so hasBeenSent() returns true
   // and findNextWqe will skip it, returning the local WQE next
   while (!virtualWqePtr->hasBeenSent()) {
-    (void)virtualWqePtr->allocateNextPosn();
+    // Packet POSNs are unused here because only the fully-sent state matters.
+    std::ignore = virtualWqePtr->allocateNextPosn();
   }
   Wqe* localWqePtr = tag_->findNextWqe();
   ASSERT_NE(localWqePtr, nullptr);
@@ -2285,8 +2286,8 @@ TEST_F(TagTest, HandleTxWqesCompletionCleansUpVirtualSendWqe) {
       << "second findNextWqe should return the local WQE";
   tag_->markFree();
 
-  std::ignore = localWqePtr->allocateNextPosn();
-  localWqePtr->acknowledgePosn(0);
+  const auto posn = localWqePtr->allocateNextPosn();
+  localWqePtr->acknowledgePosn(posn);
 
   // Complete both WQEs in a single handleTxWqesCompletion call
   {
