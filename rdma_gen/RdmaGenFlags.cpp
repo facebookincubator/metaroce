@@ -151,6 +151,11 @@ DEFINE_int32(
     60000,
     "Absolute timeout in milliseconds for the per-QP Thrift control "
     "connection retry loop.");
+DEFINE_int32(
+    rc_rpc_timeout_ms,
+    0,
+    "Timeout in milliseconds for each Thrift control RPC. 0 keeps the "
+    "channel's default.");
 DEFINE_string(
     rc_connect_ports,
     "18515",

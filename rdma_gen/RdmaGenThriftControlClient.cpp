@@ -384,6 +384,9 @@ RdmaGenThriftControlClient::createClient(
         // Create Rocket client channel
         auto channel =
             apache::thrift::RocketClientChannel::newChannel(std::move(socket));
+        if (FLAGS_rc_rpc_timeout_ms > 0) {
+          channel->setTimeout(FLAGS_rc_rpc_timeout_ms);
+        }
 
         // Create and return client
         co_return std::make_unique<

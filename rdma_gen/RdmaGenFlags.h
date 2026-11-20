@@ -75,6 +75,7 @@ DECLARE_bool(use_completion_barrier);
 
 // Flags for client only.
 DECLARE_int32(rc_connect_timeout_ms);
+DECLARE_int32(rc_rpc_timeout_ms);
 DECLARE_string(rc_connect_ports);
 DECLARE_string(num_messages);
 DECLARE_bool(equal_messages_per_server);
