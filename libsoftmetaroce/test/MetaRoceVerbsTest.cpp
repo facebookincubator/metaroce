@@ -2080,7 +2080,10 @@ TEST(MetaRoceVerbsTest, DestroyQpWaitsForInFlightReceive) {
  * Creates and modifies a QP then posts a send WQE. For each operation, it
  * verifies the attributes set by that operation.
  */
-TEST(MetaRoceVerbsTest, PostSentWQE) {
+static void testPostSentWqe(bool singleOwnerTx) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_single_owner_tx = singleOwnerTx;
+
   constexpr uint32_t numPacketsToSend = 5;
   std::atomic<uint32_t> numPacketsRegistered{0};
   std::atomic_flag allPacketsSentPosted = ATOMIC_FLAG_INIT;
@@ -2173,24 +2176,24 @@ TEST(MetaRoceVerbsTest, PostSentWQE) {
        ++flowId) {
     const auto packetsToExpectOnThisFlow =
         flowId < flowsWithExtraPacket ? packetsPerFlow + 1 : packetsPerFlow;
-    const auto nowNs =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::high_resolution_clock::now().time_since_epoch())
-            .count();
+    const auto nowNs = getNowNs();
     const auto ackHeader = AckHeader::AckHeaderBuilder()
                                .setCumulativeFsn(packetsToExpectOnThisFlow - 1)
                                .setMaxRcvdFsn(packetsToExpectOnThisFlow - 1)
                                .setAckStatus(AckStatus::ACK)
                                .setTimestamp(nowNs)
                                .build();
-    qp->getTxFlowById(flowId)->processAckPacket(
-        ackHeader, simulatedProcessedAtNs(ackHeader.getTimestamp()));
+    if (qp->usesSingleOwnerRxRing()) {
+      qp->enqueueReceivedAck(flowId, ackHeader, steadyNowNs());
+    } else {
+      auto inlineAckGuard = qp->lockForInlineAckApply();
+      qp->getTxFlowById(flowId)->processAckPacket(
+          ackHeader, simulatedProcessedAtNs(ackHeader.getTimestamp()));
+    }
   }
 
-  EXPECT_EQ(qp->getNumPendingWqes(), 0)
-      << "WQE should have completed after processing the acks on all paths.";
-  struct ibv_wc wc;
-  if (verbs.ibv_poll_cq(cq, 1, &wc) > 0) {
+  struct ibv_wc wc{};
+  if (pollOneCompletion(verbs, cq, wc)) {
     EXPECT_EQ(wc.status, WorkCompletionStatus::kSuccess);
     EXPECT_EQ(wc.byte_len, wqeSizeBytes);
     EXPECT_EQ(wc.wr_id, wqeWrId);
@@ -2200,13 +2203,24 @@ TEST(MetaRoceVerbsTest, PostSentWQE) {
             qp->getLocalQpNum(), MetaRoceVerbs::qpAndTagToTag(ibvqp->qp_num)));
     EXPECT_EQ(wc.opcode, IBV_WC_RDMA_WRITE);
   } else {
-    EXPECT_TRUE(false) << "expected to find a completion in the queue";
+    ADD_FAILURE()
+        << "the ACKs must report the write completion before teardown";
   }
+  EXPECT_EQ(qp->getNumPendingWqes(), 0)
+      << "the acknowledged write must leave no pending WQE";
 
   EXPECT_EQ(verbs.ibv_dereg_mr(mr), 0);
   EXPECT_EQ(verbs.ibv_destroy_qp(ibvqp), 0);
   EXPECT_EQ(verbs.ibv_destroy_cq(cq), 0);
   EXPECT_EQ(verbs.ibv_dealloc_pd(pd), 0);
+}
+
+TEST(MetaRoceVerbsTest, PostSentWQE) {
+  testPostSentWqe(/*singleOwnerTx=*/true);
+}
+
+TEST(MetaRoceVerbsTest, PostSentWqeWithInlineAcks) {
+  testPostSentWqe(/*singleOwnerTx=*/false);
 }
 
 /*
