@@ -73,7 +73,7 @@ inline constexpr uint8_t kLocalAckTimeoutExponentCeiling = 19;
 // --- Device Capability Limits ---
 // Reported via ibv_query_device to emulate hardware limits.
 inline constexpr uint8_t kPhysicalPortCount = 1;
-inline constexpr uint32_t kMaxMemoryRegions = 16777216;
+inline constexpr uint32_t kMaxMemoryRegions = 1048576;
 inline constexpr uint32_t kMaxCqEntries = 32768;
 inline constexpr uint32_t kMaxCompletionQueues = 1048576;
 inline constexpr int kCompletionVectorCount = 1;

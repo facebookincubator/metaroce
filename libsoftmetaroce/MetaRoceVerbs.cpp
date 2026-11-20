@@ -1745,11 +1745,7 @@ struct ibv_mr* FOLLY_NULLABLE MetaRoceVerbs::ibv_reg_mr_internal(
   if (!everyPageIsMapped(addr, length)) {
     return nullSettingErrno(EFAULT);
   }
-  struct ibv_mr* const mr = memoryRegions_.reg_mr(pd, addr, length, access);
-  if (mr == nullptr) {
-    return nullSettingErrno(EINVAL);
-  }
-  return mr;
+  return memoryRegions_.reg_mr(pd, addr, length, access);
 }
 
 int MetaRoceVerbs::ibv_dereg_mr(struct ibv_mr* mr) {

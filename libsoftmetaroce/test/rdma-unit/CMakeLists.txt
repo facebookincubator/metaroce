@@ -323,6 +323,7 @@ set(LSMR_RDMA_UNIT_GREEN
     DeviceTest.ContextTomfoolery
     DeviceTest.QueryDevice
     DeviceLimitTest.MaxPd
+    DeviceLimitTest.MaxMr
     PdTest.AllocPd
     MrTest.RegisterMemory
     BufferTest.RegisterZeroByteMr

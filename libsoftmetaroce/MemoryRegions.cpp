@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 
 #include <libsoftmetaroce/MemoryRegions.h>
+#include <cerrno>
 #include <limits>
 
 namespace libsoftmetaroce {
@@ -197,6 +198,7 @@ struct ibv_mr* FOLLY_NULLABLE MemoryRegions::reg_mr(
   // no end to measure an address against.
   if (length >
       std::numeric_limits<uint64_t>::max() - reinterpret_cast<uint64_t>(addr)) {
+    errno = EINVAL;
     return nullptr;
   }
   // Remote write and remote atomic both write into the region, so either
@@ -207,12 +209,17 @@ struct ibv_mr* FOLLY_NULLABLE MemoryRegions::reg_mr(
   if (writesTheRegionRemotely && (access & IBV_ACCESS_LOCAL_WRITE) == 0) {
     LOG(ERROR) << "reg_mr asks for remote write or remote atomic without local "
                << "write; access 0x" << std::hex << access << std::dec;
+    errno = EINVAL;
     return nullptr;
   }
   // start with key == 1 to separate from uninitialized 0.
-  // One hold for the key and the insert that uses it, so two registrations
-  // cannot be handed the same one.
+  // One hold for the count, the key and the insert that uses it, so two
+  // registrations can neither pass the limit together nor share a key.
   auto lockedRegions = memoryRegions_.wlock();
+  if (lockedRegions->size() >= kMaxMemoryRegions) {
+    errno = ENOSPC;
+    return nullptr;
+  }
   const uint32_t key = ++last_key_;
 
   auto placed = lockedRegions->emplace(

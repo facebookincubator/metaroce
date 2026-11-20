@@ -83,8 +83,7 @@ class MemoryRegions {
       const struct ibv_pd* pd,
       uint64_t addr,
       uint32_t rkey) const;
-  // Returns nullptr when access asks for remote write or remote atomic
-  // without local write.
+  // Returns nullptr with errno set to the code ibv_reg_mr reports.
   struct ibv_mr* FOLLY_NULLABLE
   reg_mr(struct ibv_pd* pd, void* addr, size_t length, int access);
   // True while any region is registered under `pd`, which is what
