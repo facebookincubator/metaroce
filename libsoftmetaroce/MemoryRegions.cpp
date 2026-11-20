@@ -17,6 +17,7 @@
 #include <glog/logging.h>
 
 #include <libsoftmetaroce/MemoryRegions.h>
+#include <libsoftmetaroce/NextFreeId.h>
 #include <cerrno>
 #include <limits>
 
@@ -212,7 +213,6 @@ struct ibv_mr* FOLLY_NULLABLE MemoryRegions::reg_mr(
     errno = EINVAL;
     return nullptr;
   }
-  // start with key == 1 to separate from uninitialized 0.
   // One hold for the count, the key and the insert that uses it, so two
   // registrations can neither pass the limit together nor share a key.
   auto lockedRegions = memoryRegions_.wlock();
@@ -220,7 +220,15 @@ struct ibv_mr* FOLLY_NULLABLE MemoryRegions::reg_mr(
     errno = ENOSPC;
     return nullptr;
   }
-  const uint32_t key = ++last_key_;
+  // start with key == 1 to separate from uninitialized 0.
+  const std::optional<uint32_t> maybeKey = nextFreeId(
+      nextKeyToAssign_,
+      1,
+      std::numeric_limits<uint32_t>::max(),
+      [&lockedRegions](uint32_t key) { return lockedRegions->contains(key); });
+  CHECK(maybeKey.has_value())
+      << "the count checked above leaves keys free, so nextFreeId finds one";
+  const uint32_t key = *maybeKey;
 
   auto placed = lockedRegions->emplace(
       key,

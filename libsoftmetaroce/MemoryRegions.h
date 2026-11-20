@@ -158,9 +158,9 @@ class MemoryRegions {
   }
 
   folly::Synchronized<MemoryRegionsMap> memoryRegions_;
-  // first key will be 1. Read and written only under memoryRegions_'s write
-  // lock, which is what keeps two registrations off the same key.
-  uint32_t last_key_{0};
+  // Read and written only under memoryRegions_'s write lock, which is what
+  // keeps two registrations off the same key.
+  uint32_t nextKeyToAssign_{1};
 };
 
 } // namespace libsoftmetaroce
