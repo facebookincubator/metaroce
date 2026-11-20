@@ -212,6 +212,7 @@ set(LSMR_RDMA_UNIT_GREEN
     LoopbackRcQpTest.CompareSwapEqualWithSwap
     LoopbackRcQpTest.SgePointerChase
     LoopbackRcQpTest.QueryQpInitialState
+    LoopbackRcQpTest.FullSubmissionQueue
     QpTest.MaxSge
     QpTest.UnknownType
     MrTest.DeregInvalidMr
@@ -244,6 +245,7 @@ set(LSMR_RDMA_UNIT_GREEN
     ThreadedTest.CreateSrq
     SrqTest.Send
     SrqTest.SendRnr
+    SrqTest.SendManyWithOneOutstanding
     SrqRcMultiplexTest.Send
     SrqRcMultiplexTest.WriteWithImmediate
     SrqMultiThreadTest.MultiThreadedSrqLoopback

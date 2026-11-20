@@ -76,8 +76,6 @@ class IntrospectionLsmr : public NicIntrospection {
     // atomic operand length.
     static const absl::flat_hash_map<TestcaseKey, std::string> deviations{
         {{"SrqTest", "QpFlush"}, "Provider does not support UD."},
-        {{"SrqTest", "SendManyWithOneOutstanding"},
-         "Provider takes one sge per work request."},
         {{"SrqTest", "OverflowSrq"}, "Provider does not support SRQ."},
         {{"SrqTest", "ModifyMaxWr"}, "Provider does not support SRQ resizing."},
 
@@ -245,10 +243,6 @@ class IntrospectionLsmr : public NicIntrospection {
          "lsmr does not allow posting to SQ in Init state."},
         {{"QpStateTest", "PostSendRtr"},
          "lsmr does not allow posting to SQ in Rtr state."},
-
-        // The test indexes past its WR vector when the SQ never fills.
-        {{"LoopbackRcQpTest", "FullSubmissionQueue"},
-         "lsmr does not report a full submission queue."},
 
         // A receive overflow is indistinguishable from wire alignment padding
         // when the payload and the receive length fall within the same
