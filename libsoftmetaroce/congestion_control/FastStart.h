@@ -21,6 +21,7 @@
 #include <folly/container/F14Map.h>
 #include <libsoftmetaroce/congestion_control/CongestionController.h>
 #include <libsoftmetaroce/congestion_control/Flags.h>
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 #include <stdexcept>
@@ -31,8 +32,8 @@ DECLARE_int32(libsoftmetaroce_initial_qwnd_max);
 namespace libsoftmetaroce {
 
 /* Congestion controller implementation that includes only fast
-   start. In fast start, increment fwnd by every packet we send until
-   we see an ack.  Any flows with zero fwnd will stay that way.  No
+   start. In fast start, increment fwnd by every packet we send, up to
+   the maximum fwnd.  Any flows with zero fwnd will stay that way.  No
    other control (ecn response) is applied here. */
 class FastStart : public CongestionController {
  public:
@@ -46,7 +47,7 @@ class FastStart : public CongestionController {
     if (inFastStart_ && flow.fwnd < maxFwnd_) {
       flow.fwnd += 1;
       qwnd_++;
-      inFastStart_ = qwnd_ < qwnd_max_;
+      inFastStart_ = qwnd_ < std::min(qwnd_max_, maxFwnd_ * numFlows());
     }
     flow.inflightPackets += 1;
   }

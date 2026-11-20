@@ -17,6 +17,8 @@
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
 #include <libsoftmetaroce/congestion_control/BaselineWithRCN.h>
+#include <array>
+#include <string>
 
 DECLARE_int32(libsoftmetaroce_max_qwnd);
 DECLARE_int32(libsoftmetaroce_fwnd_floor);
@@ -63,6 +65,12 @@ class BaselineWithRCNTest : public ::testing::Test {
         .rcnDesiredRateGbps = rcnRate,
     };
   }
+
+  static constexpr CongestionController::AckEvent kAckWithNoSendPending{
+      .numAckedPackets = 1,
+      .smoothedQpRttNs = 10'000,
+      .rcnDesiredRateGbps = 100,
+      .sendPending = false};
 
   // Helper to send N packets
   static void sendPackets(TestableBaselineWithRCN& cc, int count) {
@@ -488,6 +496,87 @@ TEST_F(BaselineWithRCNTest, CongestionResponseStillReducesBelowTheFloor) {
   EXPECT_LT(cc.getFwnd(kFlowId), floor)
       << "ECN must still be able to reduce a flow below the floor; a floor "
          "that congestion response could not cross would be a minimum";
+}
+
+TEST_F(
+    BaselineWithRCNTest,
+    ASenderWithOneMessageInFlightUsesBothFlowsAtMaxFwnd) {
+  gflags::FlagSaver flagSaver;
+  constexpr uint16_t kMaxFwnd = 4;
+  gflags::SetCommandLineOption(
+      "libsoftmetaroce_max_fwnd", std::to_string(kMaxFwnd).c_str());
+  TestableBaselineWithRCN cc(kEpsilon, kBeta, kGammaNumerator, kOmegaNs);
+  cc.setMTU(2048);
+  cc.onFlowAdded(0);
+  cc.onFlowAdded(1);
+
+  std::array<int, 2> sendsAfterTheCap{};
+  int rotation = 0;
+  for (int message = 0; message < 6 * kMaxFwnd; ++message) {
+    const auto next = cc.flowForNextSend();
+    const bool scheduled =
+        next.has_value() && cc.getAvailableWindowSize(next->flowId) > 0;
+    const auto flow =
+        static_cast<uint16_t>(scheduled ? next->flowId : rotation++ % 2);
+    ASSERT_GT(cc.getAvailableWindowSize(flow), 0)
+        << "the sender stalls at message " << message << "; fwnds are "
+        << cc.getFwnd(0) << " and " << cc.getFwnd(1);
+    cc.onPacketSent(flow);
+    cc.onPacketAck(flow, kAckWithNoSendPending);
+    if (message >= 2 * kMaxFwnd) {
+      ++sendsAfterTheCap.at(flow);
+    }
+  }
+
+  ASSERT_GT(cc.getQwndMax(), 2 * kMaxFwnd)
+      << "precondition: the rate hint holds qwnd_max above what both flows can "
+         "hold, so qwnd_max cannot end fast start";
+  EXPECT_FALSE(cc.flowForNextSend().has_value())
+      << "fast start must end once both flows hold their maximum fwnd, since "
+         "qwnd can no longer grow to advance its schedule";
+  for (uint16_t flow = 0; flow < 2; ++flow) {
+    EXPECT_LE(cc.getFwnd(flow), kMaxFwnd)
+        << "the controller must not grow flow " << flow
+        << " past its maximum fwnd";
+    EXPECT_GT(sendsAfterTheCap.at(flow), 0)
+        << "all traffic after the flows reach their maximum fwnd goes to one "
+        << "flow; flow " << flow << " sends none of it";
+  }
+}
+
+TEST_F(
+    BaselineWithRCNTest,
+    FlowsAtMaxFwndRetainAvailableWindowWithAnotherFlowDisabled) {
+  gflags::FlagSaver flagSaver;
+  constexpr uint16_t kMaxFwnd = 4;
+  constexpr uint16_t kDisabledFlow = 2;
+  gflags::SetCommandLineOption(
+      "libsoftmetaroce_max_fwnd", std::to_string(kMaxFwnd).c_str());
+  TestableBaselineWithRCN cc(kEpsilon, kBeta, kGammaNumerator, kOmegaNs);
+  cc.setMTU(2048);
+  cc.onFlowAdded(0);
+  cc.onFlowAdded(1);
+  cc.onFlowAdded(kDisabledFlow);
+  for (uint16_t flow = 0; flow < 2; ++flow) {
+    for (int sent = 0; sent < kMaxFwnd; ++sent) {
+      cc.onPacketSent(flow);
+      cc.onPacketAck(flow, kAckWithNoSendPending);
+    }
+  }
+  cc.onPacketSent(kDisabledFlow);
+  cc.onFlowDisabled(kDisabledFlow);
+
+  for (int message = 0; message < 4 * kMaxFwnd; ++message) {
+    const auto flow = static_cast<uint16_t>(message % 2);
+    ASSERT_GT(cc.getAvailableWindowSize(flow), 0)
+        << "flow " << flow << " stalls at message " << message << " with fwnd "
+        << cc.getFwnd(flow);
+    cc.onPacketSent(flow);
+    cc.onPacketAck(flow, kAckWithNoSendPending);
+  }
+  ASSERT_TRUE(cc.flowForNextSend().has_value())
+      << "precondition: flow 2 is out of service, so not every flow can reach "
+         "its maximum fwnd and fast start keeps running";
 }
 
 } // namespace libsoftmetaroce

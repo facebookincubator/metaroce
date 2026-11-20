@@ -15,9 +15,26 @@
  */
 
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <libsoftmetaroce/TxFlow.h>
+#include <libsoftmetaroce/codec/AckHeader.h>
+#include <libsoftmetaroce/codec/Header.h>
+#include <libsoftmetaroce/codec/Packet.h>
+#include <libsoftmetaroce/congestion_control/CongestionControllerFactory.h>
 #include <libsoftmetaroce/congestion_control/FastStart.h>
+#include <libsoftmetaroce/modifier/Modifier.h>
+#include <libsoftmetaroce/test/AckProcessedAt.h>
+#include <libsoftmetaroce/test/LimitedTestSender.h>
+#include <libsoftmetaroce/test/MockUDPSocket.h>
+#include <libsoftmetaroce/test/QpTestBase.h>
+#include <libsoftmetaroce/test/TxTimerSuppressor.h>
+#include <array>
+#include <memory>
+#include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 
 using namespace testing;
 namespace libsoftmetaroce {
@@ -196,9 +213,8 @@ TEST_F(FastStartTest, AnAckWithNothingToSendLeavesFastStartRunning) {
 }
 
 /*
- * A sender with one small message in flight at a time sees every ack with
- * nothing pending, so fast start keeps running while each flow's fwnd climbs to
- * its maximum. A flow there must keep sending as its acks come back.
+ * A sender with one small message in flight at a time sees every ack arrive
+ * with no unsent work.
  */
 TEST_F(FastStartTest, AFlowAtItsMaximumFwndKeepsSendingAsAcksReturn) {
   gflags::FlagSaver flagSaver;
@@ -207,6 +223,7 @@ TEST_F(FastStartTest, AFlowAtItsMaximumFwndKeepsSendingAsAcksReturn) {
       "libsoftmetaroce_max_fwnd", std::to_string(kMaxFwnd).c_str());
   FastStart cc;
   cc.onFlowAdded(0);
+  cc.onFlowAdded(1);
 
   for (int message = 0; message < 3 * kMaxFwnd; ++message) {
     ASSERT_GT(cc.getAvailableWindowSize(0), 0)
@@ -221,7 +238,8 @@ TEST_F(FastStartTest, AFlowAtItsMaximumFwndKeepsSendingAsAcksReturn) {
   }
 
   ASSERT_TRUE(cc.flowForNextSend().has_value())
-      << "precondition: acks with nothing pending leave fast start running";
+      << "precondition: flow 1 stays below its maximum fwnd, so acks that "
+         "arrive with no unsent work leave fast start running";
   EXPECT_EQ(cc.getFwnd(0), kMaxFwnd)
       << "fast start must not grow a flow past its maximum fwnd";
 }
@@ -478,6 +496,103 @@ TEST_F(FastStartTest, DisablingFlowZeroLeavesItsWindowAlone) {
       << "flow 0 stays in service, so its window must not be shed";
   EXPECT_EQ(cc.getQwnd(), qwndBefore)
       << "the aggregate must be unchanged, since nothing left it";
+}
+
+namespace {
+std::pair<std::unique_ptr<folly::AsyncUDPSocket>, std::unique_ptr<Modifier>>
+mockUDPSocketMaker(folly::EventBase* evb) {
+  return std::make_pair(
+      std::make_unique<::testing::NiceMock<MockUDPSocket>>(evb), nullptr);
+}
+} // namespace
+
+class QpFastStartTest : public QpTestBase {
+ protected:
+  // Posts a one-frame send and acks the frame the queue pair puts on the wire.
+  // Returns the flow that sent the frame, or nullopt if the queue pair sent no
+  // packet.
+  std::optional<uint16_t> sendOneFrameMessage() {
+    EXPECT_NE(
+        postWqeHelper(
+            &qp,
+            WqeData{
+                .workType = Wqe::WorkType::kSend,
+                .msgSizeBytes = mtu,
+                .address = payload_.data()}),
+        nullptr)
+        << "precondition: the queue pair accepts the send, or it has no frame "
+           "to put on the wire";
+    const auto egress = qp.getNextPacketToSend();
+    if (!egress) {
+      return std::nullopt;
+    }
+    const auto* data = dynamic_cast<const DataPacket*>(egress->packet.get());
+    if (data == nullptr) {
+      ADD_FAILURE() << "a send's only packet carries its frame";
+      return std::nullopt;
+    }
+    const uint16_t flow = data->getBaseHeader().getFlowId();
+    const uint16_t fsn = data->getDataHeader().getFsn();
+    const uint32_t sentAtNs = data->getDataHeader().getTimestamp();
+    CHECK_NOTNULL(qp.getTxFlowById(flow))
+        ->processAckPacket(
+            AckHeader::AckHeaderBuilder()
+                .setCumulativeFsn(fsn)
+                .setMaxRcvdFsn(fsn)
+                .setAckStatus(AckStatus::ACK)
+                .setRateHints(kDefaultRateHintGbps)
+                .setTimestamp(sentAtNs)
+                .build(),
+            simulatedProcessedAtNs(sentAtNs));
+    return flow;
+  }
+
+  std::vector<char> payload_ = std::vector<char>(mtu);
+};
+
+// Each message contains one frame. The sender posts the next message after
+// acknowledging the previous frame.
+TEST_F(QpFastStartTest, ASenderWithOneMessageInFlightUsesBothFlowsAtMaxFwnd) {
+  gflags::FlagSaver flagSaver;
+  constexpr uint16_t kMaxFwnd = 4;
+  gflags::SetCommandLineOption(
+      "libsoftmetaroce_max_fwnd", std::to_string(kMaxFwnd).c_str());
+  ScopedSuppressedTxTimers suppressTimers;
+  auto controller =
+      CongestionControllerFactory{}.makeCongestionController("baseline_rcn");
+  ASSERT_NE(controller, nullptr);
+  const CongestionController& cc = *controller;
+  controller->setMTU(mtu);
+  qp.setCongestionController(std::move(controller));
+  LimitedTestSender sender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(2, 2, &sender);
+
+  for (int message = 0; message < 2 * kMaxFwnd; ++message) {
+    ASSERT_TRUE(sendOneFrameMessage().has_value())
+        << "the queue pair stalls at message " << message
+        << " while the flows fill; fwnds are " << cc.getFwnd(0) << " and "
+        << cc.getFwnd(1);
+  }
+  for (uint16_t flow = 0; flow < 2; ++flow) {
+    ASSERT_EQ(cc.getFwnd(flow), kMaxFwnd)
+        << "precondition: flow " << flow
+        << " holds its maximum fwnd before the packets counted below";
+  }
+
+  std::array<int, 2> sendsAtMaxFwnd{};
+  for (int message = 0; message < 4 * kMaxFwnd; ++message) {
+    const auto flow = sendOneFrameMessage();
+    ASSERT_TRUE(flow.has_value())
+        << "the queue pair stalls at message " << message
+        << " after the flows fill; fwnds are " << cc.getFwnd(0) << " and "
+        << cc.getFwnd(1);
+    ++sendsAtMaxFwnd.at(*flow);
+  }
+  for (uint16_t flow = 0; flow < 2; ++flow) {
+    EXPECT_GT(sendsAtMaxFwnd.at(flow), 0)
+        << "all traffic after the flows reach their maximum fwnd goes to one "
+        << "flow; flow " << flow << " sends none of it";
+  }
 }
 
 } // namespace libsoftmetaroce
