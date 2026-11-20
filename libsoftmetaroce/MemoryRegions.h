@@ -24,10 +24,10 @@
 #include <libsoftmetaroce/codec/ReadWriteHeader.h>
 #include <algorithm>
 #include <cstdint>
-#include <map>
 #include <memory>
 #include <optional>
 #include <span>
+#include <unordered_map>
 
 namespace libsoftmetaroce {
 
@@ -58,7 +58,8 @@ struct RegisteredMemoryRegion {
   permits(uint64_t address, uint32_t length, int requiredAccess) const;
 };
 
-using MemoryRegionsMap = std::map<uint32_t, RegisteredMemoryRegion>;
+// Node-based, because reg_mr returns the address of an entry.
+using MemoryRegionsMap = std::unordered_map<uint32_t, RegisteredMemoryRegion>;
 
 class MemoryRegions {
  public:
