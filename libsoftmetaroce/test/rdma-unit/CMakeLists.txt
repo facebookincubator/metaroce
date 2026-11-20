@@ -347,6 +347,8 @@ set(LSMR_RDMA_UNIT_GREEN
     BufferMrTest.SendZeroByteOutsideMr
     BufferMrTest.SendZeroByteFromZeroByteMr
     MrLoopbackTest.OutstandingRecv
+    MrLoopbackTest.OutstandingRead
+    MrLoopbackTest.OutstandingWrite
     QpTest.Create
     QpTest.CreateWithInlineMax
     QpTest.ZeroSendWr
@@ -405,6 +407,7 @@ set(LSMR_RDMA_UNIT_GREEN
     CqOverflowTest.RecvSharedCqOverflow
     CqBatchOpTest.SendSharedCq
     CqBatchOpTest.RecvSharedCq
+    StressTest.Write32B100Qp100kOps
 )
 string(JOIN ":" LSMR_RDMA_UNIT_FILTER ${LSMR_RDMA_UNIT_GREEN})
 # Reject filter entries whose test definition is absent from the fetched suite.
