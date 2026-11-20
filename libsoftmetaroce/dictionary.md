@@ -315,6 +315,34 @@ tag-owned pending state (`processTransmitWqe`, `processReceiveWqe`); until
 then the set's queue holds it. A tag **draws** a receive WQE when it removes
 one from its shared receive queue.
 
+## Timers
+
+**Interval** -- a duration: the RTO (`computeRtoIntervalUs()`), a backoff, the
+watchdog interval. **Expiry**, or **deadline**, is the time at which an
+interval ends, on the clock that measures it: the protocol clock for the RTO
+and a backoff (`clock-domains.md`), the steady clock for the watchdog. Prefer
+*expiry* for new RTO and backoff fields; existing deadline names
+(`hrnrBackoffDeadlineNs_`) remain valid. *Expiry* also names the event of
+reaching that time, as in watchdog expiry.
+
+A timer is **armed** to invoke its callback, and **fires** when the callback
+runs; that run is a **wake** (`onRtoWake()`). A wake can precede the RTO
+expiry it serves, since a send can move that expiry after the timer was armed,
+so the callback checks whether the RTO or backoff has expired.
+
+**Running** -- of the retransmission timer (`retxTimerRunning_`): armed, or
+in a callback that has yet to decide whether to arm another wake.
+
+**Waking the sender** -- signaling the arbiter that a queue pair is ready
+(`signalReadyAsync()`); `SenderWake` records whether a caller must. A timer
+callback may also signal the sender, so say *the sender* when the sender is
+what wakes.
+
+Prefer *armed* and *fired* where they separate a timer's state from a protocol
+expiry. Established API names (`scheduleTimeout()`, `isScheduled()`) and clear
+existing prose stay. Give *timeout* enough context to say whether it means a
+duration, a timer callback, or a failure to complete within a bound.
+
 ## Words not to use
 
 **Done** says neither whether the wire is clear nor whether the client was
