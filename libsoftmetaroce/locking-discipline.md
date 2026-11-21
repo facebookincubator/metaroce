@@ -15,7 +15,7 @@ around `Tag`, `TagSet`, `TxFlow`, or QP teardown.
 | `TagSet::schedulerLock_` | `folly::MicroLock` | round-robin state (`scheduler_`): the sender's turns against the retransmit timer's peek | per-TagSet |
 | `Tag::pendingReceives_` | `folly::Synchronized` r/w lock | the receives waiting by csn (`receivesByCsn`) and the dedicated-queue RNR-Cancel request (`rnrCancelRequested`); receive lookup and request recording are atomic with receive insertion and request clearing | per-Tag (fine) |
 | `Tag::msnSpan_` | `folly::Synchronized` r/w lock | the msn span: the posted send-WQE map and the three cursors that bound it (`nextMsn`, `inOrderCompletedMsn`, `inOrderRetiredMsn`) | per-Tag (fine) |
-| `sndCur` | `folly::Synchronized` wlock in `TxFlow` | the send cursor / transmit state | per-path -- one per `TxFlow`, so holding it excludes no work on a sibling path of the same QP |
+| `sndCur` | `folly::Synchronized` wlock in `TxFlow` | the send cursor / transmit state | per-flow -- one per `TxFlow`, so holding it excludes no work on a sibling flow of the same QP |
 | `qpNumToQp_` | `folly::Synchronized` r/w lock in `MetaRoceVerbs` | the `qpNum -> Qp` map | process-wide |
 | `Qp::txStateLock_` | plain mutex (`lockForInlineAckApply`) | a QP's whole transmit state against two writers, when a receiver applies ACKs inline instead of handing them to the sender. Engaged only in that mode | per-QP (coarse) |
 | `SynchronizedCongestionController::box_` | plain mutex in a `folly::Synchronized` | the congestion controller's mutable state | per-QP |

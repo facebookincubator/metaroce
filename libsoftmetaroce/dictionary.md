@@ -14,10 +14,10 @@ the level first.
 | Level | What it is | Where its state lives |
 |---|---|---|
 | **posn** | packet offset sequence number: where a packet's data belongs in the buffer, and so one packet's worth of a message | `Wqe::rejectedPosns_`, `Wqe::requestFrameStatus_` |
-| **frame** | one packet actually put on a path, identified by the fsn it carries | `TxFlow::txState_.tracker`, a `Flow::FsnState` per entry |
+| **frame** | one packet actually put on a flow, identified by the fsn it carries | `TxFlow::txState_.tracker`, a `Flow::FsnState` per entry |
 | **work request** (WQE) | one client work request, or work this side creates as responder | `Wqe::isFailing_`, the posn statuses above |
 | **tag** | one `ibv_qp` handle of a multi-tag QP, holding its own work requests | `Tag`, `ibv_qp::state` |
-| **QP** | the whole `TagSet`: every tag, sharing the transmit paths | the tags' `ibv_qp::state`, collectively |
+| **QP** | the whole `TagSet`: every tag, sharing the transmit flows | the tags' `ibv_qp::state`, collectively |
 
 Never spell posn "position": that reads as an ordinal, and the posn is an
 offset.
@@ -39,7 +39,7 @@ For a read or atomic the posns are what the *responder* will fill, and the one
 frame this side sends is separate from them.
 
 A frame and a posn describe the same packet from two sides: the tracker says
-whether the *path* still expects an answer, the posn says whether the *message*
+whether the *flow* still expects an answer, the posn says whether the *message*
 still does. They are separate enums and can disagree in flight, so `Wqe` names
 each accessor for the one it takes -- `abandonFrame()` against `abandonPosn()`.
 The two families agree for a send and not for a read.
@@ -119,7 +119,7 @@ abandoned posn is in neither. A posn handed back by a BRNR is REJECTED and
 unsent again while its old entry stays BRNR until it retires: the
 retransmission is a new frame carrying a new fsn. REJECTED is what lets
 `sndNxtPosn_` only ever move forward: a posn coming back is a hole behind the
-cursor rather than a reason to wind it back. Tearing a path down is the
+cursor rather than a reason to wind it back. Tearing a flow down is the
 one case with no entry to read, since it abandons the posns of its unacked
 frames and drops the tracker with them.
 
@@ -153,7 +153,7 @@ since resending only delays the error the client is waiting for. A BRNR abandons
 an allocated frame of a failing work request rather than handing it back: a
 returned posn is REJECTED and unsent again, which undoes the allocation
 freeze `markFailing()` set and leaves a work request that can never settle.
-Tearing a path down abandons the posn with no entry left to mark.
+Tearing a flow down abandons the posn with no entry left to mark.
 
 ## Work request states
 
