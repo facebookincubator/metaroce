@@ -37,6 +37,7 @@
 
 DECLARE_uint32(libsoftmetaroce_max_rto_us);
 DECLARE_uint32(libsoftmetaroce_rtos_before_repath);
+DECLARE_uint32(libsoftmetaroce_rto_retransmission_count);
 inline constexpr uint32_t kRtxRepathDisabledSentinel = 0;
 
 namespace libsoftmetaroce {
@@ -111,6 +112,7 @@ class TxFlow : public Flow {
     uint16_t maxAckdFsn{UINT16_MAX};
     folly::Synchronized<uint16_t> sndCur{0}; // Next packet to be retransmitted
     bool inRecycleQ{false};
+    std::optional<uint16_t> rtoRecoveryEnd;
     std::deque<TrackerState> tracker;
 
     // Instrumentation only: per-QP teardown diagnostics.
@@ -187,7 +189,9 @@ class TxFlow : public Flow {
   // Called when either a loss by out-of-order is detected upon processing
   // an ACK or when retransmission timer expires. Returns the number of
   // packets queued for retransmission.
-  uint16_t prepareRetxPacketsIfAny(bool isRtoEvent);
+  uint16_t prepareRetxPacketsIfAny(
+      bool isRtoEvent,
+      uint32_t newlyAckedDuringRto = 0);
 
   [[nodiscard]] uint32_t computeRttNs(uint32_t timestampNs, uint32_t nowNs)
       const;

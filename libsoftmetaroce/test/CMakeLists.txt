@@ -27,7 +27,7 @@ target_link_libraries(lsmr_test_main PRIVATE Folly::folly glog::glog
 # QpTestBase.cpp compiles into the tests that use the Qp fixture (mirroring
 # test/BUCK's :qp_test_base users); the mock-socket and sender helpers the
 # concurrency test also uses are header-only, so they need no wiring here.
-set(LSMR_QP_BASE_TESTS EcnSourcePortChangeTest FlowActivationTest QpTest QpWithTagsTest RtoRepathTest CongestionControllerConcurrencyTest FastStartTest)
+set(LSMR_QP_BASE_TESTS EcnSourcePortChangeTest FlowActivationTest QpTest QpWithTagsTest RtoRepathTest RtoRetransmissionTest CongestionControllerConcurrencyTest FastStartTest)
 
 set(LSMR_TEST_SRCS
     AckedSendTest.cpp
@@ -73,6 +73,7 @@ set(LSMR_TEST_SRCS
     RenamedFlagTest.cpp
     RoceV2iCRCTest.cpp
     RtoRepathTest.cpp
+    RtoRetransmissionTest.cpp
     RttEstimatorTest.cpp
     SenderTest.cpp
     SgeListTest.cpp

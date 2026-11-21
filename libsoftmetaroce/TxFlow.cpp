@@ -39,6 +39,11 @@ DEFINE_uint32(
     2,
     "Try to repath (change entropy) if this many RTOs have occurred on a socket");
 
+DEFINE_uint32(
+    libsoftmetaroce_rto_retransmission_count,
+    0,
+    "Maximum oldest unacknowledged packets retransmitted per RTO; 0 sends all");
+
 DECLARE_uint32(libsoftmetaroce_min_rto_us);
 DEFINE_bool(
     libsoftmetaroce_slow_receiver,
@@ -1053,6 +1058,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     }
   };
   bool shouldSackRetransmit = false;
+  bool partialRto = false;
   // Tags whose frames are abandoned below, to complete outside the lock.
   std::bitset<kMetaRoceTagCount> tagsWithAbandonedFrames;
   {
@@ -1215,6 +1221,11 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     bool hasSackHoles = after(txState_.maxAckdFsn, *lockedSndCur);
     shouldSackRetransmit =
         hasSackHoles && isAllowedToFastRetransmit(*lockedSndCur);
+    partialRto = txState_.rtoRecoveryEnd &&
+        before(*lockedSndCur, *txState_.rtoRecoveryEnd);
+    if (!partialRto) {
+      txState_.rtoRecoveryEnd.reset();
+    }
   } // end scope holding sndCur lock
 
   qp_.retireTagsWithAbandonedFrames(tagsWithAbandonedFrames);
@@ -1262,8 +1273,10 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
                           << numPosnDeallocated << " posns across "
                           << minBrnrMsnByTag.size() << " tag(s)";
   }
-  if (shouldSackRetransmit || numPosnDeallocated > 0) {
-    auto retxCount = prepareRetxPacketsIfAny(false);
+  if (partialRto ? !newlyAckedPkts.empty()
+                 : shouldSackRetransmit || numPosnDeallocated > 0) {
+    auto retxCount = prepareRetxPacketsIfAny(
+        false, partialRto ? static_cast<uint32_t>(newlyAckedPkts.size()) : 0);
     if (retxCount > 0) {
       cc.onPacketLoss(
           flowId_,
@@ -1352,7 +1365,9 @@ uint16_t TxFlow::retireResolvedFramesAtWindowHead(uint16_t& sndCur) {
   return abandonedCount;
 }
 
-uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
+uint16_t TxFlow::prepareRetxPacketsIfAny(
+    bool isRtoEvent,
+    uint32_t newlyAckedDuringRto) {
   if (txState_.sndNxt == txState_.sndUna) {
     return 0;
   }
@@ -1365,6 +1380,9 @@ uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
     return 0;
   }
   uint16_t retxCount = 0;
+  const uint32_t maxRetxPackets = isRtoEvent
+      ? FLAGS_libsoftmetaroce_rto_retransmission_count
+      : newlyAckedDuringRto;
   uint16_t numRetiredAbandonedFrames = 0;
   uint32_t retxRateHints = computeRateHints(
       qp_.congestionController_ ? qp_.congestionController_->getQwnd() : 0);
@@ -1376,14 +1394,19 @@ uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
       // reset sndCur to sndUna so that the unacked packets that were
       // retransmitted because of out-of-order can be retransmitted again.
       *lockedSndCur = txState_.sndUna;
+      txState_.rtoRecoveryEnd = maxRetxPackets > 0
+          ? std::optional<uint16_t>{txState_.sndNxt}
+          : std::nullopt;
     }
 
     // In case of RTO, all packets we've sent (and haven't been acked) may be
     // lost. For SACK retransmission with windowed modes, limit the cursor to
     // base on mode, retransmitting only packets outside the
     // reordering tolerance window.
-    const auto cursorLimit =
-        isRtoEvent ? txState_.sndNxt : sackRetxCursorLimit();
+    const auto cursorLimit = isRtoEvent ? txState_.sndNxt
+        : newlyAckedDuringRto > 0
+        ? txState_.rtoRecoveryEnd.value_or(txState_.sndUna)
+        : sackRetxCursorLimit();
     for (; before(*lockedSndCur, cursorLimit); (*lockedSndCur)++) {
       // If sndCur is before cursorLimit and it is not acked, it can be
       // assumed lost.
@@ -1447,15 +1470,22 @@ uint16_t TxFlow::prepareRetxPacketsIfAny(bool isRtoEvent) {
           /*isRetransmit=*/true,
           /*isTimeout=*/isRtoEvent,
           retxRateHints));
-      if (isRtoEvent && qp_.getHrnrState() == HrnrState::HRNR_PROBING &&
-          retxPktsToSend_.rlock()->size() > 0) {
+      if (isRtoEvent && qp_.getHrnrState() == HrnrState::HRNR_PROBING) {
         // In HRNR_PROBING, queue only a single packet as the probe and wait for
         // the next backoff or a sign of life (ACK/RNR-cancel).
         VLOG(2) << "Queueing a single probe packet after RTO";
         break;
       }
+      if (maxRetxPackets > 0 && retxCount >= maxRetxPackets) {
+        ++(*lockedSndCur);
+        break;
+      }
     }
     numRetiredAbandonedFrames = retireResolvedFramesAtWindowHead(*lockedSndCur);
+    if (txState_.rtoRecoveryEnd &&
+        !before(*lockedSndCur, *txState_.rtoRecoveryEnd)) {
+      txState_.rtoRecoveryEnd.reset();
+    }
   }
   if (numRetiredAbandonedFrames > 0 && qp_.congestionController_) {
     // Not acknowledged, but they leave the window the same way, and the acked
