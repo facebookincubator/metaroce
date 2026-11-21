@@ -177,7 +177,8 @@ TxFlow::TxFlow(TxFlow&& other) noexcept
       consecutiveRtosWithoutAck_{other.consecutiveRtosWithoutAck_.load()},
       rtoExpiryNs_{other.rtoExpiryNs_},
       retxTimerRunning_{false},
-      lastConsumedRtoCount_{other.lastConsumedRtoCount_} {
+      lastConsumedRtoCount_{other.lastConsumedRtoCount_},
+      sourcePortChangePending_{other.sourcePortChangePending_} {
   other.qpRetxTimer_ = nullptr;
 }
 
@@ -362,7 +363,7 @@ std::unique_ptr<DataPacket> TxFlow::popQueuedRetxPacket() {
   return retxPacket;
 }
 
-std::unique_ptr<struct EgressPacket> TxFlow::tryGetRetransmissionPacket(
+std::unique_ptr<DataPacket> TxFlow::tryGetRetransmissionPacket(
     const SndCurWriteLock& sndCurHeld) {
   // Popped before the tag is taken: the queueing path owns a tag and then
   // takes this deque, so taking them the other way round here would deadlock.
@@ -407,22 +408,17 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetRetransmissionPacket(
             << " fsn: " << retxPacket->getDataHeader().getFsn()
             << " msn: " << retxPacket->getDataHeader().getMsn()
             << " posn: " << retxPacket->getDataHeader().getPosn()
-            << " flow: " << flowId_ << " socketId: " << socketId_;
+            << " flow: " << flowId_;
 
-    return std::make_unique<struct EgressPacket>(
-        std::move(retxPacket),
-        qp_.getSender().getSendSocket(socketId_, EgressPacket::Kind::Data),
-        getRemoteAddr(),
-        qp_.getLocalQpNum(),
-        consecutiveRtosWithoutAck_ ? EgressPacket::RxmitType::Rto
-                                   : EgressPacket::RxmitType::Fast);
+    return retxPacket;
   }
   return nullptr;
 }
 
 std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
   Wqe* FOLLY_NULLABLE wqe = nullptr;
-  std::unique_ptr<struct EgressPacket> packet;
+  std::unique_ptr<DataPacket> packet;
+  bool noOldFrames = false;
   {
     // Acquire sndCur before findNextWqe (which acquires the Tag semaphore) so
     // the send path takes locks in sndCur->Tag order, matching the retransmit
@@ -435,6 +431,7 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
       CHECK_NOTNULL(wqe); // for lint(facebook-hte-NullableDereference)
       if (!tag->isInErrorState()) {
         try {
+          noOldFrames = txState_.sndUna == txState_.sndNxt;
           packet = getNextPacketToSendFromWqe(*wqe, tagNum, lockedSndCur);
           VLOG(2) << "TxFlow::tryGetNewPacketFromWqe() found a packet on WQE";
           tag->markProbeSentIfBlockedMsn(*wqe);
@@ -480,7 +477,20 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
       }
     }
   }
-  return packet;
+  if (!packet) {
+    return nullptr;
+  }
+  applyRtoRepath();
+  maybeFailoverRemotePort();
+  if (noOldFrames) {
+    applyPendingSourcePortChange();
+  }
+  return std::make_unique<struct EgressPacket>(
+      std::move(packet),
+      qp_.getSender().getSendSocket(socketId_, EgressPacket::Kind::Data),
+      getRemoteAddr(),
+      qp_.getLocalQpNum(),
+      EgressPacket::RxmitType::None);
 }
 
 std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSend() {
@@ -490,16 +500,25 @@ std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSend() {
     return nullptr;
   }
 
-  applyRtoRepath();
   maybeFailoverRemotePort();
 
   // sndCur is held across the attempt so the tracker can be consulted, in the
   // sndCur->retx order the queueing code uses.
+  std::unique_ptr<DataPacket> retxPacket;
   {
     auto lockedSndCur = txState_.sndCur.wlock();
-    if (auto retxPacket = tryGetRetransmissionPacket(lockedSndCur)) {
-      return retxPacket;
-    }
+    retxPacket = tryGetRetransmissionPacket(lockedSndCur);
+  }
+  if (retxPacket) {
+    applyRtoRepath();
+    maybeFailoverRemotePort();
+    return std::make_unique<struct EgressPacket>(
+        std::move(retxPacket),
+        qp_.getSender().getSendSocket(socketId_, EgressPacket::Kind::Data),
+        getRemoteAddr(),
+        qp_.getLocalQpNum(),
+        consecutiveRtosWithoutAck_ ? EgressPacket::RxmitType::Rto
+                                   : EgressPacket::RxmitType::Fast);
   }
 
   if (qp_.congestionController_ &&
@@ -532,7 +551,7 @@ bool TxFlow::hasUnackedData() const {
  * responsible for semaphore management. In particular, should call
  * qp->getTag(tagNum)->markFree() when finished with the tag.
  */
-std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSendFromWqe(
+std::unique_ptr<DataPacket> TxFlow::getNextPacketToSendFromWqe(
     Wqe& wqe,
     uint8_t tagNum,
     const SndCurWriteLock& sndCurHeld) {
@@ -546,8 +565,7 @@ std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSendFromWqe(
           << txState_.sndNxt << " msn: " << wqe.getMsn().value()
           << " posn: " << posn << " flow: " << flowId_
           << " payload(bytes): " << sendPayloadSize
-          << " tagnum: " << static_cast<uint32_t>(tagNum)
-          << " socketId: " << socketId_;
+          << " tagnum: " << static_cast<uint32_t>(tagNum);
 
   // holding sndCur write lock
   txState_.tracker.push_back(
@@ -583,13 +601,7 @@ std::unique_ptr<struct EgressPacket> TxFlow::getNextPacketToSendFromWqe(
   // estimate; both are mutated only under the sndCur write lock held here.
   const uint16_t inflightFsns = txState_.sndNxt - txState_.sndUna;
   txState_.maxInflightFsns = std::max(txState_.maxInflightFsns, inflightFsns);
-
-  return std::make_unique<struct EgressPacket>(
-      std::move(dataPacket),
-      qp_.getSender().getSendSocket(socketId_, EgressPacket::Kind::Data),
-      getRemoteAddr(),
-      qp_.getLocalQpNum(),
-      EgressPacket::RxmitType::None);
+  return dataPacket;
 } // getNextPacketToSendFromWqe
 
 void TxFlow::processHrnrPacket(const AckHeader& hrnr) {
@@ -1263,7 +1275,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
   }
 
   if (numFramesReturnedToCc > 0) {
-    cc.onPacketAck(
+    const auto result = cc.onPacketAck(
         flowId_,
         CongestionController::AckEvent{
             .numAckedPackets = numFramesReturnedToCc,
@@ -1273,6 +1285,9 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
             .rcnDesiredRateGbps = ack.getRateHints(),
             .sendPending = qp_.getUnsentPosnCount() > 0,
         });
+    if (result.changeSourcePort) {
+      sourcePortChangePending_ = true;
+    }
   } else {
     reportAckReturningNoFrames(ack);
   }
@@ -1645,21 +1660,34 @@ void TxFlow::applyRtoRepath() {
     return;
   }
 
-  const auto oldSocketId = socketId_;
-  try {
-    socketId_ = qp_.getSender().getAlternateSocket(socketId_);
-  } catch (const std::exception& ex) {
-    // A failed source-port change does not prevent moving to another
-    // configured pair.
-    LOG_FIRST_N(WARNING, 10)
-        << "QP " << qp_.getLocalQpNum() << " flow " << flowId_
-        << ": could not change RTO source-port entropy: " << ex.what();
-  }
-  VLOG(2) << "QP " << qp_.getLocalQpNum() << " flow " << flowId_ << ": RTO "
-          << rtoCount << " socket " << oldSocketId << " -> " << socketId_;
+  changeSourcePort("RTO");
 
   if (rtoCount > threshold) {
     tryMoveToFailoverPortPair(rtoCount - threshold - 1);
+  }
+}
+
+void TxFlow::applyPendingSourcePortChange() {
+  if (!sourcePortChangePending_) {
+    return;
+  }
+  changeSourcePort("ECN");
+}
+
+void TxFlow::changeSourcePort(const char* reason) {
+  const auto oldSocketId = socketId_;
+  try {
+    const auto alternateSocket = qp_.getSender().getAlternateSocket(socketId_);
+    if (alternateSocket != socketId_) {
+      socketId_ = alternateSocket;
+      sourcePortChangePending_ = false;
+    }
+    VLOG(2) << "QP " << qp_.getLocalQpNum() << " flow " << flowId_ << ": "
+            << reason << " socket " << oldSocketId << " -> " << socketId_;
+  } catch (const std::exception& ex) {
+    LOG_FIRST_N(WARNING, 10) << "QP " << qp_.getLocalQpNum() << " flow "
+                             << flowId_ << ": could not change " << reason
+                             << " source-port entropy: " << ex.what();
   }
 }
 

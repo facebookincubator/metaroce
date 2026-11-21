@@ -147,10 +147,13 @@ class Baseline : public FastStart {
       return {.windowResult = AckWindowResult::IncreaseAllowed};
     }
     auto& flow = flowStateForId(flowId);
+    const bool hadWindow = flow.fwnd > 0;
     reduceFwndBySignal(flow, event.numAckedPacketsWithCE);
     VLOG(2) << "mark of " << event.numAckedPacketsWithCE << " reduced to "
             << trace(flowId, flow);
-    return {.windowResult = AckWindowResult::ReductionApplied};
+    return {
+        .windowResult = AckWindowResult::ReductionApplied,
+        .ackResult = {.changeSourcePort = hadWindow && flow.fwnd == 0}};
   }
 
   std::string trace(uint16_t flowId, const FlowState& flow) const {

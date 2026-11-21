@@ -375,6 +375,47 @@ TEST_F(FlowActivationTest, ZeroWindowWaitsForFinalOutstandingFrame) {
   }
 }
 
+TEST_F(FlowActivationTest, EcnToZeroNotifiesForEveryFlow) {
+  for (uint16_t id : {0, 1}) {
+    for (bool rcn : {false, true}) {
+      std::unique_ptr<Baseline> cc = rcn
+          ? std::make_unique<BaselineWithRCN>(128, 0)
+          : std::make_unique<Baseline>(128, 0);
+      open(*cc, {3, 13});
+      const auto marked = cc->getFwnd(id);
+      EXPECT_TRUE(
+          cc->onPacketAck(
+                id,
+                {.numAckedPackets = marked, .numAckedPacketsWithCE = marked})
+              .changeSourcePort)
+          << "ECN emptying any flow must notify the transmit layer, including outside bootstrap";
+      EXPECT_EQ(cc->getFwnd(id), 0)
+          << "the entropy notification must accompany an actual ECN-to-zero transition";
+      EXPECT_FALSE(cc->onPacketAck(
+                         id, {.numAckedPackets = 1, .numAckedPacketsWithCE = 1})
+                       .changeSourcePort)
+          << "ACKs at zero must not repeat the entropy notification";
+      expectWindowSum(*cc, 2);
+    }
+  }
+}
+
+TEST_F(FlowActivationTest, RcnAckDoesNotReuseAnEcnEntropyNotification) {
+  BaselineWithRCN cc(128, 0);
+  open(cc, {40, 3, 1, 1, 1, 1, 3});
+  ASSERT_TRUE(
+      cc.onPacketAck(1, {.numAckedPackets = 3, .numAckedPacketsWithCE = 3})
+          .changeSourcePort)
+      << "precondition: an ECN-to-zero ACK must produce an entropy notification";
+  EXPECT_FALSE(
+      cc.onPacketAck(6, {.numAckedPackets = 4, .rcnDesiredRateGbps = 1})
+          .changeSourcePort)
+      << "an RCN ACK must not inherit another flow's earlier ECN entropy notification";
+  EXPECT_EQ(cc.getFwnd(6), 0)
+      << "the RCN reduction must empty this flow without requesting new entropy";
+  expectWindowSum(cc, 7);
+}
+
 TEST_F(FlowActivationTest, CongestionRestartsTheLowestEligibleFlow) {
   Baseline cc(128, 0);
   open(cc, {13, 0, 0, 0});

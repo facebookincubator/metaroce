@@ -246,7 +246,10 @@ class TxFlow : public Flow {
   [[nodiscard]] bool rtoExpired(const SndCurWriteLock& sndCurHeld) const;
   void scheduleRtoWake(const SndCurWriteLock& sndCurHeld);
 
+  // Socket selection requires sndCur, Tag and TagSet locks to be released.
   void applyRtoRepath();
+  void applyPendingSourcePortChange();
+  void changeSourcePort(const char* reason);
   void tryMoveToFailoverPortPair(uint32_t priorMoves);
   [[nodiscard]] uint16_t findAlternatePortPair(
       uint16_t activePortSet,
@@ -263,7 +266,7 @@ class TxFlow : public Flow {
   // may change the window.
   [[nodiscard]] uint32_t computeRateHints(uint32_t qwnd) const;
   // Caller must hold sndCur.wlock(): this advances sndCur-guarded state.
-  std::unique_ptr<struct EgressPacket> getNextPacketToSendFromWqe(
+  std::unique_ptr<DataPacket> getNextPacketToSendFromWqe(
       Wqe& wqe,
       uint8_t tagNum,
       const SndCurWriteLock& sndCurHeld);
@@ -286,7 +289,7 @@ class TxFlow : public Flow {
   // Returns the next queued retransmission worth sending, discarding those
   // whose frame is already resolved or whose work must stop being
   // retransmitted, or nullptr when none is left.
-  std::unique_ptr<struct EgressPacket> tryGetRetransmissionPacket(
+  std::unique_ptr<DataPacket> tryGetRetransmissionPacket(
       const SndCurWriteLock& sndCurHeld);
 
   // A message: an msn within a tag. Value-typed on purpose, so resolving a
@@ -335,6 +338,7 @@ class TxFlow : public Flow {
   // With queued ACKs, sender visits serialize access to this count.
   // With inline ACKs, Qp::txStateLock_ guards reads and writes.
   uint16_t lastConsumedRtoCount_{0}; // Last RTO count processed by repathing.
+  bool sourcePortChangePending_{false};
   folly::Synchronized<std::deque<std::unique_ptr<DataPacket>>> retxPktsToSend_;
   std::unique_ptr<HighResTimer::Callback> retxTimerCallback_;
   bool disabled_{false};
