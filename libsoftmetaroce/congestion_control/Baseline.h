@@ -18,6 +18,7 @@
 
 #include <gflags/gflags_declare.h>
 #include <glog/logging.h>
+#include <libsoftmetaroce/congestion_control/BootstrappingFlow.h>
 #include <libsoftmetaroce/congestion_control/FastStart.h>
 #include <algorithm>
 #include <cstdint>
@@ -41,10 +42,6 @@ class Baseline : public FastStart {
       : epsilon_(epsilon), beta_(beta), lambda_(lambda) {}
   ~Baseline() override = default;
 
-  bool fwndMayIncrease(const FlowState& flow) {
-    return flow.fwnd < maxFwnd_;
-  }
-
   bool eligibleByLowDelay(const AckEvent& event) {
     if (event.measuredRttNs == 0) {
       // Without a sample, the flow cannot be shown below the average.
@@ -66,31 +63,36 @@ class Baseline : public FastStart {
       return {};
     }
 
-    auto& flow = flowStateForId(flowId);
-    if (event.numAckedPacketsWithCE == 0) {
-      // More than half the flow window outstanding counts as window limited.
-      const bool windowLimited = flow.fwnd < 2 * inflightBeforeAck;
-      if (!qwndMayIncrease() || !windowLimited) {
-        return {};
-      }
-      // additive increase on no congestion.
-      // The fwnd only increases when the measured rtt on this ack is at or
-      // below the smoothed rtt for the qp, to achieve flow balance.
-      qwnd_fractional_ += std::min(epsilon_, qwnd_) * event.numAckedPackets;
-      const bool lowDelay = eligibleByLowDelay(event);
-      while (lowDelay && qwnd_fractional_ > qwnd_ && qwndMayIncrease() &&
-             fwndMayIncrease(flow)) {
-        qwnd_fractional_ -= qwnd_;
-        qwnd_ += 1;
-        flow.fwnd += 1;
-      }
-      VLOG(2) << "increased to " << trace(flowId, flow);
-      return {};
-    } else {
-      reduceFwndBySignal(flow, event.numAckedPacketsWithCE);
-      VLOG(2) << "mark of " << event.numAckedPacketsWithCE << " reduced to "
-              << trace(flowId, flow);
+    const auto result = applyAckReduction(flowId, event);
+    bootstrap_.onAck(
+        *this,
+        flowId,
+        {.congested = event.numAckedPacketsWithCE > 0,
+         .reduced = result.windowResult == AckWindowResult::ReductionApplied});
+    if (result.windowResult != AckWindowResult::IncreaseAllowed) {
+      return result.ackResult;
     }
+
+    auto& flow = flowStateForId(flowId);
+    // More than half the flow window outstanding counts as window limited.
+    const bool windowLimited = flow.fwnd < 2 * inflightBeforeAck;
+    if (!qwndMayIncrease() || !windowLimited) {
+      return {};
+    }
+    // additive increase on no congestion.
+    qwnd_fractional_ += std::min(epsilon_, qwnd_) * event.numAckedPackets;
+    const bool lowDelay = eligibleByLowDelay(event);
+    for (auto recipient =
+             bootstrap_.flowForWindowIncrease(*this, flowId, lowDelay);
+         qwnd_fractional_ > qwnd_ && qwndMayIncrease() && recipient.has_value();
+         recipient =
+             bootstrap_.flowForWindowIncrease(*this, flowId, lowDelay)) {
+      qwnd_fractional_ -= qwnd_;
+      qwnd_ += 1;
+      flowStateForId(*recipient).fwnd += 1;
+      bootstrap_.onWindowIncreased(*this, *recipient);
+    }
+    VLOG(2) << "increased to " << trace(flowId, flow);
     return {};
   }
 
@@ -99,12 +101,16 @@ class Baseline : public FastStart {
     FastStart::onPacketLoss(flowId, event);
     auto& flow = flowStateForId(flowId);
     reduceFwndBySignal(flow, event.numLostPackets, lambda_);
+    if (event.numLostPackets > 0) {
+      bootstrap_.abandonBootstrap(flowId);
+    }
     VLOG(2) << "loss of " << event.numLostPackets << " reduced to "
             << trace(flowId, flow);
   }
 
   void onFlowDisabled(uint16_t flowId) override {
     FastStart::onFlowDisabled(flowId);
+    bootstrap_.abandonBootstrap(flowId);
     if (qwnd_ < kMinQwnd) {
       // Restored on flow 0, the flow that stays in service. qwnd_ counts
       // flow 0's window, so the sum fits a uint16_t.
@@ -126,6 +132,27 @@ class Baseline : public FastStart {
   }
 
  protected:
+  enum class AckWindowResult { IncreaseAllowed, ReductionApplied, Held };
+  struct AckReduction {
+    AckWindowResult windowResult{AckWindowResult::Held};
+    AckResult ackResult{};
+  };
+
+  // Overrides must apply matching QWND and FWND changes and report whether
+  // the ACK permits additive increase.
+  virtual AckReduction applyAckReduction(
+      uint16_t flowId,
+      const AckEvent& event) {
+    if (event.numAckedPacketsWithCE == 0) {
+      return {.windowResult = AckWindowResult::IncreaseAllowed};
+    }
+    auto& flow = flowStateForId(flowId);
+    reduceFwndBySignal(flow, event.numAckedPacketsWithCE);
+    VLOG(2) << "mark of " << event.numAckedPacketsWithCE << " reduced to "
+            << trace(flowId, flow);
+    return {.windowResult = AckWindowResult::ReductionApplied};
+  }
+
   std::string trace(uint16_t flowId, const FlowState& flow) const {
     return fmt::format(
         "qwnd_ {}.{}, flow {} to fwnd {}",
@@ -191,5 +218,6 @@ class Baseline : public FastStart {
 
   // Runtime state.
   int qwnd_fractional_{0};
+  BootstrappingFlow bootstrap_;
 };
 } // namespace libsoftmetaroce

@@ -32,6 +32,15 @@ bool validateUint16Range(const char* flagname, uint32_t value) {
   return false;
 }
 
+bool validateAverageWindowLog2(const char* flagname, uint32_t value) {
+  if (value >= 1 && value <= 5) {
+    return true;
+  }
+  LOG(ERROR) << "Invalid value for --" << flagname << ": " << value
+             << ". Must be in range [1, 5].";
+  return false;
+}
+
 bool validatePositive(const char* flagname, int32_t value) {
   if (value > 0) {
     return true;
@@ -71,6 +80,23 @@ LSMR_DEFINE_RENAMED_FLAG(
     "Default maximum flow window (fwnd) size");
 
 // Flags for Baseline congestion controller
+DEFINE_bool(
+    libsoftmetaroce_activate_tx_flows,
+    true,
+    "Activate unused transmit flows as QWND grows after fast start");
+DEFINE_bool(
+    libsoftmetaroce_exponential_flow_activation_threshold,
+    true,
+    "Use QWND > 3 << (active flows - 1) to activate a flow; false uses "
+    "the target average flow window");
+DEFINE_uint32(
+    libsoftmetaroce_average_window_log2,
+    3,
+    "Log2 of the target average flow window for activation (1 through 5)");
+DEFINE_validator(
+    libsoftmetaroce_average_window_log2,
+    &validateAverageWindowLog2);
+
 DEFINE_int32(
     libsoftmetaroce_min_qwnd,
     1,

@@ -103,13 +103,15 @@ class BaselineWithRCN : public Baseline {
       }
     }
 
-    // If qwnd exceeds max, RCN reduction takes priority over Baseline's
-    // ECN reduction. Call FastStart directly to exit fast start and decrement
-    // inflight, skipping Baseline's AIMD logic.
-    bool rcnReductionApplies = qwnd_ > qwnd_max_;
-    const auto result = rcnReductionApplies
-        ? FastStart::onPacketAck(flowId, event)
-        : Baseline::onPacketAck(flowId, event);
+    return Baseline::onPacketAck(flowId, event);
+  }
+
+ protected:
+  AckReduction applyAckReduction(uint16_t flowId, const AckEvent& event)
+      override {
+    if (qwnd_ <= qwnd_max_) {
+      return Baseline::applyAckReduction(flowId, event);
+    }
 
     // Apply RCN reduction if qwnd exceeds limits.
     // RCN uses fixed shift values independent of beta_:
@@ -121,7 +123,7 @@ class BaselineWithRCN : public Baseline {
         (int64_t{flowId} + 1) * FLAGS_libsoftmetaroce_fwnd_floor;
     if ((flowId == 0 || qwnd_max_ >= qwndThatWouldProtectThisFlow) &&
         flow.fwnd <= FLAGS_libsoftmetaroce_fwnd_floor) {
-      return result;
+      return {.windowResult = AckWindowResult::Held};
     }
     if (qwnd_ > 2 * qwnd_max_) {
       reduceFwndBySignal(flow, event.numAckedPackets, 0);
@@ -132,7 +134,7 @@ class BaselineWithRCN : public Baseline {
       VLOG(2) << "RCN: qwnd " << qwnd_ << " > qwnd_max " << qwnd_max_
               << ", reduced by " << (event.numAckedPackets >> 1);
     }
-    return result;
+    return {.windowResult = AckWindowResult::ReductionApplied};
   }
 
  private:

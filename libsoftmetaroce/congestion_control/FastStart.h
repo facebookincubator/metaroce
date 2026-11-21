@@ -36,6 +36,8 @@ namespace libsoftmetaroce {
    the maximum fwnd.  Any flows with zero fwnd will stay that way.  No
    other control (ecn response) is applied here. */
 class FastStart : public CongestionController {
+  friend class BootstrappingFlow;
+
  public:
   static constexpr int kDefaultQwndMax = 2 << 16;
 
@@ -75,11 +77,12 @@ class FastStart : public CongestionController {
   }
 
   void onFlowDisabled(uint16_t flowId) override {
-    // Flow 0 stays in service, so its share is not shed.
+    auto& flow = flowStateForId(flowId);
+    flow.disabled = true;
+    // Flow 0 retains its share of the window.
     if (flowId == 0) {
       return;
     }
-    auto& flow = flowStateForId(flowId);
     // qwnd_ is the sum of the flow windows.
     qwnd_ -= flow.fwnd;
     flow.fwnd = 0;
@@ -167,6 +170,11 @@ class FastStart : public CongestionController {
   struct FlowState {
     uint16_t inflightPackets{0};
     uint16_t fwnd{0};
+    bool disabled{false};
+
+    bool mayReceiveWindowIncrease() const {
+      return !disabled && (fwnd > 0 || inflightPackets == 0);
+    }
   };
 
   // Configuration.

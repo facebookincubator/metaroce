@@ -22,6 +22,9 @@
 // Congestion-control gflags are defined in Flags.cpp; consumers include this
 // header to reference the ones declared below.
 DECLARE_string(libsoftmetaroce_cc_algorithm);
+DECLARE_bool(libsoftmetaroce_activate_tx_flows);
+DECLARE_bool(libsoftmetaroce_exponential_flow_activation_threshold);
+DECLARE_uint32(libsoftmetaroce_average_window_log2);
 
 namespace libsoftmetaroce {
 

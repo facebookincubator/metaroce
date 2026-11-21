@@ -417,7 +417,6 @@ TEST_F(BaselineTest, QwndMaxLimitedByFlag) {
   FLAGS_libsoftmetaroce_max_qwnd = 0;
 }
 
-// A flow left with no window draws no ack, so nothing grows it back.
 TEST_F(BaselineTest, DisablingAFlowRestoresTheMinimumWindowOnFlowZero) {
   constexpr int epsilon = 2;
   constexpr int beta = 1;
