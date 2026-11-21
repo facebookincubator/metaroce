@@ -54,7 +54,9 @@ constexpr uint16_t kSendToPort = 0xace;
 class BenchCongestionController : public CongestionController {
  public:
   void onPacketSent(uint16_t /*flowId*/) override {}
-  void onPacketAck(uint16_t /*flowId*/, const AckEvent& /*ack*/) override {}
+  AckResult onPacketAck(uint16_t /*flowId*/, const AckEvent& /*ack*/) override {
+    return {};
+  }
   void onPacketLoss(uint16_t /*flowId*/, const LossEvent& /*loss*/) override {}
   void onFlowAdded(uint16_t /*flowId*/) override {}
   void onFlowDisabled(uint16_t /*flowId*/) override {}

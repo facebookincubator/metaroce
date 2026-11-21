@@ -60,7 +60,8 @@ void QpTestBase::createAlwaysSendingMockCongestionController(Qp& qp) {
   ON_CALL(*congestionController, getAvailableWindowSize(_))
       .WillByDefault(Return(100));
   ON_CALL(*congestionController, onPacketSent(_)).WillByDefault(Return());
-  ON_CALL(*congestionController, onPacketAck(_, _)).WillByDefault(Return());
+  ON_CALL(*congestionController, onPacketAck(_, _))
+      .WillByDefault(Return(CongestionController::AckResult{}));
   ON_CALL(*congestionController, onPacketLoss(_, _)).WillByDefault(Return());
   ON_CALL(*congestionController, onFlowAdded(_)).WillByDefault(Return());
   qp.setCongestionController(std::move(congestionController));

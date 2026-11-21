@@ -145,8 +145,9 @@ TEST_F(CongestionControllerConcurrencyTest, ControllerMethodsExcludeEachOther) {
    public:
     mutable int calls{0};
 
-    void onPacketAck(uint16_t, const AckEvent&) override {
+    AckResult onPacketAck(uint16_t, const AckEvent&) override {
       ++calls;
+      return {};
     }
     uint16_t getFwnd(uint16_t) const override {
       ++calls;

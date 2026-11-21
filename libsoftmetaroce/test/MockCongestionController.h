@@ -30,7 +30,7 @@ class MockCongestionController : public CongestionController {
   explicit MockCongestionController() = default;
   ~MockCongestionController() override = default;
   MOCK_METHOD(void, onPacketSent, (uint16_t flowId));
-  MOCK_METHOD(void, onPacketAck, (uint16_t flowId, const AckEvent& ack));
+  MOCK_METHOD(AckResult, onPacketAck, (uint16_t flowId, const AckEvent& ack));
   MOCK_METHOD(void, onPacketLoss, (uint16_t flowId, const LossEvent& loss));
   MOCK_METHOD(void, onFlowAdded, (uint16_t flowId));
   MOCK_METHOD(void, onFlowDisabled, (uint16_t flowId));

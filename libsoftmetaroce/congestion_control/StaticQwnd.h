@@ -32,12 +32,13 @@ class StaticQwnd : public CongestionController {
     flowStateForId(flowId).inflightPackets += 1;
   }
 
-  void onPacketAck(uint16_t flowId, const AckEvent& event) override {
+  AckResult onPacketAck(uint16_t flowId, const AckEvent& event) override {
     FlowState& flow = flowStateForId(flowId);
     // it should not be possible to make inflightPackets negative, but
     // guard against it anyway.
     flow.inflightPackets -=
         std::min(event.numAckedPackets, flow.inflightPackets);
+    return {};
   }
 
   void onPacketLoss(uint16_t /* flowId */, const LossEvent&) override {}

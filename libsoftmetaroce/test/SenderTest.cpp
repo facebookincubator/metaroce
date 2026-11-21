@@ -2183,7 +2183,8 @@ TEST_F(StaleAckTest, ARepeatedAckIsReportedWithItsRateHintButNotItsMark) {
 
   CongestionController::AckEvent reported;
   EXPECT_CALL(*rawCongestionController, onPacketAck(0, _))
-      .WillOnce(SaveArg<1>(&reported));
+      .WillOnce(DoAll(
+          SaveArg<1>(&reported), Return(CongestionController::AckResult{})));
   const uint32_t nowNs = getNowNs();
   flow_->processAckPacket(
       AckHeader::AckHeaderBuilder()

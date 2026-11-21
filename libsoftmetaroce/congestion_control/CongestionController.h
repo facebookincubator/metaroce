@@ -53,11 +53,16 @@ class CongestionController {
     }
   };
 
+  struct AckResult {
+    bool changeSourcePort{false};
+  };
+
   CongestionController() = default;
   virtual ~CongestionController() = default;
 
   virtual void onPacketSent(uint16_t flowId) = 0;
-  virtual void onPacketAck(uint16_t flowId, const AckEvent& ack) = 0;
+  virtual AckResult onPacketAck(uint16_t flowId, const AckEvent& ack) = 0;
+
   virtual void onPacketLoss(uint16_t flowId, const LossEvent& loss) = 0;
   virtual void onFlowAdded(uint16_t flowId) = 0;
   virtual void onFlowDisabled(uint16_t flowId) = 0;

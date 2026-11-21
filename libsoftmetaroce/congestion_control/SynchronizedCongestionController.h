@@ -45,8 +45,8 @@ class SynchronizedCongestionController : public CongestionController {
     return locked->get().getQwnd();
   }
 
-  void onPacketAck(uint16_t flowId, const AckEvent& ack) override {
-    box_.lock()->mut().onPacketAck(flowId, ack);
+  AckResult onPacketAck(uint16_t flowId, const AckEvent& ack) override {
+    return box_.lock()->mut().onPacketAck(flowId, ack);
   }
 
   void onPacketLoss(uint16_t flowId, const LossEvent& loss) override {

@@ -57,13 +57,13 @@ class Baseline : public FastStart {
     return qwnd_ < qwnd_max_;
   }
 
-  void onPacketAck(uint16_t flowId, const AckEvent& event) override {
+  AckResult onPacketAck(uint16_t flowId, const AckEvent& event) override {
     const uint16_t inflightBeforeAck = flowStateForId(flowId).inflightPackets;
     // exits fast start if needed, decrements inflight.
     FastStart::onPacketAck(flowId, event);
     if (inFastStart_) {
       // Fast start grows the window as packets are sent, not on acks.
-      return;
+      return {};
     }
 
     auto& flow = flowStateForId(flowId);
@@ -71,7 +71,7 @@ class Baseline : public FastStart {
       // More than half the flow window outstanding counts as window limited.
       const bool windowLimited = flow.fwnd < 2 * inflightBeforeAck;
       if (!qwndMayIncrease() || !windowLimited) {
-        return;
+        return {};
       }
       // additive increase on no congestion.
       // The fwnd only increases when the measured rtt on this ack is at or
@@ -85,12 +85,13 @@ class Baseline : public FastStart {
         flow.fwnd += 1;
       }
       VLOG(2) << "increased to " << trace(flowId, flow);
-      return;
+      return {};
     } else {
       reduceFwndBySignal(flow, event.numAckedPacketsWithCE);
       VLOG(2) << "mark of " << event.numAckedPacketsWithCE << " reduced to "
               << trace(flowId, flow);
     }
+    return {};
   }
 
   void onPacketLoss(uint16_t flowId, const LossEvent& event) override {

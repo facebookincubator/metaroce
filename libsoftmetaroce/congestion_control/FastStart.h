@@ -52,7 +52,7 @@ class FastStart : public CongestionController {
     flow.inflightPackets += 1;
   }
 
-  void onPacketAck(uint16_t flowId, const AckEvent& event) override {
+  AckResult onPacketAck(uint16_t flowId, const AckEvent& event) override {
     if (inFastStart_) {
       const bool congested = event.numAckedPacketsWithCE > 0;
       inFastStart_ = !(event.sendPending || congested || qwnd_ >= qwnd_max_);
@@ -62,6 +62,7 @@ class FastStart : public CongestionController {
     // guard against it anyway.
     flow.inflightPackets -=
         std::min(event.numAckedPackets, flow.inflightPackets);
+    return {};
   }
 
   void onPacketLoss(uint16_t /* flowId */, const LossEvent&) override {}

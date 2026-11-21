@@ -64,7 +64,7 @@ class BaselineWithRCN : public Baseline {
     mtu_ = mtu;
   }
 
-  void onPacketAck(uint16_t flowId, const AckEvent& event) override {
+  AckResult onPacketAck(uint16_t flowId, const AckEvent& event) override {
     // Spec 6.3.2:
     //   qwnd_max = max(QWND_min, gamma * rate * (rtt + omega) / (MTU * 8))
     //
@@ -107,11 +107,9 @@ class BaselineWithRCN : public Baseline {
     // ECN reduction. Call FastStart directly to exit fast start and decrement
     // inflight, skipping Baseline's AIMD logic.
     bool rcnReductionApplies = qwnd_ > qwnd_max_;
-    if (rcnReductionApplies) {
-      FastStart::onPacketAck(flowId, event);
-    } else {
-      Baseline::onPacketAck(flowId, event);
-    }
+    const auto result = rcnReductionApplies
+        ? FastStart::onPacketAck(flowId, event)
+        : Baseline::onPacketAck(flowId, event);
 
     // Apply RCN reduction if qwnd exceeds limits.
     // RCN uses fixed shift values independent of beta_:
@@ -123,7 +121,7 @@ class BaselineWithRCN : public Baseline {
         (int64_t{flowId} + 1) * FLAGS_libsoftmetaroce_fwnd_floor;
     if ((flowId == 0 || qwnd_max_ >= qwndThatWouldProtectThisFlow) &&
         flow.fwnd <= FLAGS_libsoftmetaroce_fwnd_floor) {
-      return;
+      return result;
     }
     if (qwnd_ > 2 * qwnd_max_) {
       reduceFwndBySignal(flow, event.numAckedPackets, 0);
@@ -134,6 +132,7 @@ class BaselineWithRCN : public Baseline {
       VLOG(2) << "RCN: qwnd " << qwnd_ << " > qwnd_max " << qwnd_max_
               << ", reduced by " << (event.numAckedPackets >> 1);
     }
+    return result;
   }
 
  private:

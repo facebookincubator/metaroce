@@ -2804,6 +2804,7 @@ TEST_F(QpTest, AbandonedFramesAreReturnedToTheCongestionWindow) {
         if (ack.measuredRttNs == 0) {
           reportedZeroRtt++;
         }
+        return CongestionController::AckResult{};
       });
 
   wqe->markFailing(kWcRetryExcErr);
@@ -2849,6 +2850,7 @@ TEST_F(QpTest, ABrnrdFrameAbandonedLaterIsAccountedOnce) {
   ON_CALL(*rawCongestionController, onPacketAck(_, _))
       .WillByDefault([&](uint16_t, const CongestionController::AckEvent& ack) {
         reportedAbandoned += ack.numAckedPackets;
+        return CongestionController::AckResult{};
       });
 
   // The message is still live, so the BRNR releases the second frame's posn
@@ -4131,6 +4133,7 @@ TEST_F(QpTest, BrnrOnAFailingWqeAbandonsRatherThanWaitingToResend) {
   ON_CALL(*rawCongestionController, onPacketAck(_, _))
       .WillByDefault([&](uint16_t, const CongestionController::AckEvent& ack) {
         reportedAbandoned += ack.numAckedPackets;
+        return CongestionController::AckResult{};
       });
 
   BitVector<AckHeader::kAckTrackerBits> rnrBitVector;
@@ -6208,7 +6211,8 @@ TEST_F(QpTest, AnHrnrIsReportedWithoutItsReservedRateHint) {
 
   CongestionController::AckEvent reported;
   EXPECT_CALL(*fixture.congestionController, onPacketAck(0, _))
-      .WillOnce(SaveArg<1>(&reported));
+      .WillOnce(DoAll(
+          SaveArg<1>(&reported), Return(CongestionController::AckResult{})));
   fixture.flow->processAckPacket(hrnr, simulatedProcessedAtNs(0));
 
   EXPECT_EQ(reported.numAckedPackets, 0)

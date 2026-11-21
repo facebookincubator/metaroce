@@ -1051,7 +1051,8 @@ TEST_F(NakTest, AFlowIdNakIsReportedWithoutItsFlowCount) {
 
   CongestionController::AckEvent reported;
   EXPECT_CALL(congestionController(), onPacketAck(1, _))
-      .WillOnce(SaveArg<1>(&reported));
+      .WillOnce(DoAll(
+          SaveArg<1>(&reported), Return(CongestionController::AckResult{})));
   txFlow(1).processAckPacket(nak, simulatedProcessedAtNs(sentAtNs));
 
   EXPECT_EQ(reported.numAckedPackets, 0)
