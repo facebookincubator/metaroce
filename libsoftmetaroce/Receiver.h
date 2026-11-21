@@ -20,6 +20,7 @@
 #include <folly/Utility.h>
 #include <folly/io/async/AsyncUDPSocket.h>
 #include <folly/io/async/EventBase.h>
+#include <gflags/gflags_declare.h>
 #include <libsoftmetaroce/Constants.h>
 #include <libsoftmetaroce/Ecn.h>
 #include <libsoftmetaroce/PacketModifierSocket.h>
@@ -35,6 +36,8 @@
 #include <memory>
 #include <optional>
 #include <vector>
+
+DECLARE_uint32(libsoftmetaroce_recv_threads);
 
 namespace libsoftmetaroce {
 

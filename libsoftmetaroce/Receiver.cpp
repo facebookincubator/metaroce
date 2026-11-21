@@ -38,6 +38,10 @@ DEFINE_uint32(
     "datagrams across the threads by 4-tuple so recvmsg/CRC/parse run in "
     "parallel; 1 (default) is a single receive thread. Each QP's cross-flow "
     "receive state is guarded by a per-QP lock.");
+static bool validateRecvThreads(const char* /*name*/, uint32_t value) {
+  return value >= 1;
+}
+DEFINE_validator(libsoftmetaroce_recv_threads, &validateRecvThreads);
 
 DEFINE_uint32(
     libsoftmetaroce_socket_max_reads_per_event,
@@ -118,8 +122,7 @@ Receiver::Receiver(
       activePortSet_(activePortSet),
       localAddrs_{std::move(localAddrs)},
       metaRoceSendToPort_{metaRoceSendToPort} {
-  const uint32_t numReaders =
-      std::max<uint32_t>(1, FLAGS_libsoftmetaroce_recv_threads);
+  const uint32_t numReaders = FLAGS_libsoftmetaroce_recv_threads;
   multiReader_ = numReaders > 1;
   for (uint32_t i = 0; i < numReaders; ++i) {
     readerThreads_.emplace_back();
