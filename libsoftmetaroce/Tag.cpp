@@ -1185,18 +1185,9 @@ bool Tag::completeReceivesReleasedBySends(
 }
 
 void Tag::completeLocalTxWqes(
-    const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete,
     folly::Synchronized<MsnSpan>::LockedPtr& lockedSpan) {
   const WorkCompletionStatus defaultStatus =
       isInErrorState() ? kWrFlushErr : kSuccess;
-
-  for (Wqe& wqe : wqesToComplete) {
-    if (!after(wqe.getMsn().value(), lockedSpan->inOrderCompletedMsn)) {
-      LOG(ERROR) << "Tx: WQE completed on QP: " << qpNum_
-                 << " Tag: " << (uint32_t)tagNum_ << " (already processed)"
-                 << " wqe=" << wqe;
-    }
-  }
 
   // The work at the head of the window, where it is finished and so due to
   // report next. Read again after each completion, which moves the head.
@@ -1222,15 +1213,15 @@ void Tag::completeLocalTxWqes(
 
 bool Tag::handleTxWqesCompletion(
     const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete) {
-  // Split into virtual (remoteMsnToWqe_) and local (msnSpan_) WQEs
+  // Classify virtual (remoteMsnToWqe_) and local (msnSpan_) WQEs
   // to avoid acquiring locks on maps we don't need.
   std::vector<std::reference_wrapper<Wqe>> virtualWqes;
-  std::vector<std::reference_wrapper<Wqe>> localWqes;
+  bool hasLocalWqes = false;
   for (Wqe& wqe : wqesToComplete) {
     if (wqe.isVirtual()) {
       virtualWqes.emplace_back(wqe);
     } else {
-      localWqes.emplace_back(wqe);
+      hasLocalWqes = true;
     }
   }
 
@@ -1247,9 +1238,9 @@ bool Tag::handleTxWqesCompletion(
     }
   }
 
-  if (!localWqes.empty()) {
+  if (hasLocalWqes) {
     auto lockedSpan = msnSpan_.wlock();
-    completeLocalTxWqes(localWqes, lockedSpan);
+    completeLocalTxWqes(lockedSpan);
     retireCompletedWqesAtMapHead(lockedSpan);
   }
   signalMsnSpanRoom();

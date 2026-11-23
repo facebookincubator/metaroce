@@ -638,9 +638,7 @@ class Tag {
   // Completes ready local WQEs in MSN order without retiring them.
   // Caller holds receive or exclusive retirement access and the MSN-span
   // write lock.
-  void completeLocalTxWqes(
-      const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete,
-      folly::Synchronized<MsnSpan>::LockedPtr& lockedSpan);
+  void completeLocalTxWqes(folly::Synchronized<MsnSpan>::LockedPtr& lockedSpan);
 
   // The caller's span lock keeps `wqe` alive across the enqueue.
   void completeSingleTxWqe(
