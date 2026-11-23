@@ -194,6 +194,11 @@ static struct ibv_qp* setup_qp(
 
 class VerbsTest : public ::testing::Test {
  protected:
+  explicit VerbsTest(
+      const std::function<SocketWithModifier(folly::EventBase*)>& socketMaker =
+          mockUDPSocketMaker)
+      : verbs_(socketMaker) {}
+
   void SetUp() override {
     cq_ = verbs_.ibv_create_cq(&context_, kCqEntries, nullptr, nullptr, 0);
     ASSERT_NE(cq_, nullptr);
@@ -237,7 +242,7 @@ class VerbsTest : public ::testing::Test {
   static constexpr int kCqEntries = 10;
   static constexpr uint32_t kDestQpNum = 10;
 
-  libsoftmetaroce::MetaRoceVerbs verbs_{mockUDPSocketMaker};
+  libsoftmetaroce::MetaRoceVerbs verbs_;
   struct ibv_context context_{};
   struct ibv_cq* cq_{nullptr};
   struct ibv_pd* pd_{nullptr};
@@ -6312,10 +6317,57 @@ TEST_F(VerbsTest, ASharedReceiveQueueTakesEverySgeTheDeviceReports) {
   EXPECT_EQ(verbs_.ibv_destroy_srq(srq), 0);
 }
 
+// This base precedes VerbsTest so observation state outlives its sender
+// threads.
+class ReadAtomicRequestsOnWire {
+ protected:
+  struct RequestNotification {
+    std::atomic_flag signalled = ATOMIC_FLAG_INIT;
+    folly::Baton<> baton;
+
+    void signalOnce() {
+      if (!signalled.test_and_set(std::memory_order_relaxed)) {
+        baton.post();
+      }
+    }
+  };
+
+  auto socketMaker() {
+    return [this](folly::EventBase* evb) -> SocketWithModifier {
+      auto socket = std::make_unique<NiceMock<MockUDPSocket>>(evb);
+      ON_CALL(*socket, write(_, _))
+          .WillByDefault([this](
+                             const folly::SocketAddress&,
+                             const std::unique_ptr<folly::IOBuf>& buf) {
+            folly::io::Cursor cursor(CHECK_NOTNULL(buf.get()));
+            const BaseHeader baseHeader{cursor};
+            const auto op = baseHeader.getOpcode().operationType();
+            if (op == BaseHeader::Opcode::OperationType::READ) {
+              readRequestSent.signalOnce();
+            } else if (
+                op == BaseHeader::Opcode::OperationType::ATOMIC_FETCH_ADD) {
+              fetchAddRequestSent.signalOnce();
+            } else if (
+                op == BaseHeader::Opcode::OperationType::ATOMIC_CMP_SWP) {
+              compareSwapRequestSent.signalOnce();
+            }
+            return buf->computeChainDataLength();
+          });
+      return std::make_pair(std::move(socket), nullptr);
+    };
+  }
+
+  RequestNotification readRequestSent;
+  RequestNotification fetchAddRequestSent;
+  RequestNotification compareSwapRequestSent;
+};
+
 // Each case posts at a nonzero offset into a sentinel-filled buffer and
 // compares the whole buffer, so bytes landing anywhere but at the offset show.
-class ZeroBasedLocalBufferTest : public VerbsTest {
+class ZeroBasedLocalBufferTest : public ReadAtomicRequestsOnWire,
+                                 public VerbsTest {
  protected:
+  ZeroBasedLocalBufferTest() : VerbsTest(socketMaker()) {}
   static constexpr char kSentinel = 0x5a;
   static constexpr uint32_t kMessageBytes = 64;
   static constexpr uint64_t kOffset = 32;
@@ -6439,8 +6491,8 @@ TEST_F(ZeroBasedLocalBufferTest, AReadResponseLandsAtItsOffset) {
   struct ibv_send_wr* badWr = nullptr;
   ASSERT_EQ(verbs_.ibv_post_send(ibvqp, &readWr, &badWr), 0)
       << "precondition: the read is posted";
-  ASSERT_TRUE(qp->waitForWqesToBePosted(1, std::chrono::milliseconds(100)))
-      << "precondition: the read is pending when its response arrives";
+  ASSERT_TRUE(readRequestSent.baton.try_wait_for(std::chrono::seconds(5)))
+      << "precondition: the read request frame must reach the mock socket before its response is injected";
 
   const auto payload = countingBytes(kMessageBytes, 1);
   const auto [baseHeader, dataHeader] = singlePacketHeaders(
@@ -6493,12 +6545,9 @@ TEST_F(ZeroBasedLocalBufferTest, AtomicResultsLandAtTheirOffsets) {
   struct ibv_send_wr* badWr = nullptr;
   ASSERT_EQ(verbs_.ibv_post_send(ibvqp, &fetchAdd, &badWr), 0)
       << "precondition: both atomics are posted";
-  ASSERT_TRUE(qp->waitForWqesToBePosted(2, std::chrono::milliseconds(100)))
-      << "precondition: both atomics are pending when their acks arrive";
-
   const std::array<uint64_t, 2> originals{
       0x0102030405060708ULL, 0x1112131415161718ULL};
-  for (uint16_t i = 0; i < originals.size(); ++i) {
+  const auto injectAtomicResult = [qp, firstMsn, &originals](uint16_t i) {
     const auto [baseHeader, dataHeader] = singlePacketHeaders(
         *qp,
         BaseHeader::Opcode::OperationType::ATOMIC_ACK_RESP,
@@ -6512,7 +6561,15 @@ TEST_F(ZeroBasedLocalBufferTest, AtomicResultsLandAtTheirOffsets) {
             .setOrigRemoteData(originals.at(i))
             .build());
     qp->getRxFlowById(0)->processDataPacket(&ack, kEcnECT0);
-  }
+  };
+
+  ASSERT_TRUE(fetchAddRequestSent.baton.try_wait_for(std::chrono::seconds(5)))
+      << "precondition: the fetch-add request frame must reach the mock socket before its result is injected";
+  injectAtomicResult(0);
+  ASSERT_TRUE(
+      compareSwapRequestSent.baton.try_wait_for(std::chrono::seconds(5)))
+      << "precondition: the compare-swap request frame must reach the mock socket before its result is injected";
+  injectAtomicResult(1);
 
   std::vector<char> results(sizeof(originals));
   std::memcpy(results.data(), originals.data(), sizeof(originals));
