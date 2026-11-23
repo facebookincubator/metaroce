@@ -1184,6 +1184,42 @@ bool Tag::completeReceivesReleasedBySends(
   return everyCsnInSequence;
 }
 
+void Tag::completeLocalTxWqes(
+    const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete,
+    folly::Synchronized<MsnSpan>::LockedPtr& lockedSpan) {
+  const WorkCompletionStatus defaultStatus =
+      isInErrorState() ? kWrFlushErr : kSuccess;
+
+  for (Wqe& wqe : wqesToComplete) {
+    if (!after(wqe.getMsn().value(), lockedSpan->inOrderCompletedMsn)) {
+      LOG(ERROR) << "Tx: WQE completed on QP: " << qpNum_
+                 << " Tag: " << (uint32_t)tagNum_ << " (already processed)"
+                 << " wqe=" << wqe;
+    }
+  }
+
+  // The work at the head of the window, where it is finished and so due to
+  // report next. Read again after each completion, which moves the head.
+  auto nextToReport = [&lockedSpan]() -> Wqe* {
+    auto wqeIt = lockedSpan->wqes.find(
+        static_cast<uint16_t>(lockedSpan->inOrderCompletedMsn + 1));
+    return wqeIt != lockedSpan->wqes.end() && wqeIt->second->isReadyToComplete()
+        ? wqeIt->second.get()
+        : nullptr;
+  };
+
+  // Process completions in MSN order.
+  for (Wqe* wqe = nextToReport(); wqe != nullptr; wqe = nextToReport()) {
+    LOG_FIRST_N(INFO, 20) << "tx: WQE completed on QP: " << qpNum_
+                          << " Tag: " << (uint32_t)tagNum_ << ": " << *wqe;
+    completeSingleTxWqe(
+        *wqe,
+        wqe->getCompletionStatusOverride().value_or(defaultStatus),
+        lockedSpan);
+    ++lockedSpan->inOrderCompletedMsn;
+  }
+}
+
 bool Tag::handleTxWqesCompletion(
     const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete) {
   // Split into virtual (remoteMsnToWqe_) and local (msnSpan_) WQEs
@@ -1213,37 +1249,7 @@ bool Tag::handleTxWqesCompletion(
 
   if (!localWqes.empty()) {
     auto lockedSpan = msnSpan_.wlock();
-    WorkCompletionStatus status = isInErrorState() ? kWrFlushErr : kSuccess;
-
-    for (Wqe& wqe : localWqes) {
-      if (!after(wqe.getMsn().value(), lockedSpan->inOrderCompletedMsn)) {
-        LOG(ERROR) << "Tx: WQE completed on QP: " << qpNum_
-                   << " Tag: " << (uint32_t)tagNum_ << " (already processed)"
-                   << " wqe=" << wqe;
-      }
-    }
-
-    // The work at the head of the window, where it is finished and so due to
-    // report next. Read again after each completion, which moves the head.
-    auto nextToReport = [&lockedSpan]() -> Wqe* {
-      auto wqeIt = lockedSpan->wqes.find(
-          static_cast<uint16_t>(lockedSpan->inOrderCompletedMsn + 1));
-      return wqeIt != lockedSpan->wqes.end() &&
-              wqeIt->second->isReadyToComplete()
-          ? wqeIt->second.get()
-          : nullptr;
-    };
-
-    // Process completions in MSN order.
-    for (Wqe* wqe = nextToReport(); wqe != nullptr; wqe = nextToReport()) {
-      LOG_FIRST_N(INFO, 20) << "tx: WQE completed on QP: " << qpNum_
-                            << " Tag: " << (uint32_t)tagNum_ << ": " << *wqe;
-      completeSingleTxWqe(
-          *wqe,
-          wqe->getCompletionStatusOverride().value_or(status),
-          lockedSpan);
-      ++lockedSpan->inOrderCompletedMsn;
-    }
+    completeLocalTxWqes(localWqes, lockedSpan);
     retireCompletedWqesAtMapHead(lockedSpan);
   }
   signalMsnSpanRoom();
