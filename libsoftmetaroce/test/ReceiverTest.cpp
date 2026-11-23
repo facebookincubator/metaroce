@@ -30,6 +30,7 @@
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/synchronization/Baton.h>
+#include <gflags/gflags.h>
 #include <gmock/gmock-actions.h>
 #include <gtest/gtest.h>
 #include <libsoftmetaroce/CompletionQueue.h>
@@ -820,6 +821,43 @@ TEST_F(ReceiverTest, DataArrivingDuringSetupFlowsSendsHrnrNotFlowIdNak) {
   EXPECT_GT(hrnrCount.load(std::memory_order_relaxed), 0)
       << "at least one packet must land during setup, or the race was not "
          "exercised";
+}
+
+TEST_F(ReceiverTest, AnAckForAFlowTheQpDoesNotHaveIsDropped) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_single_owner_tx = false;
+  qpNumToQp_.wlock()->clear();
+  buildQp();
+  Qp* const qp = qpNumToQp_.rlock()->at(dstQp).get();
+  ASSERT_FALSE(qp->usesSingleOwnerRxRing())
+      << "precondition: the receiver applies each ack itself, so the receive "
+         "path reaches the flow lookup";
+  ASSERT_EQ(qp->getRemoteActivePortSet(), 0)
+      << "precondition: the QP knows of no active remote port, so an applied "
+         "ack would change the set";
+
+  const BaseHeader baseHeader =
+      BaseHeader::BaseHeaderBuilder()
+          .setOpcode(
+              BaseHeader::Opcode(BaseHeader::Opcode::OperationType::SEL_ACK))
+          .setVersion(kMetaRoceProtocolVersion)
+          .setFlowId(qp->getNumTxFlows())
+          .setDstQp(dstQp)
+          .setSrcQp(srcQp)
+          .build();
+  const AckHeader ackHeader = AckHeader::AckHeaderBuilder()
+                                  .setCumulativeFsn(0)
+                                  .setMaxRcvdFsn(0)
+                                  .setAckStatus(AckStatus::ACK)
+                                  .setActivePortSet(1)
+                                  .setTimestamp(0)
+                                  .build();
+  mockReceiver_->simulateReceivePacket(
+      std::make_unique<AckPacket>(baseHeader, ackHeader), kEcnECT0);
+
+  EXPECT_EQ(qp->getRemoteActivePortSet(), 0)
+      << "an ack for a flow the QP lacks fails packet validation, so the QP "
+         "should drop it without aborting and change no transmit state";
 }
 
 TEST_F(ReceiverTest, APacketFromAnotherSourceQpIsDiscardedSilently) {

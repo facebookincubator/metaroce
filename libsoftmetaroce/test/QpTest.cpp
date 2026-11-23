@@ -1445,7 +1445,7 @@ struct TrackedMessageFixture {
       Qp& qp,
       uint16_t mtu,
       Tag*& initialTag,
-      std::initializer_list<Flow::FsnState> frames,
+      const std::vector<Flow::FsnState>& frames,
       uint16_t sndCur,
       int messageFrames = 4)
       : mockSender(arbiter, mockUDPSocketMaker) {
@@ -4068,6 +4068,110 @@ TEST_F(QpTest, AnAckClaimingAFrameNotYetSentIsDiscardedWhole) {
   EXPECT_EQ(txState.maxAckdFsn, 9)
       << "the sender should record no frame as received from the discarded "
          "ack";
+}
+
+TEST_F(QpTest, AnAckWhoseMaxFsnPrecedesItsCumulativeFsnIsDiscardedWhole) {
+  TrackedMessageFixture fixture(
+      arbiter,
+      qp,
+      mtu,
+      initialTag,
+      {Flow::FsnState::UNACKED,
+       Flow::FsnState::UNACKED,
+       Flow::FsnState::UNACKED,
+       Flow::FsnState::UNACKED},
+      /*sndCur=*/10);
+  auto* const flow = fixture.flow;
+  auto& txState = *fixture.txState;
+  const uint32_t outstandingBefore = fixture.wqe->getOutstandingPosnCount();
+
+  const AckHeader ack = AckHeader::AckHeaderBuilder()
+                            .setCumulativeFsn(12)
+                            .setMaxRcvdFsn(11)
+                            .setAckStatus(AckStatus::ACK_OUT_OF_ORDER)
+                            .setTimestamp(0)
+                            .build();
+  flow->processAckPacket(ack, simulatedProcessedAtNs(ack.getTimestamp()));
+
+  EXPECT_EQ(txState.sndUna, 10)
+      << "a MaxFSN behind CumulativeFSN reports a window over half the "
+         "sequence space, so the sender should apply no part of the ack, the "
+         "cumulative fsn included";
+  EXPECT_EQ(fixture.wqe->getOutstandingPosnCount(), outstandingBefore)
+      << "the message should complete only once the receiver acknowledges "
+         "its frames";
+}
+
+TEST_F(QpTest, AnAckWhoseMaxFsnIsPastTheBitVectorIsApplied) {
+  constexpr uint32_t kFrames = AckHeader::kAckTrackerBits + 44;
+  TrackedMessageFixture fixture(
+      arbiter,
+      qp,
+      mtu,
+      initialTag,
+      std::vector<Flow::FsnState>(kFrames, Flow::FsnState::UNACKED),
+      /*sndCur=*/10 + kFrames,
+      /*messageFrames=*/kFrames);
+  auto* const flow = fixture.flow;
+  auto& txState = *fixture.txState;
+
+  // The receiver acknowledges frames 10, 11 and the one at the vector's last
+  // bit, reports frame 12 missing, and sets MaxFSN past the vector.
+  BitVector<AckHeader::kAckTrackerBits> fsnBitVector;
+  fsnBitVector.setBit(0);
+  fsnBitVector.setBit(AckHeader::kAckTrackerBits - 1);
+  const AckHeader ack = AckHeader::AckHeaderBuilder()
+                            .setCumulativeFsn(10)
+                            .setMaxRcvdFsn(txState.sndNxt - 1)
+                            .setAckStatus(AckStatus::ACK_OUT_OF_ORDER)
+                            .setFsnBitVector(fsnBitVector)
+                            .setTimestamp(0)
+                            .build();
+  flow->processAckPacket(ack, simulatedProcessedAtNs(ack.getTimestamp()));
+
+  EXPECT_EQ(txState.sndUna, 12)
+      << "a receiver may set MaxFSN past the bit vector, and the sender should "
+         "still retire frames 10 and 11 and stop at frame 12, which the ack "
+         "reports missing";
+  EXPECT_LE(fixture.wqe->getOutstandingPosnCount(), kFrames - 3)
+      << "the sender should resolve at least frames 10 and 11 and the frame "
+         "at the vector's last bit";
+}
+
+TEST_F(QpTest, SackBitsPastMaxFsnAcknowledgeNoFrame) {
+  TrackedMessageFixture fixture(
+      arbiter,
+      qp,
+      mtu,
+      initialTag,
+      {Flow::FsnState::UNACKED,
+       Flow::FsnState::UNACKED,
+       Flow::FsnState::UNACKED,
+       Flow::FsnState::UNACKED},
+      /*sndCur=*/14);
+  auto* const flow = fixture.flow;
+  auto& txState = *fixture.txState;
+
+  // Bit 1 stands for frame 12, at MaxFSN; bit 2 stands for frame 13, past it.
+  BitVector<AckHeader::kAckTrackerBits> fsnBitVector;
+  fsnBitVector.setBit(1);
+  fsnBitVector.setBit(2);
+  const AckHeader ack = AckHeader::AckHeaderBuilder()
+                            .setCumulativeFsn(10)
+                            .setMaxRcvdFsn(12)
+                            .setAckStatus(AckStatus::ACK_OUT_OF_ORDER)
+                            .setFsnBitVector(fsnBitVector)
+                            .setTimestamp(0)
+                            .build();
+  flow->processAckPacket(ack, simulatedProcessedAtNs(ack.getTimestamp()));
+
+  EXPECT_EQ(txState.sndUna, 11)
+      << "only the bits past MaxFSN acknowledge no frame, so the sender "
+         "should accept the ack and apply its cumulative fsn";
+  EXPECT_EQ(fixture.wqe->getOutstandingPosnCount(), 2u)
+      << "the sender should resolve frame 12, which bit 1 acknowledges, and "
+         "leave frame 13 outstanding beside the missing frame 11, since "
+         "MaxFSN is the highest fsn the receiver fully acknowledges";
 }
 
 /*
