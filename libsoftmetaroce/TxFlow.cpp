@@ -648,6 +648,8 @@ void TxFlow::processBrnrPacket(
 }
 
 void TxFlow::processNakFlowIdError() {
+  // processAckPacket discards a flow ID NAK for flow 0.
+  CHECK_NE(flowId_, 0);
   LOG(ERROR) << "Received NAK_FLOW_ID_ERROR for qp: " << qp_.getLocalQpNum()
              << " flow: " << flowId_;
 
@@ -690,13 +692,7 @@ void TxFlow::processNakFlowIdError() {
         numReleasedForRetry++;
       }
     }
-    // A receiver is not permitted to reject flow 0.
-    if (flowId_ == 0) {
-      LOG_FIRST_N(ERROR, 10)
-          << "keeping flow 0 in service on qp " << qp_.getLocalQpNum();
-    } else {
-      disableAndNotifyCongestionControl();
-    }
+    disableAndNotifyCongestionControl();
     // Destroy the retransmission timer to prevent further retransmissions
     destroyRetransmissionTimer();
     // Do not process these tracker entries again if we see another
@@ -899,6 +895,11 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
           << " cumulativeRespDeliveredMsn: " << ack.getCumulRespDeliveredMsn();
 
   if (ack.getAckStatus() == AckStatus::NAK_FLOW_ID_ERROR) {
+    if (flowId_ == 0) {
+      LOG_FIRST_N(ERROR, 10)
+          << "ignoring a flow ID NAK for flow 0 on qp " << qp_.getLocalQpNum();
+      return;
+    }
     processNakFlowIdError();
     reportAckReturningNoFrames(ack);
     return;

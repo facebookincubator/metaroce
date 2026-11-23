@@ -1127,13 +1127,18 @@ TEST_F(SenderTest, NakDoesNotClearRcnHint) {
   gflags::FlagSaver flagSaver;
   FLAGS_libsoftmetaroce_rcn_pacing_multiplier = 2;
   ScopedSuppressedTxTimers suppressTimers;
-  auto sender = createTestSenderWithFlows(
-      mockUDPSocketMaker, LimitedTestSender::kDisableSendLoop);
+  auto sender = std::make_unique<LimitedTestSender>(
+      arbiter,
+      mockUDPSocketMaker,
+      kMetaRoceSendToPort,
+      LimitedTestSender::kDisableSendLoop);
+  // The NAK goes to flow 1 because the sender ignores a flow ID NAK for flow 0.
+  qp->setupFlows(2, 2, sender.get());
 
   qp->updateRcnHintGbps(100);
   ASSERT_TRUE(qp->isRateLimited())
       << "precondition: the hint must program the pacer before the NAK";
-  auto* flow = qp->getTxFlowById(0);
+  auto* flow = qp->getTxFlowById(1);
   ASSERT_NE(flow, nullptr);
   flow->processAckPacket(
       AckHeader::AckHeaderBuilder()

@@ -11681,8 +11681,8 @@ TEST_F(QpTest, ABrnrThatAbandonsTheLastPosnCompletesTheMessage) {
 TEST_F(QpTest, AFlowIdErrorAbandonsAFailingReadsFrameRatherThanHandingItBack) {
   qp.setCongestionController(std::make_unique<MockCongestionController>());
   LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
-  qp.setupFlows(1, 1, &mockSender);
-  auto flow = qp.getTxFlowById(0);
+  qp.setupFlows(2, 2, &mockSender);
+  auto flow = qp.getTxFlowById(1);
 
   std::array<char, 4096> payload{};
   // Posted first and left pending, so in-order completion cannot retire the
@@ -11747,8 +11747,8 @@ TEST_F(QpTest, AFlowIdErrorAbandonsAFailingReadsFrameRatherThanHandingItBack) {
 TEST_F(QpTest, AFlowIdErrorAbandonsAServedReadsFrameRatherThanHandingItBack) {
   qp.setCongestionController(std::make_unique<MockCongestionController>());
   LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
-  qp.setupFlows(1, 1, &mockSender);
-  auto flow = qp.getTxFlowById(0);
+  qp.setupFlows(2, 2, &mockSender);
+  auto flow = qp.getTxFlowById(1);
 
   std::array<char, 4096> payload{};
   // Posted first and left pending, so in-order completion cannot retire the

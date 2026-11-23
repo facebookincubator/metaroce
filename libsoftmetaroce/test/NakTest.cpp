@@ -954,74 +954,36 @@ TEST_F(NakTest, WqePostedAfterFatalNakIsFlushedBehindTheFailingWqe) {
   sender = nullptr;
 }
 
-// A receiver may not reject flow 0, so a NAK blaming it must not take it out
-// of service. Flow 1 is rejected on every frame; flow 0 once, then acked.
-TEST_F(NakTest, FlowZeroIsNotTakenOutOfServiceByAFlowIdNak) {
-  auto sender = createTestSenderWithFlows(2);
-  auto& socket = getTestSocket(sender.get());
-
+TEST_F(NakTest, AFlowIdNakForFlowZeroIsIgnored) {
+  auto sender =
+      createTestSenderWithFlows(1, LimitedTestSender::kDisableSendLoop);
   ON_CALL(congestionController(), getAvailableWindowSize(_))
       .WillByDefault(Return(kCongestionWindowSize));
-  EXPECT_CALL(congestionController(), onFlowDisabled(0)).Times(0);
-  EXPECT_CALL(congestionController(), onFlowDisabled(1)).Times(AtLeast(1));
-
-  std::mutex mtx;
-  std::condition_variable cv;
-  std::set<uint16_t> posnOnFlow0;
-  bool rejectedFlowZeroOnce = false;
-
-  auto& flow0 = txFlow(0);
-  auto& flow1 = txFlow(1);
-
-  EXPECT_CALL(socket, write(_, _))
-      .Times(AtLeast(kTestFrameCount))
-      .WillRepeatedly([&](const folly::SocketAddress&,
-                          const std::unique_ptr<folly::IOBuf>& buf) {
-        auto packetInfo = parseDataPacket(buf);
-        if (!packetInfo) {
-          return buf.get()->computeChainDataLength();
-        }
-        std::lock_guard<std::mutex> lock(mtx);
-        if (packetInfo->flowId == 1) {
-          flow1.processAckPacket(
-              buildNakFlowIdError(packetInfo->fsn, packetInfo->timestamp),
-              simulatedProcessedAtNs(packetInfo->timestamp));
-        } else if (!rejectedFlowZeroOnce) {
-          rejectedFlowZeroOnce = true;
-          flow0.processAckPacket(
-              buildNakFlowIdError(packetInfo->fsn, packetInfo->timestamp),
-              simulatedProcessedAtNs(packetInfo->timestamp));
-        } else {
-          posnOnFlow0.insert(packetInfo->posn);
-          flow0.processAckPacket(
-              buildAck(packetInfo->fsn, packetInfo->timestamp),
-              simulatedProcessedAtNs(packetInfo->timestamp));
-          if (posnOnFlow0.size() == kTestFrameCount) {
-            cv.notify_one();
-          }
-        }
-        return buf.get()->computeChainDataLength();
-      });
-
   auto payload = std::make_unique<char[]>(kTestFrameCount * qp->getMtu());
   postTestWqe(kTestFrameCount, payload.get());
   qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the WQE reaches its Tag, or flow 0 has nothing to send";
+  auto sent = txFlow(0).getNextPacketToSend();
+  ASSERT_NE(sent, nullptr);
+  const auto* data = dynamic_cast<const DataPacket*>(sent->packet.get());
+  ASSERT_NE(data, nullptr);
+  const uint16_t fsn = data->getDataHeader().getFsn();
+  const uint32_t sentAtNs = data->getDataHeader().getTimestamp();
 
-  {
-    std::unique_lock<std::mutex> lock(mtx);
-    bool success = cv.wait_for(lock, kTestTimeout, [&posnOnFlow0]() {
-      return posnOnFlow0.size() == kTestFrameCount;
-    });
-    EXPECT_TRUE(success)
-        << "flow 0 was rejected once and must still carry the message; it "
-           "delivered "
-        << posnOnFlow0.size() << " of " << kTestFrameCount << " posns";
-  }
-  EXPECT_TRUE(rejectedFlowZeroOnce)
-      << "the case never rejected flow 0, so it proves nothing about keeping "
-         "it in service";
+  EXPECT_CALL(congestionController(), onFlowDisabled(0)).Times(0);
+  CongestionController::AckEvent reported;
+  EXPECT_CALL(congestionController(), onPacketAck(0, _))
+      .WillOnce(DoAll(
+          SaveArg<1>(&reported), Return(CongestionController::AckResult{})));
+  txFlow(0).processAckPacket(
+      buildNakFlowIdError(fsn, sentAtNs), simulatedProcessedAtNs(sentAtNs));
+  txFlow(0).processAckPacket(
+      buildAck(fsn, sentAtNs), simulatedProcessedAtNs(sentAtNs));
 
-  sender = nullptr;
+  EXPECT_EQ(reported.numAckedPackets, 1)
+      << "the sender must leave the frame outstanding through the NAK, so "
+         "the later ack acknowledges it";
 }
 
 TEST_F(NakTest, AFlowIdNakIsReportedWithoutItsFlowCount) {
