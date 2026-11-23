@@ -16,8 +16,10 @@
 
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBufQueue.h>
+#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 #include <libsoftmetaroce/Icrc.h>
+#include <libsoftmetaroce/ProtocolCompatibility.h>
 #include <libsoftmetaroce/UdpEncapsulation.h>
 
 namespace libsoftmetaroce {
@@ -73,6 +75,22 @@ TEST(UdpEncapsulationTest, FrameThenDeframeRoundTrips) {
   auto metadata = encap.deframeIncoming(buf);
   EXPECT_TRUE(metadata.has_value())
       << "a frame with a freshly computed mCRC must validate";
+}
+
+TEST(UdpEncapsulationTest, DeframeFrameWithCorruptMcrcDrops) {
+  gflags::FlagSaver flagSaver;
+  FLAGS_libsoftmetaroce_validate_crc = true;
+  UdpEncapsulation encap;
+  folly::IOBufQueue queue;
+  queue.append(folly::IOBuf::copyBuffer("MetaRoCE"));
+  encap.frameOutgoing(queue, std::nullopt);
+  auto framed = queue.move();
+  framed->coalesce();
+  framed->writableData()[framed->length() - 1] ^= 0x01;
+
+  EXPECT_FALSE(encap.deframeIncoming(framed))
+      << "the receiver must drop a frame whose mCRC does not match its "
+         "contents rather than act on corrupted bytes";
 }
 
 TEST(UdpEncapsulationTest, PayloadSizeExcludesMcrc) {

@@ -105,14 +105,17 @@ TEST(CodecTest, IsMetaRoceClassifiesBthPrefix) {
 }
 
 namespace {
-BaseHeader writeAndParseBaseHeader(const BaseHeader& header) {
+std::unique_ptr<folly::IOBuf> writeBaseHeader(const BaseHeader& header) {
   auto buf = folly::IOBuf::create(BaseHeader::kBaseHeaderSizeBytes);
   folly::IOBufQueue bufferQueue;
   bufferQueue.append(std::move(buf));
   folly::io::QueueAppender appender(&bufferQueue, /* growth */ 0);
   header.write(appender);
+  return bufferQueue.move();
+}
 
-  std::unique_ptr<folly::IOBuf> movedBuf = bufferQueue.move();
+BaseHeader writeAndParseBaseHeader(const BaseHeader& header) {
+  std::unique_ptr<folly::IOBuf> movedBuf = writeBaseHeader(header);
   folly::io::Cursor cursor(movedBuf.get());
   return BaseHeader(cursor);
 }
@@ -198,6 +201,27 @@ TEST(CodecTest, BaseHeaderWriteTruncatesOutOfRangeFlowId) {
   EXPECT_EQ(parsed.getFlowId(), kTruncatedFlowId)
       << "an out-of-range flow id should truncate to its low 12 bits on the "
          "wire";
+}
+
+TEST(CodecTest, BaseHeaderIgnoresReservedBits) {
+  constexpr size_t kReservedByteOffset = 1;
+  const BaseHeader header = BaseHeader::BaseHeaderBuilder()
+                                .setOpcode(BaseHeader::Opcode(0xC0))
+                                .setVersion(kDistinctiveVersion)
+                                .setFlowId(kMaxWireFlowId)
+                                .setDstQp(kSomeDstQp)
+                                .setSrcQp(kSomeSrcQp)
+                                .build();
+  auto wireBuffer = writeBaseHeader(header);
+  wireBuffer->writableData()[kReservedByteOffset] = 0xFF;
+
+  folly::io::Cursor cursor(wireBuffer.get());
+  BaseHeader parsed;
+  ASSERT_NO_THROW(parsed = BaseHeader(cursor))
+      << "a receiver must accept a base header with nonzero reserved bits";
+  EXPECT_EQ(parsed, header)
+      << "the parser should read every field around the reserved bits "
+         "unchanged, or the packet reaches the wrong QP or flow";
 }
 
 TEST(CodecDeathTest, BaseHeaderFlowIdSettersRejectOutOfRange) {
@@ -766,6 +790,8 @@ TEST(CodecTest, ABrnrNakKeepsTheRnrBitsItCarries) {
 }
 
 namespace {
+constexpr size_t kAckStatusOffset = 6;
+
 std::unique_ptr<folly::IOBuf> serializeAckKeepingVectorBytes(
     const AckHeader& header,
     size_t vectorBytes) {
@@ -818,7 +844,6 @@ TEST(CodecTest, AnInOrderAckIgnoresTheBitVectorItCarries) {
   auto buffer = serializeAckKeepingVectorBytes(
       header, /*vectorBytes=*/AckHeader::kAckTrackerBits / 8);
   // The builder writes a vector only for a status that calls for one.
-  constexpr size_t kAckStatusOffset = 6;
   buffer->writableData()[kAckStatusOffset] =
       static_cast<uint8_t>(AckStatus::ACK);
 
@@ -833,6 +858,58 @@ TEST(CodecTest, AnInOrderAckIgnoresTheBitVectorItCarries) {
   EXPECT_FALSE(parsed.getFsnBitVector().getBit(3))
       << "the parser should read no bit from a vector an in-order ack does "
          "not call for, or a stray byte acknowledges a frame never received";
+}
+
+TEST(CodecTest, AnOutOfOrderAckIgnoresTheRnrVectorItCarries) {
+  BitVector<AckHeader::kAckTrackerBits> rnrBitVector;
+  rnrBitVector.setBit(7);
+  const AckHeader header = AckHeader::AckHeaderBuilder()
+                               .setCumulativeFsn(100)
+                               .setMaxRcvdFsn(120)
+                               .setTimestamp(5678)
+                               .setAckStatus(AckStatus::BRNR)
+                               .setRnrBackoffTimeExp(3)
+                               .setRnrBitVector(rnrBitVector)
+                               .build();
+  auto buffer = serializeAckKeepingVectorBytes(
+      header, /*vectorBytes=*/2 * AckHeader::kAckTrackerBits / 8);
+  // The builder writes an RNR vector only for a BRNR-NAK.
+  buffer->writableData()[kAckStatusOffset] =
+      static_cast<uint8_t>(AckStatus::ACK_OUT_OF_ORDER);
+
+  folly::io::Cursor cursor(buffer.get());
+  AckHeader parsed;
+  ASSERT_NO_THROW(parsed = AckHeader(cursor))
+      << "the parser should accept an ack carrying a vector it does not read";
+  ASSERT_EQ(parsed.getAckStatus(), AckStatus::ACK_OUT_OF_ORDER)
+      << "precondition: the ack parses as an out-of-order ack";
+  EXPECT_FALSE(parsed.getRnrBitVector().getBit(7))
+      << "the parser should read no RNR bit from an out-of-order ack, or a "
+         "stray byte reports a frame the receiver never refused";
+}
+
+TEST(CodecTest, AckHeaderIgnoresReservedBitsBesideCnpCeAndAckStatus) {
+  const AckHeader header = AckHeader::AckHeaderBuilder()
+                               .setCnpCE(0x5)
+                               .setCumulativeFsn(100)
+                               .setMaxRcvdFsn(120)
+                               .setAckStatus(AckStatus::ACK)
+                               .setCumulRespDeliveredMsn(7)
+                               .setTimestamp(5678)
+                               .build();
+  auto buffer = serializeAckKeepingVectorBytes(header, /*vectorBytes=*/0);
+  constexpr size_t kReservedNibbleOffset = 0;
+  constexpr size_t kReservedByteOffset = 7;
+  buffer->writableData()[kReservedNibbleOffset] |= 0xF0;
+  buffer->writableData()[kReservedByteOffset] = 0xFF;
+
+  folly::io::Cursor cursor(buffer.get());
+  AckHeader parsed;
+  ASSERT_NO_THROW(parsed = AckHeader(cursor))
+      << "a receiver must accept an ack with nonzero reserved bits";
+  EXPECT_EQ(parsed, header)
+      << "the parser should read every field around the reserved bits "
+         "unchanged, or the sender acts on field values the peer never sent";
 }
 
 TEST(CodecTest, ABrnrNakTooShortForItsVectorsStillCarriesItsCumulativeFsn) {
