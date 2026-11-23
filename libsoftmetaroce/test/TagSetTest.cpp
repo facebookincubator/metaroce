@@ -127,7 +127,7 @@ class TagSetTest : public ::testing::Test {
     read.onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
     auto tagGuard = tag.scopedLock();
     auto retirementGuard = tag.lockForWqeRetirement();
-    tag.retireAfterRequestFrameSettled(read);
+    tag.retireAfterRequestFrameSettled(read, retirementGuard);
   }
 
   // Adds tag 1, spends its one negotiated slot with a read the loop admits,

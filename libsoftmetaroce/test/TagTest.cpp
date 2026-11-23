@@ -1811,7 +1811,7 @@ TEST_F(TagTest, FlushAllPendingWqesInErrorGeneratesCompletions) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeWqeThatFailsTheTag(*wqe1Ptr, kWrRemAccErr);
+    tag_->completeWqeThatFailsTheTag(*wqe1Ptr, kWrRemAccErr, retirementGuard);
   }
 
   EXPECT_EQ(tag_->getNumPendingWqes(), 2)
@@ -1859,7 +1859,7 @@ TEST_F(TagTest, CompletingAWorkRequestInErrorLeavesTheTagRunning) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeWqeThatFailsTheTag(*posted, kWrRemAccErr);
+    tag_->completeWqeThatFailsTheTag(*posted, kWrRemAccErr, retirementGuard);
   }
 
   EXPECT_FALSE(tag_->isInErrorState())
@@ -2034,7 +2034,7 @@ TEST_F(TagTest, FailingATagRetiresAVirtualSendThatWillNeverBeSent) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   EXPECT_EQ(tag_->getNumPendingWqes(), 0)
@@ -2083,8 +2083,12 @@ TEST_F(TagTest, PostingAFailedWqeLeavesTheRestToTheSender) {
       << "the sender marks it failing once it sees the tag in error";
 
   // The packet on the wire is acknowledged, so the earlier one settles.
-  inFlightWqe->acknowledgePosn(0);
-  tag_->completeSettledFailedWqes();
+  {
+    auto tagGuard = tag_->scopedLock();
+    auto retirementGuard = tag_->lockForWqeRetirement();
+    inFlightWqe->acknowledgePosn(0);
+    tag_->completeSettledFailedWqes(retirementGuard);
+  }
 
   ASSERT_EQ(cq_->getNumCompletedWqes(), 2)
       << "both work requests must report once no packet is left on the wire";
@@ -2181,7 +2185,7 @@ TEST_F(TagTest, AFailingReadCompletesOnceItsRequestFrameSettles) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
   EXPECT_EQ(cq_->getNumCompletedWqes(), 0)
       << "the request is still on the wire and can be retransmitted, so the "
@@ -2195,7 +2199,7 @@ TEST_F(TagTest, AFailingReadCompletesOnceItsRequestFrameSettles) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   ASSERT_EQ(cq_->getNumCompletedWqes(), 1)
@@ -2378,7 +2382,7 @@ TEST_F(TagTest, AVirtualSendCompletedInErrorIsHeldUntilItsResponseSettles) {
     auto tagGuard = tag_->scopedLock();
     tag_->markPendingWqesFailing(kWrFlushErr);
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   EXPECT_EQ(tag_->getNumPendingWqes(), 1)
@@ -2398,7 +2402,7 @@ TEST_F(TagTest, AVirtualSendCompletedInErrorIsHeldUntilItsResponseSettles) {
     auto tagGuard = tag_->scopedLock();
     response->acknowledgePosn(secondPosn);
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   EXPECT_EQ(tag_->getNumPendingWqes(), 0)
@@ -2552,7 +2556,7 @@ TEST_F(TagTest, CompletingInErrorKeepsAStatusTheWqeAlreadyCarries) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeWqeThatFailsTheTag(*posted, kWcRetryExcErr);
+    tag_->completeWqeThatFailsTheTag(*posted, kWcRetryExcErr, retirementGuard);
   }
 
   ASSERT_EQ(cq_->getNumCompletedWqes(), 1)
@@ -2592,7 +2596,7 @@ TEST_F(TagTest, WorkThatSucceededBehindAFailureStillReportsSuccess) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeWqeThatFailsTheTag(*first, kWrRemAccErr);
+    tag_->completeWqeThatFailsTheTag(*first, kWrRemAccErr, retirementGuard);
   }
 
   ASSERT_EQ(cq_->getNumCompletedWqes(), 2)
@@ -2628,7 +2632,7 @@ TEST_F(TagTest, CompletingInErrorWaitsForTheWorkPostedBeforeIt) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeWqeThatFailsTheTag(*second, kWrRemAccErr);
+    tag_->completeWqeThatFailsTheTag(*second, kWrRemAccErr, retirementGuard);
   }
 
   EXPECT_EQ(cq_->getNumCompletedWqes(), 0)
@@ -2741,7 +2745,7 @@ TEST_F(TagTest, CompletingInErrorWaitsForItsOwnPacketsToSettle) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeWqeThatFailsTheTag(*posted, kWrRemAccErr);
+    tag_->completeWqeThatFailsTheTag(*posted, kWrRemAccErr, retirementGuard);
   }
 
   EXPECT_EQ(cq_->getNumCompletedWqes(), 0)
@@ -2759,7 +2763,7 @@ TEST_F(TagTest, CompletingInErrorWaitsForItsOwnPacketsToSettle) {
     auto tagGuard = tag_->scopedLock();
     posted->acknowledgePosn(secondPosn);
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   ASSERT_EQ(cq_->getNumCompletedWqes(), 1)
@@ -2794,7 +2798,7 @@ TEST_F(TagTest, CompleteVirtualSendWqeInError) {
     auto tagGuard = tag_->scopedLock();
     tag_->markPendingWqesFailing(kWrFlushErr);
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   EXPECT_EQ(tag_->getNumPendingWqes(), 0)
@@ -3382,7 +3386,7 @@ TEST_F(TagTest, ResponseBeforeRequestAckHoldsTheReadUntilItIsAcked) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->retireAfterRequestFrameSettled(*read);
+    tag_->retireAfterRequestFrameSettled(*read, retirementGuard);
   }
 
   EXPECT_EQ(
@@ -3438,7 +3442,7 @@ TEST_F(
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   EXPECT_EQ(tag_->getNumHeldTxWqes(), 0u)
@@ -3526,7 +3530,7 @@ TEST_F(TagTest, RequestAckBeforeResponseRetiresOnTheResponse) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->retireAfterRequestFrameSettled(*read);
+    tag_->retireAfterRequestFrameSettled(*read, retirementGuard);
   }
 
   EXPECT_EQ(cq_->getNumCompletedWqes(), 0)
@@ -3596,7 +3600,7 @@ TEST_F(TagTest, RequestAckBeforeCommittedCompletionLeavesTheReadToComplete) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->retireAfterRequestFrameSettled(*reads[1]);
+    tag_->retireAfterRequestFrameSettled(*reads[1], retirementGuard);
   }
   EXPECT_NE(
       tag_->getReceiveWqe(
@@ -3611,7 +3615,7 @@ TEST_F(TagTest, RequestAckBeforeCommittedCompletionLeavesTheReadToComplete) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->retireAfterRequestFrameSettled(*reads[0]);
+    tag_->retireAfterRequestFrameSettled(*reads[0], retirementGuard);
   }
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
@@ -3653,7 +3657,7 @@ TEST_F(TagTest, ErroringATagDoesNotReportAReadHeldOnlyForItsRequestAck) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   EXPECT_EQ(cq_->getNumCompletedWqes(), 1)
@@ -3731,7 +3735,7 @@ TEST_F(TagTest, ARunOfReadsAbandonedTogetherRetiresInOnePass) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->completeSettledFailedWqes();
+    tag_->completeSettledFailedWqes(retirementGuard);
   }
 
   EXPECT_EQ(tag_->getNumHeldTxWqes(), 0)
@@ -3833,7 +3837,7 @@ TEST_F(TagTest, WorkHeldBehindAStalledRequestFrameOutgrowsTheSendQueue) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->retireAfterRequestFrameSettled(*read);
+    tag_->retireAfterRequestFrameSettled(*read, retirementGuard);
   }
 
   EXPECT_EQ(tag_->getNumHeldTxWqes(), 0)
@@ -3959,7 +3963,7 @@ TEST_F(TagTest, RetiringAReadReturnsTheSlotItSpent) {
   {
     auto tagGuard = tag_->scopedLock();
     auto retirementGuard = tag_->lockForWqeRetirement();
-    tag_->retireAfterRequestFrameSettled(*read);
+    tag_->retireAfterRequestFrameSettled(*read, retirementGuard);
   }
   ASSERT_EQ(tag_->getNumHeldTxWqes(), 0)
       << "precondition: the read has retired and left the map";

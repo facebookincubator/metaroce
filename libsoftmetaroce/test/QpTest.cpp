@@ -3031,7 +3031,7 @@ TEST_F(QpTest, AFailingReadIsHeldUntilItsRequestFrameSettles) {
     auto retirementGuard = initialTag->lockForWqeRetirement();
     initialTag->getIbvQp().state = IBV_QPS_ERR;
     initialTag->markPendingWqesFailing(kWrRemAccErr);
-    initialTag->completeSettledFailedWqes();
+    initialTag->completeSettledFailedWqes(retirementGuard);
   }
 
   EXPECT_EQ(cq.getNumCompletedWqes(), 0u)
@@ -3242,7 +3242,7 @@ TEST_F(QpTest, AnUnsentFailingReadIsNotSentAndStillWaitsItsTurn) {
   const auto sweepFailedWqes = [this]() {
     auto tagGuard = initialTag->scopedLock();
     auto retirementGuard = initialTag->lockForWqeRetirement();
-    initialTag->completeSettledFailedWqes();
+    initialTag->completeSettledFailedWqes(retirementGuard);
   };
 
   sweepFailedWqes();

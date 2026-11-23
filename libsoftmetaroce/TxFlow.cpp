@@ -457,7 +457,7 @@ std::unique_ptr<struct EgressPacket> TxFlow::tryGetNewPacketFromWqe() {
             abandonedCount += tag->markPendingWqesFailing(kWrFlushErr);
             qp_.subtractUnsentPosns(abandonedCount);
             tag->flushPendingReceiveWqesInError();
-            tag->completeSettledFailedWqes();
+            tag->completeSettledFailedWqes(retirementGuard);
           }
           tag->markFree();
           lockedSndCur.unlock();
@@ -840,7 +840,7 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
 
     // A work request with no frame in flight is already fully accounted for and
     // has no ack coming to complete it.
-    tag.completeSettledFailedWqes();
+    tag.completeSettledFailedWqes(retirementGuard);
   }
   qp_.wakeSenderAfterTagError(tagErrorWake);
 }

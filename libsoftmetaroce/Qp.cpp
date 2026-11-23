@@ -883,7 +883,7 @@ void Qp::checkForTxMessageCompletion(
       // Settling a request frame, or a read-with-immediate response completing
       // its paired receive, changes state the receive path consults; a batch of
       // plain sends and writes leaves that state undisturbed.
-      std::unique_lock<folly::SharedMutex> retirementGuard;
+      Tag::WqeRetirementGuard retirementGuard;
       if (tagsNeedingRetirementGuard.test(tagNum)) {
         retirementGuard = tag.lockForWqeRetirement();
       }
@@ -897,7 +897,7 @@ void Qp::checkForTxMessageCompletion(
             // The response completes a read, so this ack can settle only a
             // failing work request, or one held back for the ack
             // alone.
-            tag.retireAfterRequestFrameSettled(wqe);
+            tag.retireAfterRequestFrameSettled(wqe, retirementGuard);
           } else if (wqe.isCompletedByAcks()) {
             wqesToComplete.emplace_back(wqe);
           }
@@ -1383,7 +1383,7 @@ void Qp::retireTagsWithAbandonedFrames(
     Tag& tag = existingTag(static_cast<uint8_t>(tagNum));
     auto tagGuard = tag.scopedLock();
     auto retirementGuard = tag.lockForWqeRetirement();
-    tag.completeSettledFailedWqes();
+    tag.completeSettledFailedWqes(retirementGuard);
   }
 }
 
@@ -1494,7 +1494,7 @@ void Qp::processWatchdogExpiry() {
     WorkCompletionStatus errorStatus =
         (isRnrState || tagInBrnr) ? kWcRnrRetryExcErr : kWcRetryExcErr;
     subtractUnsentPosns(tag.markPendingWqesFailing(errorStatus));
-    tag.completeSettledFailedWqes();
+    tag.completeSettledFailedWqes(retirementGuard);
 
     tagErrorWake |= enterTagErrorWithTagHeld(tag);
   }
@@ -1553,7 +1553,7 @@ SenderWake Qp::processRnrRetryExceeded() {
     }
     tagSet_.subtractUnsentPosns(abandonedCount);
     tag.flushPendingReceiveWqesInError();
-    tag.completeSettledFailedWqes();
+    tag.completeSettledFailedWqes(retirementGuard);
   }
   // Handed back rather than signalled here: every Tag guard above has closed,
   // but the sender may be the caller, and a signal to itself calls in nobody.

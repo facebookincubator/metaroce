@@ -375,7 +375,7 @@ bool Tag::processTransmitWqe(std::unique_ptr<Wqe> ownedWqe) {
       // Excludes receive delivery from the WQEs retired below; taken after
       // msnSpan_ is released, keeping the semaphore -> guard -> map order.
       auto retirementGuard = lockForWqeRetirement();
-      completeSettledFailedWqes();
+      completeSettledFailedWqes(retirementGuard);
       return false;
     }
     const bool hasCompletionOverride =
@@ -1279,12 +1279,13 @@ void Tag::markForDeletion() {
 
 uint32_t Tag::completeWqeThatFailsTheTag(
     Wqe& wqe,
-    enum WorkCompletionStatus status) {
+    enum WorkCompletionStatus status,
+    const WqeRetirementGuard& retirementGuard) {
   DCHECK(!wqe.isVirtual())
       << "a virtual send's posns never entered the unsent count, so the count "
          "returned here would take off posns that were never added";
   const uint32_t abandonedPosnCount = wqe.markFailing(status);
-  completeSettledFailedWqes();
+  completeSettledFailedWqes(retirementGuard);
   return abandonedPosnCount;
 }
 
@@ -1304,7 +1305,7 @@ uint32_t Tag::failPendingWqesIfInErrorWithTagHeld() {
   // Marking settles a work request whose posns were all unsent.
   const uint32_t abandonedPosnCount = markPendingWqesFailing(kWrFlushErr);
   // No ack or retransmission scan comes back for a settled work request.
-  completeSettledFailedWqes();
+  completeSettledFailedWqes(retirementGuard);
   return abandonedPosnCount;
 }
 
@@ -1330,7 +1331,7 @@ bool Tag::isTxCompletionCommitted(uint16_t msn) const {
   return msnSpan_.rlock()->isTxCompletionCommitted(msn);
 }
 
-void Tag::retireAfterRequestFrameSettled(Wqe& wqe) {
+void Tag::retireAfterRequestFrameSettled(Wqe& wqe, const WqeRetirementGuard&) {
   DCHECK(wqe.getMsn().has_value());
   if (wqe.isFailingAndSettled()) {
     // The result is dropped: it flags a receive refused for an out-of-
@@ -1384,7 +1385,7 @@ uint32_t Tag::markPendingWqesFailing(WorkCompletionStatus status) {
   return abandonedCount;
 }
 
-void Tag::completeSettledFailedWqes() {
+void Tag::completeSettledFailedWqes(const WqeRetirementGuard&) {
   std::vector<std::reference_wrapper<Wqe>> failedWqes;
   // Already reported and held only for a request frame that has since left the
   // wire. The ack path settles those where it stands; abandonment has no wqe

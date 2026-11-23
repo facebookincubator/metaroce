@@ -383,6 +383,8 @@ class Tag {
   [[nodiscard]] bool completeReceivesReleasedBySends(
       const std::vector<std::reference_wrapper<Wqe>>& sends);
 
+  using WqeRetirementGuard = std::unique_lock<folly::SharedMutex>;
+
   // Caller holds the WQE-retirement guard. False where a completed send
   // released a receive out of sequence: fail the tag and flush.
   [[nodiscard]] bool handleTxWqesCompletion(
@@ -429,8 +431,8 @@ class Tag {
 
   // The exclusive counterpart, for moving this Tag to the error state and for
   // retiring any WQE it owns.
-  [[nodiscard]] std::unique_lock<folly::SharedMutex> lockForWqeRetirement() {
-    return std::unique_lock<folly::SharedMutex>(wqeRetirementMutex_);
+  [[nodiscard]] WqeRetirementGuard lockForWqeRetirement() {
+    return WqeRetirementGuard(wqeRetirementMutex_);
   }
 
   // markForDeletion() half-closes the Tag (FIN-WAIT-like): it takes no new work
@@ -451,7 +453,8 @@ class Tag {
   // Caller holds the Tag semaphore and the WQE-retirement guard exclusively.
   uint32_t completeWqeThatFailsTheTag(
       Wqe& wqe,
-      enum WorkCompletionStatus status);
+      enum WorkCompletionStatus status,
+      const WqeRetirementGuard& retirementGuard);
 
   // Complete every pending send and receive WQE with WR_FLUSH_ERR. Used on the
   // error path (watchdog) and on teardown; does not require or change the ibv
@@ -489,13 +492,15 @@ class Tag {
   // completion, whether it holds the error or is flushing behind one.
   // Caller must hold the Tag semaphore and the WQE-retirement guard
   // exclusively.
-  void completeSettledFailedWqes();
+  void completeSettledFailedWqes(const WqeRetirementGuard& retirementGuard);
   // Takes the span's lock; a caller already holding it asks the span instead.
   [[nodiscard]] bool isTxCompletionCommitted(uint16_t msn) const;
   // Retire a response-driven WQE whose request frame the caller has just
   // settled by ack or abandonment, if no other claim remains. Caller must
   // hold the Tag semaphore and the WQE-retirement guard exclusively.
-  void retireAfterRequestFrameSettled(Wqe& wqe);
+  void retireAfterRequestFrameSettled(
+      Wqe& wqe,
+      const WqeRetirementGuard& retirementGuard);
 
   // How many send WQEs the tag still holds, counting those already reported
   // and kept only for a request frame. getNumPendingWqes() excludes those, so
