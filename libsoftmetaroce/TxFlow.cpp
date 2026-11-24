@@ -886,6 +886,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
   uint16_t numNewlyLost = 0;
   uint16_t numPosnDeallocated = 0;
   uint16_t numRetiredAbandonedFrames = 0;
+  uint16_t numFramesReturnedToCc = 0;
   std::vector<PacketId> newlyAckedPkts;
   VLOG(1) << "Received an ACK for qp: " << qp_.getLocalQpNum()
           << " flow: " << flowId_
@@ -1227,6 +1228,15 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     if (!partialRto) {
       txState_.rtoRecoveryEnd.reset();
     }
+
+    // An abandoned frame leaves the window exactly as a BRNR'd one does, and
+    // that already counts here: the sender waits for neither.
+    numFramesReturnedToCc =
+        newlyAckedPkts.size() + numPosnDeallocated + numRetiredAbandonedFrames;
+    // An ack that returns no frames does not time the arrival of any frame.
+    if (numFramesReturnedToCc > 0) {
+      updateRtt(ack.getTimestamp(), nowNs);
+    }
   } // end scope holding sndCur lock
 
   qp_.retireTagsWithAbandonedFrames(tagsWithAbandonedFrames);
@@ -1236,16 +1246,9 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
     processBrnrPacket(ack, minBrnrMsnByTag);
   }
 
-  // An abandoned frame leaves the window exactly as a BRNR'd one does, and
-  // that already counts here: the sender waits for neither.
-  const uint16_t numFramesReturnedToCc =
-      newlyAckedPkts.size() + numPosnDeallocated + numRetiredAbandonedFrames;
-
-  // Capture QP-level smoothed RTT before updates
+  // Capture QP-level smoothed RTT before its update
   const auto smoothedQpRttNsBeforeUpdate = getQp().getEstQpRttNs();
-  // An ack that returns no frames does not time the arrival of any frame.
   if (numFramesReturnedToCc > 0) {
-    updateRtt(ack.getTimestamp(), nowNs);
     if (ack.getTimestamp() != 0) {
       getQp().updateQpRtt(rttNs);
       VLOG(1) << "packet_rtt qp=" << qp_.getLocalQpNum()

@@ -195,6 +195,8 @@ class TxFlow : public Flow {
 
   [[nodiscard]] uint32_t computeRttNs(uint32_t timestampNs, uint32_t nowNs)
       const;
+  // Caller must serialize with TX visits and hold sndCur, except for an
+  // exclusively owned, quiescent flow.
   void updateRtt(uint32_t timestampNs, uint32_t nowNs);
 
   [[nodiscard]] uint16_t getSocketId() const {
