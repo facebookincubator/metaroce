@@ -452,6 +452,30 @@ TEST_F(QpTest, SendLastEmissionCanBeDisabled) {
       << "disabling Send Last must retain the legacy Send opcode";
 }
 
+TEST_F(QpTest, ReceiveOnlyFlowsTakeTheSendSocketsInTurn) {
+  createAlwaysSendingMockCongestionController(qp);
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  mockSender.setLimitNumSockets(2);
+  qp.setupFlows(2, 5, &mockSender);
+  const uint16_t firstSendSocket = qp.getTxFlowById(0)->getSocketId();
+  const uint16_t secondSendSocket = qp.getTxFlowById(1)->getSocketId();
+  ASSERT_NE(firstSendSocket, secondSendSocket)
+      << "precondition: the two send flows hold different sockets, or taking "
+         "them in turn looks the same as taking one";
+
+  const std::vector<uint16_t> receiveOnlySockets{
+      qp.getRxFlowById(2)->getSocketId(),
+      qp.getRxFlowById(3)->getSocketId(),
+      qp.getRxFlowById(4)->getSocketId()};
+  EXPECT_EQ(
+      receiveOnlySockets,
+      (std::vector<uint16_t>{
+          firstSendSocket, secondSendSocket, firstSendSocket}))
+      << "a flow with no send side shares its address's send sockets in turn, "
+         "so the acks it sends spread across them rather than all leaving on "
+         "one socket";
+}
+
 TEST_F(QpTest, RtoWithQueuedPacketsKeepsTimerArmed) {
   gflags::FlagSaver flagSaver;
   FLAGS_libsoftmetaroce_slow_receiver = false;

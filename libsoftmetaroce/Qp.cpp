@@ -674,7 +674,21 @@ void Qp::setupFlows(
   }
 
   // Create TX and RX flows, assigning each a socket bound to its local address.
-  std::unordered_map<folly::IPAddress, std::list<uint16_t>> addrToSocketId;
+  struct AddrSockets {
+    folly::IPAddress addr;
+    std::vector<uint16_t> socketIds;
+    size_t nextShared{0};
+  };
+  std::vector<AddrSockets> socketsByAddr;
+  auto socketsOf =
+      [&socketsByAddr](const folly::IPAddress& addr) -> AddrSockets& {
+    for (auto& sockets : socketsByAddr) {
+      if (sockets.addr == addr) {
+        return sockets;
+      }
+    }
+    return socketsByAddr.emplace_back(AddrSockets{.addr = addr});
+  };
   for (uint32_t flowId = 0; flowId < maxFlowCount; flowId++) {
     const auto portPairIdx = portMap[flowId];
     const auto& pair = portPairs_.at(portPairIdx);
@@ -685,7 +699,7 @@ void Qp::setupFlows(
     uint16_t rxFlowSocketId = 0;
     if (flowId < txFlowCount) {
       auto socketId = sender_->getSocketIdFromAddress(localAddr, entry);
-      addrToSocketId[localAddr].push_back(socketId);
+      socketsOf(localAddr).socketIds.push_back(socketId);
       rxFlowSocketId = socketId;
       txFlows_.emplace_back(
           *this, flowId, socketId, &retxTimer_, portPairIdx, sackRetxConfig);
@@ -696,14 +710,14 @@ void Qp::setupFlows(
                    << flowId << "; in unit testing, this is fine.";
       }
     } else if (flowId < rxFlowCount) {
-      if (addrToSocketId.find(localAddr) == addrToSocketId.end()) {
-        auto socketId = sender_->getSocketIdFromAddress(localAddr, entry);
-        addrToSocketId[localAddr].push_back(socketId);
+      AddrSockets& sockets = socketsOf(localAddr);
+      if (sockets.socketIds.empty()) {
+        sockets.socketIds.push_back(
+            sender_->getSocketIdFromAddress(localAddr, entry));
       }
       // Round robin through the sockets for this address
-      rxFlowSocketId = addrToSocketId[localAddr].front();
-      addrToSocketId[localAddr].pop_front();
-      addrToSocketId[localAddr].push_back(rxFlowSocketId);
+      rxFlowSocketId =
+          sockets.socketIds[sockets.nextShared++ % sockets.socketIds.size()];
     }
     if (flowId < rxFlowCount) {
       rxFlows_.emplace_back(*this, flowId, rxFlowSocketId, portPairIdx);
