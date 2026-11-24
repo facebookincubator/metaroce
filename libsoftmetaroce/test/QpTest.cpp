@@ -5763,6 +5763,7 @@ TEST_F(QpTest, GetNextPacketToSendWithHrnr) {
               rnrBackoffTimeExp) // HRNR status with backoff exponent
           .setCumulativeFsn(pktFsn)
           .setMaxRcvdFsn(pktFsn)
+          .setCumulRespDeliveredMsn(msn)
           .setTimestamp(nowNs) // use current time as timestamp instead of echo
           .build();
 
@@ -6071,7 +6072,7 @@ TEST_F(QpTest, RnrCancelQueuedBehindAnHrnrIsAppliedAfterIt) {
   // is not discarded as stale.
   const uint16_t msgSizeToSendBytes = mtu * 3;
   auto sendPayload = std::make_unique<char[]>(msgSizeToSendBytes);
-  postWqeHelper(
+  const Wqe* const sentWqe = postWqeHelper(
       &qp,
       {.workType = Wqe::WorkType::kSend,
        .msgSizeBytes = msgSizeToSendBytes,
@@ -6083,13 +6084,15 @@ TEST_F(QpTest, RnrCancelQueuedBehindAnHrnrIsAppliedAfterIt) {
   // The peer NAKs HRNR and then, once its QP is up, cancels. Sharing one ring
   // keeps that order: applied out of order the cancel is consumed first and the
   // HRNR blocks a QP the peer has already told to resume.
-  const AckHeader hrnr = AckHeader::AckHeaderBuilder()
-                             .setAckStatus(AckStatus::HRNR)
-                             .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
-                             .setCumulativeFsn(0)
-                             .setMaxRcvdFsn(0)
-                             .setTimestamp(0)
-                             .build();
+  const AckHeader hrnr =
+      AckHeader::AckHeaderBuilder()
+          .setAckStatus(AckStatus::HRNR)
+          .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
+          .setCumulativeFsn(0)
+          .setMaxRcvdFsn(0)
+          .setCumulRespDeliveredMsn(sentWqe->getMsn().value())
+          .setTimestamp(0)
+          .build();
   qp.enqueueReceivedAck(0 /*flowId*/, hrnr, 0 /*recvNowNs*/);
   qp.enqueueReceivedRnrCancel(RnrCancelHeader(
       0 /*flowsAvailable*/,
@@ -6263,7 +6266,7 @@ TEST_F(QpTest, AnHrnrDoesNotAcknowledgeTheFramesBeforeTheOneItRefuses) {
   constexpr uint16_t kRefusedFsn = kFrames - 1;
   const uint32_t msgSizeBytes = kFrames * mtu;
   auto payload = std::make_unique<char[]>(msgSizeBytes);
-  postWqeHelper(
+  const Wqe* const sentWqe = postWqeHelper(
       &qp,
       {.workType = Wqe::WorkType::kSend,
        .msgSizeBytes = msgSizeBytes,
@@ -6275,13 +6278,15 @@ TEST_F(QpTest, AnHrnrDoesNotAcknowledgeTheFramesBeforeTheOneItRefuses) {
 
   // The responder refuses the last frame with an HRNR, whose FSN fields both
   // name the refused frame; the frames before it may have been lost.
-  const AckHeader hrnr = AckHeader::AckHeaderBuilder()
-                             .setAckStatus(AckStatus::HRNR)
-                             .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
-                             .setCumulativeFsn(kRefusedFsn)
-                             .setMaxRcvdFsn(kRefusedFsn)
-                             .setTimestamp(0)
-                             .build();
+  const AckHeader hrnr =
+      AckHeader::AckHeaderBuilder()
+          .setAckStatus(AckStatus::HRNR)
+          .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
+          .setCumulativeFsn(kRefusedFsn)
+          .setMaxRcvdFsn(kRefusedFsn)
+          .setCumulRespDeliveredMsn(sentWqe->getMsn().value())
+          .setTimestamp(0)
+          .build();
   txFlow->processAckPacket(hrnr, simulatedProcessedAtNs(hrnr.getTimestamp()));
 
   EXPECT_EQ(qp.getHrnrState(), HrnrState::HRNR_BLOCKED_TX)
@@ -6305,14 +6310,16 @@ TEST_F(QpTest, AnHrnrIsReportedWithoutItsReservedRateHint) {
       initialTag,
       {Flow::FsnState::UNACKED, Flow::FsnState::UNACKED},
       /*sndCur=*/12);
-  const AckHeader hrnr = AckHeader::AckHeaderBuilder()
-                             .setCumulativeFsn(11)
-                             .setMaxRcvdFsn(11)
-                             .setAckStatus(AckStatus::HRNR)
-                             .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
-                             .setRateHints(7)
-                             .setTimestamp(0)
-                             .build();
+  const AckHeader hrnr =
+      AckHeader::AckHeaderBuilder()
+          .setCumulativeFsn(11)
+          .setMaxRcvdFsn(11)
+          .setCumulRespDeliveredMsn(fixture.wqe->getMsn().value())
+          .setAckStatus(AckStatus::HRNR)
+          .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
+          .setRateHints(7)
+          .setTimestamp(0)
+          .build();
 
   CongestionController::AckEvent reported;
   EXPECT_CALL(*fixture.congestionController, onPacketAck(0, _))
@@ -6542,6 +6549,7 @@ TEST_F(QpTest, CancelRnrBackoff) {
                                    .setRnrBackoffTimeExp(rnrBackoffTimeExp)
                                    .setCumulativeFsn(pktFsn)
                                    .setMaxRcvdFsn(pktFsn)
+                                   .setCumulRespDeliveredMsn(msn)
                                    .setTimestamp(nowNs)
                                    .build();
 

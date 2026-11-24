@@ -1127,6 +1127,8 @@ TEST_F(SenderTest, NakDoesNotClearRcnHint) {
   gflags::FlagSaver flagSaver;
   FLAGS_libsoftmetaroce_rcn_pacing_multiplier = 2;
   ScopedSuppressedTxTimers suppressTimers;
+  ON_CALL(*rawCongestionController, getAvailableWindowSize(_))
+      .WillByDefault(Return(100000));
   auto sender = std::make_unique<LimitedTestSender>(
       arbiter,
       mockUDPSocketMaker,
@@ -1134,19 +1136,27 @@ TEST_F(SenderTest, NakDoesNotClearRcnHint) {
       LimitedTestSender::kDisableSendLoop);
   // The NAK goes to flow 1 because the sender ignores a flow ID NAK for flow 0.
   qp->setupFlows(2, 2, sender.get());
+  auto wqePayload = createAndPostTestWqe(1);
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the send must reach its Tag, or the NAK names no frame";
+  auto* flow = qp->getTxFlowById(1);
+  ASSERT_NE(flow, nullptr);
+  auto sent = flow->getNextPacketToSend();
+  ASSERT_NE(sent, nullptr);
+  const DataHeader& nackedFrame = dataHeaderOf(*sent);
 
   qp->updateRcnHintGbps(100);
   ASSERT_TRUE(qp->isRateLimited())
       << "precondition: the hint must program the pacer before the NAK";
-  auto* flow = qp->getTxFlowById(1);
-  ASSERT_NE(flow, nullptr);
   flow->processAckPacket(
       AckHeader::AckHeaderBuilder()
           .setTag(kMetaRoceInitialTag)
-          .setCumulativeFsn(0)
-          .setMaxRcvdFsn(0)
+          .setCumulativeFsn(nackedFrame.getFsn())
+          .setMaxRcvdFsn(nackedFrame.getFsn())
+          .setCumulRespDeliveredMsn(nackedFrame.getMsn())
           .setAckStatus(AckStatus::NAK_FLOW_ID_ERROR)
-          .setTimestamp(0)
+          .setTimestamp(nackedFrame.getTimestamp())
           .setRateHints(0)
           .build());
   EXPECT_TRUE(qp->isRateLimited())

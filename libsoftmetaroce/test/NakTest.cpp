@@ -121,11 +121,13 @@ class NakTest : public Test {
         dataHeader.getTimestamp()};
   }
 
-  AckHeader buildNakFlowIdError(uint16_t fsn, uint32_t timestamp) {
+  AckHeader
+  buildNakFlowIdError(uint16_t fsn, uint16_t msn, uint32_t timestamp) {
     return AckHeader::AckHeaderBuilder()
         .setTag(kMetaRoceInitialTag)
         .setCumulativeFsn(fsn)
         .setMaxRcvdFsn(fsn)
+        .setCumulRespDeliveredMsn(msn)
         .setAckStatus(AckStatus::NAK_FLOW_ID_ERROR)
         .setTimestamp(timestamp)
         .build();
@@ -229,7 +231,8 @@ TEST_F(NakTest, NakFlowIdErrorCausesRetransmissionOnOtherFlow) {
           LOG(INFO) << "Sending NAK_FLOW_ID_ERROR for packet on flowId 1";
           posnOnFlow1.insert(packetInfo->posn);
           flow1.processAckPacket(
-              buildNakFlowIdError(packetInfo->fsn, packetInfo->timestamp),
+              buildNakFlowIdError(
+                  packetInfo->fsn, packetInfo->msn, packetInfo->timestamp),
               simulatedProcessedAtNs(packetInfo->timestamp));
         } else if (packetInfo->flowId == 0) {
           posnOnFlow0.insert(packetInfo->posn);
@@ -344,6 +347,7 @@ TEST_F(NakTest, EveryFrameNakdOffABadFlowReappearsOnTheLiveFlow) {
     const uint16_t flowId = baseHeader.getFlowId();
     const uint16_t posn = dataHeader.getPosn();
     const uint16_t fsn = dataHeader.getFsn();
+    const uint16_t msn = dataHeader.getMsn();
     const uint32_t timestamp = dataHeader.getTimestamp();
 
     if (flowId == kLiveFlowId) {
@@ -354,7 +358,7 @@ TEST_F(NakTest, EveryFrameNakdOffABadFlowReappearsOnTheLiveFlow) {
       posnNakdOffBadFlows.insert(posn);
       qp->enqueueReceivedAck(
           flowId,
-          buildNakFlowIdError(fsn, timestamp),
+          buildNakFlowIdError(fsn, msn, timestamp),
           simulatedProcessedAtNs(timestamp));
     }
   }
@@ -433,8 +437,8 @@ TEST_F(NakTest, NakFlowIdErrorQueuedAfterTransmission) {
               posnWithQueuedNak.end()) {
             LOG(INFO) << "Queueing NAK_FLOW_ID_ERROR for packet on flowId 1";
             posnWithQueuedNak.insert(packetInfo->posn);
-            queuedNakHeaders.push_back(
-                buildNakFlowIdError(packetInfo->fsn, packetInfo->timestamp));
+            queuedNakHeaders.push_back(buildNakFlowIdError(
+                packetInfo->fsn, packetInfo->msn, packetInfo->timestamp));
           }
         } else if (packetInfo->flowId == 0) {
           posnOnFlow0.insert(packetInfo->posn);
@@ -733,6 +737,7 @@ TEST_F(NakTest, FatalNakConcurrentWithSendLoopLeavesSentWorkAlive) {
   std::mutex mtx;
   std::atomic<bool> sawPacket{false};
   uint16_t lastFsn = 0;
+  uint16_t lastMsn = 0;
   uint32_t lastTs = 0;
 
   EXPECT_CALL(socket, write(_, _))
@@ -741,6 +746,7 @@ TEST_F(NakTest, FatalNakConcurrentWithSendLoopLeavesSentWorkAlive) {
         if (auto packetInfo = parseDataPacket(buf)) {
           std::lock_guard<std::mutex> g(mtx);
           lastFsn = packetInfo->fsn;
+          lastMsn = packetInfo->msn;
           lastTs = packetInfo->timestamp;
           sawPacket.store(true, std::memory_order_release);
         }
@@ -786,6 +792,7 @@ TEST_F(NakTest, FatalNakConcurrentWithSendLoopLeavesSentWorkAlive) {
         .setTag(kMetaRoceInitialTag)
         .setCumulativeFsn(lastFsn)
         .setMaxRcvdFsn(lastFsn)
+        .setCumulRespDeliveredMsn(lastMsn)
         .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
         .setTimestamp(lastTs)
         .build();
@@ -969,6 +976,7 @@ TEST_F(NakTest, AFlowIdNakForFlowZeroIsIgnored) {
   const auto* data = dynamic_cast<const DataPacket*>(sent->packet.get());
   ASSERT_NE(data, nullptr);
   const uint16_t fsn = data->getDataHeader().getFsn();
+  const uint16_t msn = data->getDataHeader().getMsn();
   const uint32_t sentAtNs = data->getDataHeader().getTimestamp();
 
   EXPECT_CALL(congestionController(), onFlowDisabled(0)).Times(0);
@@ -977,7 +985,8 @@ TEST_F(NakTest, AFlowIdNakForFlowZeroIsIgnored) {
       .WillOnce(DoAll(
           SaveArg<1>(&reported), Return(CongestionController::AckResult{})));
   txFlow(0).processAckPacket(
-      buildNakFlowIdError(fsn, sentAtNs), simulatedProcessedAtNs(sentAtNs));
+      buildNakFlowIdError(fsn, msn, sentAtNs),
+      simulatedProcessedAtNs(sentAtNs));
   txFlow(0).processAckPacket(
       buildAck(fsn, sentAtNs), simulatedProcessedAtNs(sentAtNs));
 
@@ -1002,14 +1011,16 @@ TEST_F(NakTest, AFlowIdNakIsReportedWithoutItsFlowCount) {
   ASSERT_NE(data, nullptr);
   constexpr uint32_t kSupportedFlowCount = 1;
   const uint32_t sentAtNs = data->getDataHeader().getTimestamp();
-  const AckHeader nak = AckHeader::AckHeaderBuilder()
-                            .setTag(kMetaRoceInitialTag)
-                            .setCumulativeFsn(data->getDataHeader().getFsn())
-                            .setMaxRcvdFsn(data->getDataHeader().getFsn())
-                            .setAckStatus(AckStatus::NAK_FLOW_ID_ERROR)
-                            .setRateHints(kSupportedFlowCount)
-                            .setTimestamp(sentAtNs)
-                            .build();
+  const AckHeader nak =
+      AckHeader::AckHeaderBuilder()
+          .setTag(kMetaRoceInitialTag)
+          .setCumulativeFsn(data->getDataHeader().getFsn())
+          .setMaxRcvdFsn(data->getDataHeader().getFsn())
+          .setCumulRespDeliveredMsn(data->getDataHeader().getMsn())
+          .setAckStatus(AckStatus::NAK_FLOW_ID_ERROR)
+          .setRateHints(kSupportedFlowCount)
+          .setTimestamp(sentAtNs)
+          .build();
 
   CongestionController::AckEvent reported;
   EXPECT_CALL(congestionController(), onPacketAck(1, _))

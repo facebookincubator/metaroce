@@ -345,6 +345,7 @@ TEST_F(WatchdogTest, WatchdogExpiresWithHrnrReturnsRnrRetryExcErr) {
                      .setTag(kMetaRoceInitialTag)
                      .setCumulativeFsn(dataHeader.getFsn())
                      .setMaxRcvdFsn(dataHeader.getFsn())
+                     .setCumulRespDeliveredMsn(dataHeader.getMsn())
                      .setAckStatus(AckStatus::HRNR)
                      .setRnrBackoffTimeExp(kBrnrBackoffTimeExp)
                      .setTimestamp(dataHeader.getTimestamp())
