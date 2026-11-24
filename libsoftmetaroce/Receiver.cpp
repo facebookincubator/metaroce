@@ -127,6 +127,12 @@ Receiver::Receiver(
   for (uint32_t i = 0; i < numReaders; ++i) {
     readerThreads_.emplace_back();
   }
+  for (auto& reader : readerThreads_) {
+    for (const auto& localAddr : localAddrs_) {
+      createSocketForAddress(
+          reader, localAddr, socketMaker, metaRoceBindToPort, gidEntry);
+    }
+  }
   try {
     for (auto& reader : readerThreads_) {
       auto name = "lsmrRecv" +
@@ -147,41 +153,6 @@ Receiver::Receiver(
       }
     }
     throw;
-  }
-
-  std::exception_ptr ex;
-  for (auto& reader : readerThreads_) {
-    reader.evb.runInEventBaseThreadAndWait([&, socketMaker]() {
-      try {
-        for (const auto& localAddr : localAddrs_) {
-          createSocketForAddress(
-              reader, localAddr, socketMaker, metaRoceBindToPort, gidEntry);
-        }
-      } catch (...) {
-        ex = std::current_exception();
-      }
-    });
-    if (ex) {
-      break;
-    }
-  }
-  if (ex) {
-    for (auto& reader : readerThreads_) {
-      reader.evb.runInEventBaseThreadAndWait([&]() {
-        for (auto& ownedSocket : reader.sockets) {
-          PacketModifierSocket& socket = *CHECK_NOTNULL(ownedSocket.get());
-          socket.pauseRead();
-          socket.close();
-        }
-        reader.evb.terminateLoopSoon();
-      });
-    }
-    for (auto& reader : readerThreads_) {
-      if (reader.thread.joinable()) {
-        reader.thread.join();
-      }
-    }
-    std::rethrow_exception(ex);
   }
 }
 
@@ -335,7 +306,7 @@ void Receiver::drainInFlightReceives() {
   for (auto& reader : readerThreads_) {
     // Must run off the reader threads: runInEventBaseThreadAndWait would
     // otherwise block waiting on the very thread it needs to run the drain.
-    CHECK(!reader.evb.isInEventBaseThread());
+    CHECK(!reader.evb.inRunningEventBaseThread());
     reader.evb.runInEventBaseThreadAndWait([] {});
   }
 }
@@ -630,7 +601,7 @@ void Receiver::writeReplyPacket(
   // sockets can carry a UDP reply (they share only the SO_REUSEPORT port), so
   // sockets[0] is fine. Reached only on cold error replies.
   for (auto& reader : readerThreads_) {
-    if (reader.evb.isInEventBaseThread()) {
+    if (reader.evb.inRunningEventBaseThread()) {
       DCHECK(!reader.sockets.empty())
           << "a reader is created with a socket per local GID, never empty here";
       PacketModifierSocket& socket = *CHECK_NOTNULL(reader.sockets[0].get());

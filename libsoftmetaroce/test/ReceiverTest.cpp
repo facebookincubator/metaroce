@@ -4559,8 +4559,6 @@ TEST_F(ReceiverTest, RnrCancelBeforeFlowsExistIsDropped) {
 }
 
 TEST_F(ReceiverTest, ConstructorThrowsOnBindFailureInsteadOfAborting) {
-  // The constructor's bind runs on a noexcept EventBase thread, so it marshals
-  // a bind failure back to the caller rather than terminating the process.
   folly::Synchronized<folly::F14FastMap<uint32_t, std::unique_ptr<Qp>>>
       emptyQpMap;
 
@@ -4587,6 +4585,70 @@ TEST_F(ReceiverTest, ConstructorThrowsOnBindFailureInsteadOfAborting) {
           *pingController_),
       folly::AsyncSocketException)
       << "bind failure should propagate as an exception, not abort";
+}
+
+TEST_F(ReceiverTest, ABindFailureOnALaterReaderThrowsWithNoReaderLeftRunning) {
+  gflags::FlagSaver saver;
+  gflags::SetCommandLineOption("libsoftmetaroce_recv_threads", "4");
+  folly::Synchronized<folly::F14FastMap<uint32_t, std::unique_ptr<Qp>>>
+      emptyQpMap;
+  constexpr int kReadersBoundBeforeTheFailure = 2;
+  std::atomic<int> socketsMade{0};
+  auto laterFailingSocketMaker = [&socketsMade](folly::EventBase* evb) {
+    auto socket = std::make_unique<NiceMock<MockUDPSocket>>(evb);
+    if (socketsMade.fetch_add(1) == kReadersBoundBeforeTheFailure) {
+      ON_CALL(*socket, bindImpl(::testing::_))
+          .WillByDefault(
+              ::testing::Throw(
+                  folly::AsyncSocketException(
+                      folly::AsyncSocketException::NOT_OPEN,
+                      "test: address already in use",
+                      98 /*EADDRINUSE*/)));
+    }
+    return std::make_pair(
+        std::unique_ptr<folly::AsyncUDPSocket>(std::move(socket)), nullptr);
+  };
+
+  EXPECT_THROW(
+      Receiver(
+          folly::IPAddress("fc00::1"),
+          emptyQpMap,
+          laterFailingSocketMaker,
+          kMetaRoceBindToPort,
+          kMetaRoceSendToPort,
+          *pingController_),
+      folly::AsyncSocketException)
+      << "a bind failing after earlier readers bound reaches the caller; a "
+         "reader thread left joinable as the receiver unwinds would terminate "
+         "the process instead";
+  EXPECT_EQ(socketsMade.load(), kReadersBoundBeforeTheFailure + 1)
+      << "the failure stops construction, so no reader after the failing one "
+         "is set up";
+}
+
+TEST_F(ReceiverTest, ADrainRightAfterConstructionWaitsForTheReaders) {
+  gflags::FlagSaver saver;
+  gflags::SetCommandLineOption("libsoftmetaroce_recv_threads", "8");
+  folly::Synchronized<folly::F14FastMap<uint32_t, std::unique_ptr<Qp>>>
+      emptyQpMap;
+  // Each round drains before its reader threads have had time to start their
+  // loops, which is when a loop not yet running could be taken for this one.
+  constexpr int kRounds = 20;
+  int drained = 0;
+  for (int round = 0; round < kRounds; ++round) {
+    Receiver receiver(
+        folly::IPAddress("fc00::1"),
+        emptyQpMap,
+        mockUDPSocketMaker,
+        kMetaRoceBindToPort,
+        kMetaRoceSendToPort,
+        *pingController_);
+    receiver.drainInFlightReceives();
+    ++drained;
+  }
+  EXPECT_EQ(drained, kRounds)
+      << "a drain from the constructing thread runs on no reader, so it waits "
+         "for each reader's loop to start rather than aborting before it does";
 }
 
 /*
