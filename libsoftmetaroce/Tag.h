@@ -385,10 +385,12 @@ class Tag {
 
   using WqeRetirementGuard = std::unique_lock<folly::SharedMutex>;
 
-  // Caller holds the WQE-retirement guard. False where a completed send
-  // released a receive out of sequence: fail the tag and flush.
+  // Reports and retires work in posting order. Caller holds the Tag semaphore
+  // and the WQE-retirement guard exclusively. False where a completed send
+  // released a receive out of sequence.
   [[nodiscard]] bool handleTxWqesCompletion(
-      const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete);
+      const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete,
+      const WqeRetirementGuard& retirementGuard);
 
   // Caller holds the Tag semaphore and this Tag's exclusive retirement guard.
   void retireCompletedTxWqes(const WqeRetirementGuard& retirementGuard);
@@ -644,7 +646,8 @@ class Tag {
   // still holds. Answers whether it erased any. Caller holds the msn span's
   // wlock.
   bool retireCompletedWqesAtMapHead(
-      folly::Synchronized<MsnSpan>::LockedPtr& lockedSpan);
+      folly::Synchronized<MsnSpan>::LockedPtr& lockedSpan,
+      const WqeRetirementGuard& retirementGuard);
 
   // Completes ready local WQEs in MSN order without retiring them.
   // Caller holds receive or exclusive retirement access and the MSN-span

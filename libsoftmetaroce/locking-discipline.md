@@ -148,13 +148,8 @@ implementations, not a licence to signal from anywhere --
 bounded only by the ready queue being sized above the concurrently-ready QP
 count.
 
-An error path therefore publishes under its guards and signals after them. So
-that this survives a new call site, `Qp::enterTagErrorWithTagHeld()` returns a
-`[[nodiscard]] SenderWake` that only `Qp::wakeSenderAfterTagError()` consumes:
-the wakeup leaves the guarded region as a value the caller must pass on, rather
-than as a convention it has to remember. `[[nodiscard]]` warns when a caller
-discards the returned wakeup request. `tag-failure-lifecycle.md` walks the
-whole path from a tag error to the sweep.
+An error path therefore publishes under its guards and signals after them.
+`tag-failure-lifecycle.md` walks the whole path from a tag error to the sweep.
 
 ## The Tag error state (`ibv_qp::state`) — two readers, both atomic
 

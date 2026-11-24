@@ -909,7 +909,7 @@ void Qp::checkForTxMessageCompletion(
         if (!retirementGuard.owns_lock()) {
           retirementGuard = tag.lockForWqeRetirement();
         }
-        if (!tag.handleTxWqesCompletion(wqesToComplete)) {
+        if (!tag.handleTxWqesCompletion(wqesToComplete, retirementGuard)) {
           tagErrorWake |= enterTagErrorWithTagHeld(tag);
           tag.flushPendingReceiveWqesInError();
         }

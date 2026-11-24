@@ -59,6 +59,22 @@ static_assert(!CanRetireWithoutGuard<Tag>);
 static_assert(CanRetireWithGuard<Tag::WqeRetirementGuard>);
 static_assert(!CanRetireWithGuard<Tag::ReceiveAccess>);
 
+template <typename T>
+concept CanHandleTxCompletionWithoutGuard =
+    requires(T& tag, const std::vector<std::reference_wrapper<Wqe>>& wqes) {
+      tag.handleTxWqesCompletion(wqes);
+    };
+
+template <typename Guard>
+concept CanHandleTxCompletionWithGuard = requires(
+    Tag& tag,
+    const std::vector<std::reference_wrapper<Wqe>>& wqes,
+    const Guard& guard) { tag.handleTxWqesCompletion(wqes, guard); };
+
+static_assert(!CanHandleTxCompletionWithoutGuard<Tag>);
+static_assert(CanHandleTxCompletionWithGuard<Tag::WqeRetirementGuard>);
+static_assert(!CanHandleTxCompletionWithGuard<Tag::ReceiveAccess>);
+
 // Puts the queue pair in `state` for the scope and restores what it found, so a
 // case can reach a setting a tag takes only in an earlier state.
 class QpStateGuard {
@@ -171,7 +187,7 @@ class TagTest : public ::testing::Test {
       wqe.acknowledgePosn(0);
     }
     auto retirementGuard = tag.lockForWqeRetirement();
-    EXPECT_TRUE(tag.handleTxWqesCompletion({wqe}))
+    EXPECT_TRUE(tag.handleTxWqesCompletion({wqe}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
 
@@ -244,7 +260,7 @@ TEST_F(TagTest, WorkWhoseReportFindsNoEntryStillCompletes) {
   for (Wqe* wqe : posted) {
     wqe->acknowledgePosn(wqe->allocateNextPosn());
     auto retirementGuard = tag->lockForWqeRetirement();
-    EXPECT_TRUE(tag->handleTxWqesCompletion({*wqe}))
+    EXPECT_TRUE(tag->handleTxWqesCompletion({*wqe}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
 
@@ -654,7 +670,7 @@ TEST_F(TagTest, AnAckedVirtualSendOverASkippedCsnReportsTheRefusal) {
   const size_t reportedBefore = cq_->getNumCompletedWqes();
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_FALSE(tag_->handleTxWqesCompletion({*virtualWqe}))
+    EXPECT_FALSE(tag_->handleTxWqesCompletion({*virtualWqe}, retirementGuard))
         << "the ack ran delivery over a receive numbered out of sequence, and "
            "reporting that is what lets the sender fail the tag rather than "
            "leave the receive with no path left to complete it";
@@ -1124,7 +1140,7 @@ TEST_F(TagTest, AHalfClosedTagFinishesAMessageItStarted) {
       << "both packets are accounted for once the peer acknowledges them";
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion({*accepted}))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion({*accepted}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
   EXPECT_EQ(cq_->getNumCompletedWqes(), 1)
@@ -1284,7 +1300,7 @@ class TagFenceTest : public TagTest {
   void completePrior() {
     prior_->acknowledgePosn(0);
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion({*prior_}))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion({*prior_}, retirementGuard))
         << "precondition: completing the prior finds no csn out of sequence";
   }
 
@@ -2003,7 +2019,7 @@ TEST_F(TagTest, MarkPendingWqesFailingReportsTheErrorOnceAndFlushesTheRest) {
 
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion(wqes))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion(wqes, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
 
@@ -2309,7 +2325,8 @@ TEST_F(TagTest, HandleTxWqesCompletionCleansUpVirtualSendWqe) {
   // Complete both WQEs in a single handleTxWqesCompletion call
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion({*virtualWqePtr, *localWqePtr}))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion(
+        {*virtualWqePtr, *localWqePtr}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
 
@@ -3342,7 +3359,7 @@ TEST_F(TagTest, WorkBehindAHeldReadIsStillReachedByTheMapWalk) {
   read->onPosnReceived(0);
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion({*read}))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion({*read}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
   ASSERT_TRUE(tag_->isTxCompletionCommitted(read->getMsn().value()))
@@ -3486,7 +3503,7 @@ TEST_F(
   wqe->onPosnReceived(0);
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion({*wqe}))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion({*wqe}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
   ASSERT_EQ(cq_->getNumCompletedWqes(), 1)
@@ -3607,7 +3624,7 @@ TEST_F(TagTest, RequestAckBeforeResponseRetiresOnTheResponse) {
   read->onPosnReceived(0);
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion({*read}))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion({*read}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
 
@@ -3648,7 +3665,7 @@ TEST_F(TagTest, RequestAckBeforeCommittedCompletionLeavesTheReadToComplete) {
   reads[1]->onPosnReceived(0);
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion({*reads[1]}))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion({*reads[1]}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
   ASSERT_EQ(cq_->getNumCompletedWqes(), 0)
@@ -3682,7 +3699,7 @@ TEST_F(TagTest, RequestAckBeforeCommittedCompletionLeavesTheReadToComplete) {
   }
   {
     auto retirementGuard = tag_->lockForWqeRetirement();
-    EXPECT_TRUE(tag_->handleTxWqesCompletion({*reads[0]}))
+    EXPECT_TRUE(tag_->handleTxWqesCompletion({*reads[0]}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
 

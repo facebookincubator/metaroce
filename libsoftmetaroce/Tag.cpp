@@ -1149,7 +1149,8 @@ void Tag::completeSingleTxWqe(
 }
 
 bool Tag::retireCompletedWqesAtMapHead(
-    folly::Synchronized<MsnSpan>::LockedPtr& lockedSpan) {
+    folly::Synchronized<MsnSpan>::LockedPtr& lockedSpan,
+    const WqeRetirementGuard&) {
   auto& wqes = lockedSpan->wqes;
   // The work at `msn` if the head can retire through it. Emplaced at post and
   // erased only here, so at() finds every msn through the completed one.
@@ -1229,7 +1230,8 @@ void Tag::completeLocalTxWqes(
 }
 
 bool Tag::handleTxWqesCompletion(
-    const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete) {
+    const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete,
+    const WqeRetirementGuard& retirementGuard) {
   // Classify virtual (remoteMsnToWqe_) and local (msnSpan_) WQEs
   // to avoid acquiring locks on maps we don't need.
   std::vector<std::reference_wrapper<Wqe>> virtualWqes;
@@ -1258,7 +1260,7 @@ bool Tag::handleTxWqesCompletion(
   if (hasLocalWqes) {
     auto lockedSpan = msnSpan_.wlock();
     completeLocalTxWqes(lockedSpan);
-    retireCompletedWqesAtMapHead(lockedSpan);
+    retireCompletedWqesAtMapHead(lockedSpan, retirementGuard);
   }
   signalMsnSpanRoom();
   signalReadAtomicRoom();
@@ -1355,16 +1357,16 @@ void Tag::retireAfterRequestFrameSettled(
   if (wqe.isFailingAndSettled()) {
     // The result is dropped: it flags a receive refused for an out-of-
     // sequence csn, and a failing send releases no receive to refuse.
-    std::ignore = handleTxWqesCompletion({wqe});
+    std::ignore = handleTxWqesCompletion({wqe}, retirementGuard);
     return;
   }
   retireCompletedTxWqes(retirementGuard);
 }
 
-void Tag::retireCompletedTxWqes(const WqeRetirementGuard&) {
+void Tag::retireCompletedTxWqes(const WqeRetirementGuard& retirementGuard) {
   {
     auto lockedSpan = msnSpan_.wlock();
-    if (!retireCompletedWqesAtMapHead(lockedSpan)) {
+    if (!retireCompletedWqesAtMapHead(lockedSpan, retirementGuard)) {
       return;
     }
   }
@@ -1408,7 +1410,7 @@ uint32_t Tag::markPendingWqesFailing(WorkCompletionStatus status) {
   return abandonedCount;
 }
 
-void Tag::completeSettledFailedWqes(const WqeRetirementGuard&) {
+void Tag::completeSettledFailedWqes(const WqeRetirementGuard& retirementGuard) {
   std::vector<std::reference_wrapper<Wqe>> failedWqes;
   // Already reported and held only for a request frame that has since left the
   // wire. The ack path settles those where it stands; abandonment has no wqe
@@ -1440,7 +1442,7 @@ void Tag::completeSettledFailedWqes(const WqeRetirementGuard&) {
   if (!failedWqes.empty()) {
     // The result is dropped: it flags a receive refused for an out-of-
     // sequence csn, and every WQE here is failing, so none releases one.
-    std::ignore = handleTxWqesCompletion(failedWqes);
+    std::ignore = handleTxWqesCompletion(failedWqes, retirementGuard);
   }
   if (hasSettledAfterCompletion) {
     // One pass retires the whole run of them at the map head, so a pointer to
@@ -1448,7 +1450,7 @@ void Tag::completeSettledFailedWqes(const WqeRetirementGuard&) {
     // request.
     {
       auto lockedSpan = msnSpan_.wlock();
-      retireCompletedWqesAtMapHead(lockedSpan);
+      retireCompletedWqesAtMapHead(lockedSpan, retirementGuard);
     }
     signalMsnSpanRoom();
     signalReadAtomicRoom();

@@ -117,7 +117,7 @@ class TagSetTest : public ::testing::Test {
       wqe.acknowledgePosn(0);
     }
     auto retirementGuard = tag.lockForWqeRetirement();
-    EXPECT_TRUE(tag.handleTxWqesCompletion({wqe}))
+    EXPECT_TRUE(tag.handleTxWqesCompletion({wqe}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
 
@@ -463,7 +463,7 @@ TEST_F(TagSetTest, ALateResponseReleasesTheMsnCapacityWaiter) {
     std::ignore = sent->allocateNextPosn();
     tagSet_->decrementUnsentPosns();
     sent->acknowledgePosn(0);
-    ASSERT_TRUE(tag.handleTxWqesCompletion({*sent}))
+    ASSERT_TRUE(tag.handleTxWqesCompletion({*sent}, retirementGuard))
         << "completed sends must wait for the earlier read to report";
   }
   ASSERT_FALSE(tag.hasMsnSpanRoom())

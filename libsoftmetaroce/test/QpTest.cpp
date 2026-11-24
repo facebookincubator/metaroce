@@ -2984,7 +2984,7 @@ TEST_F(QpTest, TheWatchdogErrorsATagHoldingOnlyAReportedRead) {
   read->onPosnReceived(0);
   {
     auto retirementGuard = initialTag->lockForWqeRetirement();
-    EXPECT_TRUE(initialTag->handleTxWqesCompletion({*read}))
+    EXPECT_TRUE(initialTag->handleTxWqesCompletion({*read}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
   ASSERT_EQ(cq.getNumCompletedWqes(), 1u)
@@ -3705,7 +3705,8 @@ TEST_F(QpTest, TheWatchdogResolvesTheFrameOfAReadItsResponseHasCompleted) {
   heldRead->onPosnReceived(0);
   {
     auto retirementGuard = initialTag->lockForWqeRetirement();
-    EXPECT_TRUE(initialTag->handleTxWqesCompletion({*heldRead}))
+    EXPECT_TRUE(
+        initialTag->handleTxWqesCompletion({*heldRead}, retirementGuard))
         << "precondition: completing the send finds no csn out of sequence";
   }
   ASSERT_TRUE(initialTag->isTxCompletionCommitted(heldRead->getMsn().value()))
