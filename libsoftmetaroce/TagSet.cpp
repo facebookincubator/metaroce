@@ -293,6 +293,12 @@ folly::coro::Task<void> TagSet::processWqes(
             static_cast<ReceiveWqe*>(wqe.release()));
         maybeRnrCancelCsn = tag.processReceiveWqe(std::move(receiveWqe), mtu);
       } else {
+        // Release the retirement guard before posting; posting's error path may
+        // acquire it again.
+        {
+          auto retirementGuard = tag.lockForWqeRetirement();
+          tag.retireCompletedTxWqes(retirementGuard);
+        }
         hasSendableWork = tag.processTransmitWqe(std::move(wqe));
       }
       if (hasSendableWork) {

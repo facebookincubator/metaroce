@@ -243,8 +243,19 @@ bool Tag::tryReserveSendQueueEntry() {
   return outstandingReadAtomic_.load(std::memory_order_relaxed) < maxRdAtomic_;
 }
 
+folly::coro::Task<void> Tag::co_reclaimTxCapacity() {
+  co_await co_waitForFree();
+  auto tagGuard = folly::makeGuard([this] { markFree(); });
+  auto retirementGuard = lockForWqeRetirement();
+  retireCompletedTxWqes(retirementGuard);
+}
+
 folly::coro::Task<void> Tag::co_waitForReadAtomicRoom() {
   co_await waitUntil(readAtomicBaton_, [this]() -> folly::coro::Task<bool> {
+    if (hasReadAtomicRoom() || postWillBeFlushed()) {
+      co_return true;
+    }
+    co_await co_reclaimTxCapacity();
     co_return hasReadAtomicRoom() || postWillBeFlushed();
   });
 }
@@ -253,6 +264,10 @@ folly::coro::Task<void> Tag::co_waitForMsnSpanRoom() {
   // processTransmitWqe() flushes a deleted tag's post before it takes an msn;
   // an errored tag's post takes one first, so that one waits for real span.
   co_await waitUntil(msnSpanBaton_, [this]() -> folly::coro::Task<bool> {
+    if (hasMsnSpanRoom() || isMarkedForDeletion()) {
+      co_return true;
+    }
+    co_await co_reclaimTxCapacity();
     co_return hasMsnSpanRoom() || isMarkedForDeletion();
   });
 }
@@ -1079,7 +1094,9 @@ bool Tag::handleRxWqeCompletion(
           << " Tag: " << (uint32_t)tagNum_ << " : " << wqe;
   if (opType == BaseHeader::Opcode::OperationType::READ_RESP ||
       opType == BaseHeader::Opcode::OperationType::ATOMIC_ACK_RESP) {
-    return handleTxWqesCompletion({wqe});
+    auto lockedSpan = msnSpan_.wlock();
+    completeLocalTxWqes(lockedSpan);
+    return true;
   }
   return markDeliveredAndCompleteInOrder(msn);
 }

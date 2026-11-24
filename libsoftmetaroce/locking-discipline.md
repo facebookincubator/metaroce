@@ -10,7 +10,7 @@ around `Tag`, `TagSet`, `TxFlow`, or QP teardown.
 | Lock | Kind | Protects | Granularity |
 |---|---|---|---|
 | `Tag::freeSem_` | count-1 semaphore used as a busy token (`waitForFree` / `markFree`) | exclusive use of one `Tag`: its WQEs while a packet from it is being prepared, sent, or retransmitted, or the Tag is being torn down; and the per-tag BRNR state (`brnr_`), read and written only under it | per-Tag (fine) |
-| `Tag::wqeRetirementMutex_` | `folly::SharedMutex` (`accessForReceive` / `lockForWqeRetirement`) | the boundary between receive processing and WQE retirement: held shared while the receive path uses a `Wqe*` the Tag owns, exclusively while the Tag moves to error or retires one -- with the one exception below | per-Tag (fine) |
+| `Tag::wqeRetirementMutex_` | `folly::SharedMutex` (`accessForReceive` / `lockForWqeRetirement`) | the boundary between receive processing and WQE retirement: held shared while the receive path uses a `Wqe*` the Tag owns, exclusively while the Tag moves to error or retires one | per-Tag (fine) |
 | `TagSet::stateLock_` | `folly::MicroLock` | Tag additions, against QP state transitions (`setIbvQpState`), a Tag entering error (`enterTagErrorWithTagHeld`), the readers that may run while a Tag is added (`contains`, `protectionDomain`, `getTagInAnyState`), and the startup-HRNR and receive-setup flags (`shouldSendStartupHrnr`, `setIbvQpState`) | per-TagSet |
 | `TagSet::schedulerLock_` | `folly::MicroLock` | round-robin state (`scheduler_`): the sender's turns against the retransmit timer's peek | per-TagSet |
 | `Tag::pendingReceives_` | `folly::Synchronized` r/w lock | the receives waiting by csn (`receivesByCsn`) and the dedicated-queue RNR-Cancel request (`rnrCancelRequested`); receive lookup and request recording are atomic with receive insertion and request clearing | per-Tag (fine) |
@@ -80,16 +80,19 @@ held, after releasing CQ admission. CQ destruction nests `handleToCq_` ->
 operations must not acquire the CQ map or enter the datapath. CQ references
 remain a leaf lock.
 
-## The WQE-retirement guard (`wqeRetirementMutex_`) — one retirement is not exclusive
+## WQE retirement
 
-Every path that retires a WQE takes this exclusively, with one exception: a read
-or atomic response completing on the receive path retires its own send WQE under
-the **shared** side (`handleRxWqeCompletion` -> `handleTxWqesCompletion`). That
-does not exclude a tx path holding the same WQE under `freeSem_`, and the
-receiver cannot take `freeSem_` there without inverting `freeSem_` ->
-`wqeRetirementMutex_`. It is known debt, closed by moving send-side retirement to
-the state's owner rather than by another lock here. Do not read the table row as
-"WQE retirement is always exclusive".
+Read and atomic responses report completion under shared receive access and
+leave the WQE for retirement. Release receive access before waking the Tag's
+admission waiters.
+
+Admission reclaims its Tag's completed prefix while waiting for MSN-span or
+read/atomic room, and under the existing Tag hold for posting. An idle QP may
+retain completed WQEs until a new post or teardown. Send-queue entries return
+at completion.
+
+Retirement requires the Tag semaphore, then exclusive WQE-retirement access,
+then the msn-span lock. These exclude sender and receiver access to the WQE.
 
 ## The inline-ack lock (`txStateLock_`) — above the transmit locks, one mode only
 

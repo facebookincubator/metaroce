@@ -3362,6 +3362,56 @@ TEST_F(TagTest, WorkBehindAHeldReadIsStillReachedByTheMapWalk) {
          "request the client has been told about";
 }
 
+TEST_F(
+    TagTest,
+    AResponseCannotRetireAReadBorrowedDuringRequestFrameAbandonment) {
+  auto readWqe = std::make_unique<ReadWriteWqe>(
+      Wqe::WorkType::kRead,
+      kWorkReqId,
+      oneSge(buffer_->data(), 2 * kMtu),
+      kMtu,
+      0x1000,
+      ibvMr_->rkey);
+  Wqe* const read = readWqe.get();
+  ASSERT_TRUE(postToTag(*tag_, std::move(readWqe), kMtu))
+      << "precondition: the read is posted before its request frame is transmitted";
+  const uint16_t msn = read->getMsn().value();
+  std::ignore = read->allocateNextPosn();
+  read->onPosnReceived(0);
+
+  {
+    auto tagGuard = tag_->scopedLock();
+    // A partial response lets retransmission abandon the request while the
+    // sender still holds its WQE, before the final response completes it.
+    read->abandonFrame(Wqe::kRequestFrameWirePosn);
+    std::thread receiver([this, read, msn] {
+      auto receiveAccess = tag_->accessForReceive();
+      read->onPosnReceived(1);
+      EXPECT_TRUE(tag_->handleRxWqeCompletion(
+          *read, BaseHeader::Opcode::OperationType::READ_RESP, msn))
+          << "the final response reports the read while the sender holds it";
+    });
+    receiver.join();
+
+    ASSERT_EQ(tag_->getNumHeldTxWqes(), 1u)
+        << "abandonment does not release the sender's borrowed pointer";
+    EXPECT_TRUE(read->isRequestFrameResolved())
+        << "the response cannot make an abandoned request retransmittable";
+    EXPECT_EQ(cq_->getNumCompletedWqes(), 1)
+        << "the final response reports completion without freeing the borrowed WQE";
+  }
+
+  {
+    auto tagGuard = tag_->scopedLock();
+    auto retirementGuard = tag_->lockForWqeRetirement();
+    tag_->retireAfterRequestFrameSettled(*read, retirementGuard);
+  }
+  EXPECT_EQ(tag_->getNumHeldTxWqes(), 0u)
+      << "retirement releases the read after the sender returns its Tag hold";
+  EXPECT_EQ(cq_->getNumCompletedWqes(), 1)
+      << "retirement must not report the response-driven completion twice";
+}
+
 /*
  * Posn 0 is both the slot a read's request occupies in flight and the one its
  * first response lands in, so a response resolves it. The request's ack must

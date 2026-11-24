@@ -124,7 +124,7 @@ class Tag {
   [[nodiscard]] int getNumPendingWqes() const;
   // Claims a queue entry in the send depth this tag advertises; false when the
   // tag is already at that depth. The entry comes back when the work request
-  // retires.
+  // completes.
   bool tryReserveSendQueueEntry();
   void releaseSendQueueEntry();
 
@@ -536,6 +536,9 @@ class Tag {
   bool arePriorWqesCompleteForFence(uint16_t currentMsn) const;
 
  private:
+  // Called with no datapath locks held; acquires the Tag asynchronously.
+  folly::coro::Task<void> co_reclaimTxCapacity();
+
   static uint8_t cappedWeight(uint8_t serviceLevel) {
     return static_cast<uint8_t>(std::min(serviceLevel, kMaxServiceLevel) + 1);
   }

@@ -121,12 +121,26 @@ class TagSetTest : public ::testing::Test {
         << "precondition: completing the send finds no csn out of sequence";
   }
 
+  void reportReadResponse(Tag& tag, Wqe& read) {
+    {
+      auto receiveAccess = tag.accessForReceive();
+      read.onPosnReceived(0);
+      EXPECT_TRUE(tag.handleRxWqeCompletion(
+          read,
+          BaseHeader::Opcode::OperationType::READ_RESP,
+          read.getMsn().value()))
+          << "the response reports the read in posting order";
+    }
+    tag.signalMsnSpanRoom();
+    tag.signalReadAtomicRoom();
+  }
+
   // Retires a read that has already reported, by answering the request frame
   // it was held for; that is what returns the responder slot it spent.
   void settleRequestFrame(Tag& tag, Wqe& read) {
-    read.onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
     auto tagGuard = tag.scopedLock();
     auto retirementGuard = tag.lockForWqeRetirement();
+    read.onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
     tag.retireAfterRequestFrameSettled(read, retirementGuard);
   }
 
@@ -228,6 +242,262 @@ class TagSetTest : public ::testing::Test {
   struct ibv_qp ibvQpStorage_{};
   struct ibv_qp* ibvQp_{&ibvQpStorage_};
 };
+
+TEST_F(TagSetTest, ANextPostReclaimsACompletedRead) {
+  Wqe* const read = admitAReadThatSpendsTheOnlySlot();
+  ASSERT_NE(read, nullptr);
+  Tag& tag = tagSet_->at(1);
+  {
+    auto tagGuard = tag.scopedLock();
+    std::ignore = read->allocateNextPosn();
+    tagSet_->decrementUnsentPosns();
+    read->onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
+  }
+
+  reportReadResponse(tag, *read);
+  EXPECT_EQ(tag.getNumHeldTxWqes(), 1u)
+      << "an idle Tag may retain completed work until admission needs it";
+  EXPECT_EQ(tag.getAcceptedSendQueueEntries(), 0)
+      << "reporting returns the send-queue entry before retirement";
+
+  ASSERT_TRUE(tagSet_->postWqe(
+      1,
+      std::make_unique<SendWqe>(
+          kWorkReqId + 1, oneSge(buffer_->data(), kMtu), kMtu)))
+      << "precondition: the queue accepts the post that reclaims capacity";
+  admissionExecutor_.drain();
+
+  EXPECT_EQ(tag.getNumPendingWqes(), 1)
+      << "the new send reaches its Tag after the completed read is reclaimed";
+  EXPECT_EQ(tag.getNumHeldTxWqes(), 1u)
+      << "only the new send remains after admission reclaims the completed read";
+  EXPECT_TRUE(tag.hasReadAtomicRoom())
+      << "reclamation returns the read's negotiated responder slot";
+  EXPECT_EQ(tagSet_->getUnsentPosnCount(), 1u)
+      << "only the new send contributes to the unsent count";
+  EXPECT_EQ(cqs_[0]->getNumCompletedWqes(), 1)
+      << "reclamation must not report the read's completion twice";
+}
+
+TEST_F(TagSetTest, ALateResponseReleasesAReadAlreadyWaitingAtAdmission) {
+  Wqe* const read = admitAReadThatSpendsTheOnlySlot();
+  ASSERT_NE(read, nullptr);
+  Tag& tag = tagSet_->at(1);
+  {
+    auto tagGuard = tag.scopedLock();
+    auto retirementGuard = tag.lockForWqeRetirement();
+    std::ignore = read->allocateNextPosn();
+    tagSet_->decrementUnsentPosns();
+    read->onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
+  }
+  auto nextRead = makeReadWqe(kWorkReqId + 1);
+  Wqe* const waitingRead = nextRead.get();
+  ASSERT_TRUE(tagSet_->postWqe(1, std::move(nextRead)))
+      << "precondition: the second read is queued behind the occupied slot";
+  admissionExecutor_.drain();
+  ASSERT_FALSE(waitingRead->getMsn().has_value())
+      << "precondition: the second read is already waiting when the response arrives";
+
+  reportReadResponse(tag, *read);
+  admissionExecutor_.drain();
+
+  EXPECT_TRUE(waitingRead->getMsn().has_value())
+      << "the response must release the queued read without another ACK for its request frame";
+  EXPECT_EQ(tag.getNumHeldTxWqes(), 1u)
+      << "the admission waiter retires the completed read before taking its slot";
+  EXPECT_EQ(tagSet_->getUnsentPosnCount(), 1u)
+      << "allocation removed the first request frame's credit; only the new request frame is unsent";
+  EXPECT_EQ(cqs_[0]->getNumCompletedWqes(), 1)
+      << "reclamation must preserve the single response-driven completion";
+}
+
+TEST_F(TagSetTest, SettlingARequestFrameRetiresCompletedWorkBehindIt) {
+  for (const uint8_t tagNum : {1, 2}) {
+    tagSet_->add(tagNum, cqs_[tagNum - 1].get(), ibvQp_);
+    tagSet_->at(tagNum).setMaxRdAtomic(2);
+  }
+  startAdmissionLoop();
+
+  uint8_t tagNum = 1;
+  for (const bool abandonRequestFrame : {false, true}) {
+    SCOPED_TRACE(abandonRequestFrame ? "abandonment" : "ACK");
+    Tag& tag = tagSet_->at(tagNum);
+    auto firstWqe = makeReadWqe(kWorkReqId);
+    auto secondWqe = makeReadWqe(kWorkReqId + 1);
+    Wqe* const first = firstWqe.get();
+    Wqe* const second = secondWqe.get();
+    ASSERT_TRUE(tagSet_->postWqe(tagNum, std::move(firstWqe)))
+        << "precondition: the first read holds the map head";
+    ASSERT_TRUE(tagSet_->postWqe(tagNum, std::move(secondWqe)))
+        << "precondition: the second read follows the first";
+    admissionExecutor_.drain();
+    ASSERT_EQ(tagSet_->getUnsentPosnCount(), 2u)
+        << "precondition: admission counts both request frames as unsent";
+    {
+      auto tagGuard = tag.scopedLock();
+      for (Wqe* const read : {first, second}) {
+        std::ignore = read->allocateNextPosn();
+        tagSet_->decrementUnsentPosns();
+      }
+      second->onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
+    }
+    for (Wqe* const read : {first, second}) {
+      reportReadResponse(tag, *read);
+    }
+    admissionExecutor_.drain();
+    ASSERT_EQ(tag.getNumHeldTxWqes(), 2u)
+        << "precondition: the first frame prevents both reads from retiring";
+    {
+      auto tagGuard = tag.scopedLock();
+      auto retirementGuard = tag.lockForWqeRetirement();
+      if (abandonRequestFrame) {
+        first->abandonFrame(Wqe::kRequestFrameWirePosn);
+      } else {
+        first->onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
+      }
+      tag.retireAfterRequestFrameSettled(*first, retirementGuard);
+    }
+    EXPECT_EQ(tag.getNumHeldTxWqes(), 0u)
+        << "settling the first frame releases both completed reads";
+    EXPECT_TRUE(tag.hasReadAtomicRoom())
+        << "retirement returns the negotiated responder slots";
+    ASSERT_EQ(tagSet_->getUnsentPosnCount(), 0u)
+        << "both requests were allocated before their responses; retirement adds no unsent work";
+    EXPECT_EQ(cqs_[tagNum - 1]->getNumCompletedWqes(), 2)
+        << "retirement must not report either response completion twice";
+    ++tagNum;
+  }
+}
+
+TEST_F(TagSetTest, AdmissionWaitsForTheSenderBeforeReclaimingItsRead) {
+  Wqe* const read = admitAReadThatSpendsTheOnlySlot();
+  ASSERT_NE(read, nullptr);
+  Tag& tag = tagSet_->at(1);
+  auto nextSend = std::make_unique<SendWqe>(
+      kWorkReqId + 1, oneSge(buffer_->data(), kMtu), kMtu);
+  Wqe* const waitingSend = nextSend.get();
+  {
+    auto senderGuard = tag.scopedLock();
+    std::ignore = read->allocateNextPosn();
+    tagSet_->decrementUnsentPosns();
+    reportReadResponse(tag, *read);
+    ASSERT_TRUE(tagSet_->postWqe(1, std::move(nextSend)))
+        << "precondition: another send is queued while the sender borrows the read";
+    admissionExecutor_.drain();
+    ASSERT_EQ(tag.getNumHeldTxWqes(), 1u)
+        << "admission must preserve the sender's borrowed read";
+    EXPECT_FALSE(waitingSend->getMsn().has_value())
+        << "the admission coroutine must suspend rather than block its executor";
+  }
+  admissionExecutor_.drain();
+  EXPECT_TRUE(waitingSend->getMsn().has_value())
+      << "returning the sender's Tag hold must resume admission";
+  EXPECT_EQ(tag.getNumHeldTxWqes(), 2u)
+      << "the allocated request still holds the read alongside the new send";
+  settleRequestFrame(tag, *read);
+  EXPECT_EQ(tag.getNumHeldTxWqes(), 1u)
+      << "only the new send remains after the borrowed request settles";
+}
+
+TEST_F(TagSetTest, ANewPostReclaimsOnlyItsOwnTag) {
+  std::vector<Wqe*> reads;
+  for (const uint8_t tagNum : {1, 2}) {
+    tagSet_->add(tagNum, cqs_[tagNum - 1].get(), ibvQp_);
+    tagSet_->at(tagNum).setMaxRdAtomic(1);
+    auto read = makeReadWqe(kWorkReqId + tagNum);
+    reads.push_back(read.get());
+    ASSERT_TRUE(tagSet_->postWqe(tagNum, std::move(read)))
+        << "precondition: both Tags accept a read";
+  }
+  startAdmissionLoop();
+  admissionExecutor_.drain();
+  for (const uint8_t tagNum : {1, 2}) {
+    Tag& tag = tagSet_->at(tagNum);
+    Wqe& read = *reads[tagNum - 1];
+    {
+      auto tagGuard = tag.scopedLock();
+      std::ignore = read.allocateNextPosn();
+      tagSet_->decrementUnsentPosns();
+      read.onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
+    }
+    reportReadResponse(tag, read);
+  }
+  ASSERT_TRUE(tagSet_->postWqe(
+      1,
+      std::make_unique<SendWqe>(
+          kWorkReqId + 3, oneSge(buffer_->data(), kMtu), kMtu)))
+      << "precondition: only Tag 1 has another post";
+  admissionExecutor_.drain();
+  EXPECT_TRUE(tagSet_->at(1).hasReadAtomicRoom())
+      << "admission reclaims its own Tag's completed read";
+  EXPECT_FALSE(tagSet_->at(2).hasReadAtomicRoom())
+      << "a post must not hunt through unrelated Tags for retirement";
+  EXPECT_EQ(tagSet_->at(2).getNumHeldTxWqes(), 1u)
+      << "the idle Tag retains its completed read until its own reclamation";
+  EXPECT_EQ(tagSet_->getUnsentPosnCount(), 1u)
+      << "the retained ACKed read adds no phantom unsent work";
+}
+
+TEST_F(TagSetTest, ALateResponseReleasesTheMsnCapacityWaiter) {
+  Wqe* const read = admitAReadThatSpendsTheOnlySlot();
+  ASSERT_NE(read, nullptr);
+  Tag& tag = tagSet_->at(1);
+  {
+    auto tagGuard = tag.scopedLock();
+    std::ignore = read->allocateNextPosn();
+    tagSet_->decrementUnsentPosns();
+    read->onFrameNewlyAcked(Wqe::kRequestFrameWirePosn);
+  }
+  // The read has no response yet, so completed sends cannot report past it.
+  for (uint32_t i = 0; i < kMaxQpWorkRequests - 1; ++i) {
+    auto send = std::make_unique<SendWqe>(
+        kWorkReqId + 1 + i, oneSge(buffer_->data(), kMtu), kMtu);
+    Wqe* const sent = send.get();
+    ASSERT_TRUE(tagSet_->postWqe(1, std::move(send)))
+        << "precondition: the queue accepts work that fills the MSN span";
+    admissionExecutor_.drain();
+    ASSERT_TRUE(sent->getMsn().has_value())
+        << "precondition: the send is admitted before its frame is acknowledged";
+    auto tagGuard = tag.scopedLock();
+    auto retirementGuard = tag.lockForWqeRetirement();
+    std::ignore = sent->allocateNextPosn();
+    tagSet_->decrementUnsentPosns();
+    sent->acknowledgePosn(0);
+    ASSERT_TRUE(tag.handleTxWqesCompletion({*sent}))
+        << "completed sends must wait for the earlier read to report";
+  }
+  ASSERT_FALSE(tag.hasMsnSpanRoom())
+      << "precondition: retained work closes the modular MSN span";
+  // Exercise the MSN wait independently of the send-queue's admission bound.
+  auto waiting = folly::coro::co_withExecutor(
+                     &admissionExecutor_, tag.co_waitForMsnSpanRoom())
+                     .start();
+  admissionExecutor_.drain();
+  EXPECT_FALSE(waiting.isReady())
+      << "the resource waiter must suspend while the MSN span is full";
+
+  reportReadResponse(tag, *read);
+  EXPECT_EQ(tag.getAcceptedSendQueueEntries(), 0)
+      << "reporting returns every send-queue entry before lazy retirement";
+  admissionExecutor_.drain();
+  EXPECT_TRUE(waiting.isReady())
+      << "the final response must release the waiter without another ACK for the request frame";
+  if (!waiting.isReady()) {
+    tag.markForDeletion();
+    admissionExecutor_.drain();
+  }
+  ASSERT_TRUE(waiting.isReady())
+      << "the resource waiter must finish before its executor is destroyed";
+  std::move(waiting).get();
+  EXPECT_TRUE(tag.hasMsnSpanRoom())
+      << "the resumed wait must provide actual MSN capacity";
+  EXPECT_EQ(tag.getNumHeldTxWqes(), 0u)
+      << "the waiter reclaims the completed prefix rather than merely observing it";
+  EXPECT_TRUE(tag.hasReadAtomicRoom())
+      << "the same reclamation returns the read's responder slot";
+  EXPECT_EQ(tagSet_->getUnsentPosnCount(), 0u)
+      << "allocation removed every frame's unsent credit; retirement must not debit it again";
+}
 
 struct ibv_qp makeMockQp(ibv_qp_state state, struct ibv_pd* pd = nullptr) {
   struct ibv_qp qp{};
@@ -1298,9 +1568,12 @@ TEST_F(TagSetTest, RetiringAReadReleasesTheReadHeldBehindIt) {
       << "precondition: the queue accepts the second read";
   admissionExecutor_.drain();
 
-  answerTheOnlyFrame(tag, *firstRead);
-  // Reporting posts the baton without returning a slot. Draining consumes that
-  // wake here, so retirement's is the only one left to reach the held read.
+  {
+    auto tagGuard = tag.scopedLock();
+    std::ignore = firstRead->allocateNextPosn();
+    tagSet_->decrementUnsentPosns();
+  }
+  reportReadResponse(tag, *firstRead);
   admissionExecutor_.drain();
   ASSERT_EQ(tagSet_->getNumPendingWqes(), 0)
       << "precondition: the first read has reported and the second is still "

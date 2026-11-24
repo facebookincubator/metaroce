@@ -521,20 +521,29 @@ std::optional<AckHeader> RxFlow::processNewDataPacket(
     }
   }
 
-  // For non-READ operations, wqe must be non-null to track posn completion.
-  // For READ and atomic request ops, checkForRxMessageCompletion updates
-  // CDMSN state.
   if (!requiresReceive(opcode) && tag != nullptr && !brnrTriggered) {
+    // Update CDMSN for plain read and atomic request frames without a receive
+    // WQE.
     if (!qp_.checkForRxMessageCompletion(
             nullptr, opType, dataHeader.getTag(), msn, posn)) {
       failTag = true;
       return nakTagFailure(RequestValidationError::kInvalidRequest);
     }
   } else if (wqe != nullptr) {
+    // Delivered posns drive completion; READ_IMM_P waits for the peer to ACK
+    // the generated response.
     if (!qp_.checkForRxMessageCompletion(
             wqe, opType, dataHeader.getTag(), msn, posn)) {
       failTag = true;
       return nakTagFailure(RequestValidationError::kInvalidRequest);
+    }
+    if (isResponse(opType) && !wqe->hasOutstandingPosns()) {
+      Tag& completedTag = *CHECK_NOTNULL(tag);
+      // Release receive access before waking admission, which may acquire
+      // exclusive retirement access.
+      access.reset();
+      completedTag.signalMsnSpanRoom();
+      completedTag.signalReadAtomicRoom();
     }
   }
   return std::nullopt;

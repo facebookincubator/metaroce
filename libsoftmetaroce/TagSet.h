@@ -189,6 +189,7 @@ class TagSet {
   // state, and fails the pending work of every Tag left in the error state.
   // Cheap when no Tag has entered error since the last call.
   void failWqesOfTagsInError();
+
   // Raised where a Tag stops serving: entering error, or being destroyed.
   // Distinct from the sweep latch, which asks whose work needs failing.
   void notifySenderTagLeftService();
