@@ -1598,7 +1598,7 @@ TEST_F(QpTest, AFatalNakCompletesTheTagsReceivesRatherThanStrandingThem) {
           .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
           .setTimestamp(0)
           .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   // Fatal: polling below would block forever on a stranded receive.
   ASSERT_EQ(cq.getNumCompletedWqes(), 2u)
@@ -1694,7 +1694,7 @@ TEST_F(QpTest, AFatalNakForAMessageCarryingItsOwnErrorHandsTheStatusOn) {
           .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
           .setTimestamp(0)
           .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   EXPECT_EQ(wqeCarryingItsOwnError->getCompletionStatusOverride(), kLocalLenErr)
       << "the error this work request already carries is the one that explains "
@@ -2088,7 +2088,7 @@ TEST_F(QpTest, AFatalNakErrorsOnlyTheTagItCarries) {
           .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
           .setTimestamp(0)
           .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   EXPECT_TRUE(rejectedWqe->isFailing())
       << "the work request on the tag the peer rejected must be failing";
@@ -2225,13 +2225,13 @@ TEST_F(QpTest, ASecondFatalNakForTheSameTagReportsNothingFurther) {
         .build();
   };
 
-  flow->processNakFatalError(nakForFsn(0));
+  flow->processNakFatalError(nakForFsn(0), flow->getTxState().sndCur.wlock());
   ASSERT_TRUE(wqe->isFailing())
       << "precondition: the first nak fails the work request at its msn";
   const auto statusAfterFirstNak = wqe->getCompletionStatusOverride();
   const int completionsAfterFirstNak = cq.getNumCompletedWqes();
 
-  flow->processNakFatalError(nakForFsn(1));
+  flow->processNakFatalError(nakForFsn(1), flow->getTxState().sndCur.wlock());
 
   EXPECT_EQ(cq.getNumCompletedWqes(), completionsAfterFirstNak)
       << "a nak for a tag already in error must report nothing further; a "
@@ -2303,7 +2303,7 @@ TEST_F(QpTest, ATagFailureLeavesAnotherTagSendingOnTheSharedFlow) {
           .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
           .setTimestamp(0)
           .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   ASSERT_TRUE(rejectedWqe->isFailing())
       << "the tag the nak carries must have failing work for this to be "
@@ -2425,7 +2425,7 @@ TEST_F(QpTest, TheLastTagFailingTakesTheQpsFlowsOutOfService) {
           .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
           .setTimestamp(0)
           .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   EXPECT_CALL(*rawCongestionController, onFlowDisabled(0)).Times(1);
 
@@ -2483,7 +2483,7 @@ TEST_F(QpTest, AFatalNakStillReportsItsStatusOnATagErroredByTheReceivePath) {
           .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
           .setTimestamp(0)
           .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   ASSERT_EQ(cq.getNumCompletedWqes(), 1u)
       << "the send has no frame on the wire, so the nak settles it at once";
@@ -2532,7 +2532,7 @@ TEST_F(QpTest, AFatalNakForAnMsnWeNeverIssuedIsDiscarded) {
           .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
           .setTimestamp(0)
           .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   EXPECT_FALSE(tag->isInErrorState())
       << "one packet for a message this side never sent must not take the "
@@ -2582,7 +2582,7 @@ TEST_F(QpTest, AFatalNakForAReadResponseFailsTheResponderTag) {
                             .setAckStatus(AckStatus::NAK_OPERATIONAL_ERROR)
                             .setTimestamp(0)
                             .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   EXPECT_TRUE(initialTag->isInErrorState())
       << "the requester rejected a response this tag sent, so the tag enters "
@@ -2629,7 +2629,7 @@ TEST_F(QpTest, AFatalNakNamingAnotherTagThanTheResponseIsCheckedAsThatTags) {
                             .setAckStatus(AckStatus::NAK_OPERATIONAL_ERROR)
                             .setTimestamp(0)
                             .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   EXPECT_FALSE(otherTag->isInErrorState())
       << "the frame at the cfsn is another tag's response, so this nak is for "
@@ -2697,7 +2697,7 @@ TEST_F(QpTest, AFatalNakForAReadResponseSelectsNoSendByTheInitiatorsMsn) {
                             .setAckStatus(AckStatus::NAK_OPERATIONAL_ERROR)
                             .setTimestamp(0)
                             .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   // Neither send has a frame in flight, so both complete during the nak and
   // are gone; their statuses are read from the completion queue.
@@ -2763,7 +2763,7 @@ TEST_F(QpTest, AFatalNakLeavesTheQpsHrnrBackoffAlone) {
           .setAckStatus(AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR)
           .setTimestamp(0)
           .build();
-  flow->processNakFatalError(nak);
+  flow->processNakFatalError(nak, flow->getTxState().sndCur.wlock());
 
   ASSERT_TRUE(rejectedWqe->isFailing())
       << "the tag the nak carries must have failing work, or the backoff "
@@ -11838,7 +11838,7 @@ TEST_F(QpTest, AFlowIdErrorAbandonsAFailingReadsFrameRatherThanHandingItBack) {
   }
   const uint32_t unsentBefore = qp.getUnsentPosnCount();
 
-  flow->processNakFlowIdError();
+  flow->processNakFlowIdError(flow->getTxState().sndCur.wlock());
 
   EXPECT_TRUE(failingRead->isRequestFrameResolved())
       << "the frame must be given up on, not handed back: nothing is going to "
@@ -11904,7 +11904,7 @@ TEST_F(QpTest, AFlowIdErrorAbandonsAServedReadsFrameRatherThanHandingItBack) {
          "handing its request frame back pointless";
   const uint32_t unsentBefore = qp.getUnsentPosnCount();
 
-  flow->processNakFlowIdError();
+  flow->processNakFlowIdError(flow->getTxState().sndCur.wlock());
 
   EXPECT_TRUE(servedRead->isRequestFrameResolved())
       << "the frame must be abandoned, not handed back: the read is already "

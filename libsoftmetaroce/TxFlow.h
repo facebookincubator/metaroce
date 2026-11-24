@@ -67,6 +67,8 @@ class DataPacket;
 
 class TxFlow : public Flow {
  public:
+  using SndCurWriteLock = folly::Synchronized<uint16_t>::WLockedPtr;
+
   // Smoothing parameter for per-flow RTT measurement
   static constexpr uint16_t kDefaultInverseLog2FlowAlpha = 4;
   // Smoothing parameter for per-flow RTT mean deviation
@@ -178,13 +180,16 @@ class TxFlow : public Flow {
       const std::unordered_map<uint8_t, uint16_t>& minBrnrMsnByTag);
 
   // If we receive NAK_FLOW_ID_ERROR, release all frames and disable the flow.
-  void processNakFlowIdError();
+  // Takes ownership of this flow's held sndCur write lock and releases it
+  // before waking the sender.
+  void processNakFlowIdError(SndCurWriteLock sndCurHeld);
 
   // Handle fatal NAK errors (NAK_ADDRESS_INVALID_ACCESS_ERROR,
   // NAK_OPERATIONAL_ERROR or NAK_INVALID_REQUEST). Marks the work requests of
   // the NAK's tag failing and reports them as their packets settle, leaving
-  // the other tags sharing this flow untouched.
-  void processNakFatalError(const AckHeader& ack);
+  // the other tags sharing this flow untouched. Takes ownership of this flow's
+  // held sndCur write lock and releases it before taking the Tag.
+  void processNakFatalError(const AckHeader& ack, SndCurWriteLock sndCurHeld);
 
   // Called when either a loss by out-of-order is detected upon processing
   // an ACK or when retransmission timer expires. Returns the number of
@@ -243,8 +248,6 @@ class TxFlow : public Flow {
   [[nodiscard]] bool isBlockedMsn(const Tag& tag, uint16_t msn) const;
 
  private:
-  using SndCurWriteLock = folly::Synchronized<uint16_t>::WLockedPtr;
-
   // Body of retxTimerCallback_, so it runs on the timer thread.
   void onRtoWake();
   [[nodiscard]] uint64_t rtoExpiryFrom(uint64_t nowNs) const;
@@ -305,10 +308,11 @@ class TxFlow : public Flow {
     // Empty for a response, whose msn belongs to the initiator.
     std::optional<uint16_t> msn;
   };
-  // Resolves an FSN to the message that sent it, under sndCur. Empty once the
-  // frame is no longer outstanding.
+  // Resolves an FSN to the message that sent it, under this flow's held sndCur
+  // write lock. Empty once the frame is no longer outstanding.
   [[nodiscard]] std::optional<MessageId> getOutstandingFrameMessage(
-      uint16_t fsn) const;
+      uint16_t fsn,
+      const SndCurWriteLock& sndCurHeld) const;
 
   // Helper function to try getting a new packet from work queue element
   std::unique_ptr<struct EgressPacket> tryGetNewPacketFromWqe();

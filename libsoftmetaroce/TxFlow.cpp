@@ -647,7 +647,7 @@ void TxFlow::processBrnrPacket(
       std::chrono::microseconds(rnrBackoffTime), qp_.getBrnrTimerCallback());
 }
 
-void TxFlow::processNakFlowIdError() {
+void TxFlow::processNakFlowIdError(SndCurWriteLock sndCurHeld) {
   // processAckPacket discards a flow ID NAK for flow 0.
   CHECK_NE(flowId_, 0);
   LOG(ERROR) << "Received NAK_FLOW_ID_ERROR for qp: " << qp_.getLocalQpNum()
@@ -660,7 +660,7 @@ void TxFlow::processNakFlowIdError() {
   int numReleasedForRetry = 0;
   std::bitset<kMetaRoceTagCount> tagsWithAbandonedFrames;
   {
-    auto lockedSndCur = txState_.sndCur.wlock();
+    auto lockedSndCur = std::move(sndCurHeld);
     for (auto& trackerEntry : txState_.tracker) {
       if (trackerEntry.isResolved()) {
         // A resolved frame's wqe pointer may already be freed.
@@ -717,8 +717,8 @@ void TxFlow::processNakFlowIdError() {
 }
 
 std::optional<TxFlow::MessageId> TxFlow::getOutstandingFrameMessage(
-    uint16_t fsn) const {
-  auto lockedSndCur = txState_.sndCur.rlock();
+    uint16_t fsn,
+    const SndCurWriteLock& /*sndCurHeld*/) const {
   const auto offsetInTracker = getTrackerOffset(fsn);
   if (!offsetInTracker.has_value()) {
     return std::nullopt;
@@ -740,7 +740,9 @@ std::optional<TxFlow::MessageId> TxFlow::getOutstandingFrameMessage(
   return MessageId{id.tagNum, wqe.getMsn().value()};
 }
 
-void TxFlow::processNakFatalError(const AckHeader& ack) {
+void TxFlow::processNakFatalError(
+    const AckHeader& ack,
+    SndCurWriteLock sndCurHeld) {
   // Fails all the tag's work, each kind where it lives: the send the NAK
   // identifies, the rest of the sends and the virtual ones in
   // markPendingWqesFailing(), the receives in flushPendingReceiveWqesInError().
@@ -754,7 +756,9 @@ void TxFlow::processNakFatalError(const AckHeader& ack) {
     return;
   }
 
-  const auto nackedMessage = getOutstandingFrameMessage(ack.getCumulativeFsn());
+  const auto nackedMessage =
+      getOutstandingFrameMessage(ack.getCumulativeFsn(), sndCurHeld);
+  sndCurHeld.unlock();
   // Spec 8.5.5: a fatal NAK's tag/msn and its cfsn describe one frame two ways,
   // so a responder disagreeing with itself has left the message ambiguous.
   if (nackedMessage.has_value() && nackedMessage->msn.has_value() &&
@@ -901,7 +905,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
           << "ignoring a flow ID NAK for flow 0 on qp " << qp_.getLocalQpNum();
       return;
     }
-    processNakFlowIdError();
+    processNakFlowIdError(txState_.sndCur.wlock());
     reportAckReturningNoFrames(ack);
     return;
   }
@@ -910,7 +914,7 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
       ack.getAckStatus() == AckStatus::NAK_OPERATIONAL_ERROR ||
       ack.getAckStatus() == AckStatus::NAK_INVALID_REQUEST ||
       ack.getAckStatus() == AckStatus::RESERVED) {
-    processNakFatalError(ack);
+    processNakFatalError(ack, txState_.sndCur.wlock());
     return;
   }
 
