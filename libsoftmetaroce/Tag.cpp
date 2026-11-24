@@ -45,7 +45,7 @@ template <typename Ready>
 folly::coro::Task<void> waitUntil(folly::coro::Baton& baton, Ready ready) {
   while (true) {
     baton.reset();
-    if (ready()) {
+    if (co_await ready()) {
       co_return;
     }
     co_await baton;
@@ -244,16 +244,16 @@ bool Tag::tryReserveSendQueueEntry() {
 }
 
 folly::coro::Task<void> Tag::co_waitForReadAtomicRoom() {
-  co_await waitUntil(readAtomicBaton_, [this] {
-    return hasReadAtomicRoom() || postWillBeFlushed();
+  co_await waitUntil(readAtomicBaton_, [this]() -> folly::coro::Task<bool> {
+    co_return hasReadAtomicRoom() || postWillBeFlushed();
   });
 }
 
 folly::coro::Task<void> Tag::co_waitForMsnSpanRoom() {
   // processTransmitWqe() flushes a deleted tag's post before it takes an msn;
   // an errored tag's post takes one first, so that one waits for real span.
-  co_await waitUntil(msnSpanBaton_, [this] {
-    return hasMsnSpanRoom() || isMarkedForDeletion();
+  co_await waitUntil(msnSpanBaton_, [this]() -> folly::coro::Task<bool> {
+    co_return hasMsnSpanRoom() || isMarkedForDeletion();
   });
 }
 
