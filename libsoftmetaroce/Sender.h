@@ -156,7 +156,8 @@ class Sender : public folly::NonCopyableNonMovable {
 
   // What decides which socket a flow is given, or whether a new one is made.
   struct SocketAssignment {
-    std::unordered_map<uint16_t, uint32_t> socketIdFreqMap;
+    // Indexed by socket id.
+    std::array<uint32_t, kMaxNumSockets> flowsPerSocket{};
     std::unordered_map<folly::IPAddress, std::unordered_set<uint16_t>>
         localAddrToSocketIds;
     SourcePortCounter sourcePorts;

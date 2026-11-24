@@ -27,7 +27,7 @@ around `Tag`, `TagSet`, `TxFlow`, or QP teardown.
 | `Qp::pacer_` | `folly::Synchronized` with a plain mutex | the send clock (`nextSendTimeNs_`) and the configured rate | per-QP |
 | `Qp::pacingInputs_` | `folly::Synchronized` with a plain mutex | the verbs-installed limit the pacer's rate derives from | per-QP |
 | `SharedReceiveQueue::references_` | `folly::Synchronized` with a plain mutex | the queue pairs holding the queue and the async events it has yet to see acked, which a destroy waits on | per-SharedReceiveQueue |
-| `Sender::socketAssignment_` | `folly::Synchronized` with a plain mutex | the socket assignment: `socketIdFreqMap`, `localAddrToSocketIds`, the source-port counter and socket count, and every new entry in `sockets_` (creation and selection) | per-Sender |
+| `Sender::socketAssignment_` | `folly::Synchronized` with a plain mutex | the socket assignment: `flowsPerSocket`, `localAddrToSocketIds`, the source-port counter and socket count, and every new entry in `sockets_` (creation and selection) | per-Sender |
 | `QpArbiter::arbiterMutex_` | coroutine mutex (`co_scoped_lock`) | the ready set (`readyQpNums_`), the callback map, and the round-robin cursor -- and it is **held across the QP's build callback** | process-wide (one arbiter serves every QP) |
 
 ## The order
@@ -210,7 +210,7 @@ semaphore.
 
 ## The socket assignment lock (`socketAssignment_`) — a leaf
 
-`Sender::socketAssignment_` guards the socket assignment (`socketIdFreqMap`,
+`Sender::socketAssignment_` guards the socket assignment (`flowsPerSocket`,
 `localAddrToSocketIds`, the source-port counter, the socket count) and every new
 entry in `sockets_`, covering selection and creation during QP setup, ACK
 source-port repathing (`getAlternateAckSocket`), and sender visits

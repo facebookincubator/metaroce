@@ -608,13 +608,13 @@ uint16_t Sender::getLeastUsedSocketId(
   // one with the lowest frequency
   uint16_t leastUsedSocketId = *it->second.begin();
   for (auto socketId : it->second) {
-    if (assignment->socketIdFreqMap[socketId] <
-        assignment->socketIdFreqMap[leastUsedSocketId]) {
+    if (assignment->flowsPerSocket[socketId] <
+        assignment->flowsPerSocket[leastUsedSocketId]) {
       leastUsedSocketId = socketId;
     }
   }
   // Increment the frequency of the least used socket id
-  assignment->socketIdFreqMap[leastUsedSocketId]++;
+  assignment->flowsPerSocket[leastUsedSocketId]++;
   return leastUsedSocketId;
 }
 
@@ -662,7 +662,7 @@ uint16_t Sender::createSocketWithLocalAddr(
   uint16_t socketId = assignment->socketCount;
   sockets_[socketId] = std::move(perCosSockets);
   ++assignment->socketCount;
-  assignment->socketIdFreqMap[socketId] = 1;
+  assignment->flowsPerSocket[socketId] = 1;
   assignment->localAddrToSocketIds[localAddr].insert(socketId);
   return socketId;
 }
