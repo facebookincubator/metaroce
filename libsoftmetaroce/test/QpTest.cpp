@@ -11916,6 +11916,74 @@ static folly::coro::Task<void> countOneRun(std::atomic<int>* ran) {
   co_return;
 }
 
+TEST_F(QpTest, AResponseAfterBrnrDoesNotCrash) {
+  createAlwaysSendingMockCongestionController(qp);
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 1, &mockSender);
+  std::array<char, 4096> payload{};
+  Wqe* const read = postWqeHelper(
+      &qp,
+      {.workType = Wqe::WorkType::kRead,
+       .msgSizeBytes = payload.size(),
+       .tagNum = kMetaRoceInitialTag,
+       .workReqId = 300,
+       .address = payload.data()});
+  ASSERT_NE(read, nullptr);
+  auto request = qp.getNextPacketToSend();
+  ASSERT_NE(request, nullptr);
+  auto* const requestPacket = dynamic_cast<DataPacket*>(request->packet.get());
+  ASSERT_NE(requestPacket, nullptr);
+  const auto& requestHeader = requestPacket->getDataHeader();
+
+  BitVector<AckHeader::kAckTrackerBits> rejected;
+  rejected.setBit(0);
+  const auto brnr = AckHeader::AckHeaderBuilder()
+                        .setCumulativeFsn(requestHeader.getFsn() - 1)
+                        .setMaxRcvdFsn(requestHeader.getFsn())
+                        .setAckStatus(AckStatus::BRNR)
+                        .setRnrBitVector(rejected)
+                        .setRnrBackoffTimeExp(0)
+                        .setTimestamp(0)
+                        .build();
+  {
+    auto inlineAckGuard = qp.lockForInlineAckApply();
+    qp.getTxFlowById(0)->processAckPacket(brnr, getNowNs());
+  }
+  ASSERT_FALSE(read->isRequestFrameAllocated())
+      << "precondition: BRNR returns the request for retry before the response";
+  ASSERT_FALSE(read->isRequestFrameResolved())
+      << "precondition: rejection does not acknowledge or abandon the request";
+
+  const auto baseHeader =
+      BaseHeader::BaseHeaderBuilder()
+          .setSrcQp(qp.getRemoteQpNum())
+          .setDstQp(qp.getLocalQpNum())
+          .setOpcode(
+              BaseHeader::Opcode(BaseHeader::Opcode::OperationType::READ_RESP))
+          .setVersion(0)
+          .setFlowId(0)
+          .build();
+  const auto responseHeader = DataHeader::DataHeaderBuilder()
+                                  .setFsn(0)
+                                  .setUna(0)
+                                  .setMsn(requestHeader.getMsn())
+                                  .setPosn(0)
+                                  .setCsn(0)
+                                  .setAckRequest(true)
+                                  .setTimestamp(0)
+                                  .build();
+  const DataPacket response(
+      baseHeader, responseHeader, payload.data(), payload.size());
+  // The peer contradicts its BRNR. Processing and a later retirement visit
+  // must remain nonfatal, without requiring a successful completion.
+  EXPECT_NO_THROW({
+    qp.getRxFlowById(0)->processDataPacket(&response, kEcnECT0);
+    auto tagGuard = initialTag->scopedLock();
+    auto retirementGuard = initialTag->lockForWqeRetirement();
+    initialTag->retireCompletedTxWqes(retirementGuard);
+  }) << "a peer that responds to a refused request frame must not crash the process";
+}
+
 TEST_F(QpTest, ClosingAdmissionDoesNotRaceSubmission) {
   // The sanitizer is this test's oracle; the expectation below is secondary.
   std::atomic<int> ran{0};
