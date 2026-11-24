@@ -2590,6 +2590,50 @@ TEST_F(QpTest, AFatalNakForAReadResponseFailsTheResponderTag) {
          "it never issued";
 }
 
+TEST_F(QpTest, AFatalNakForAReadResponsePassesTheAckPath) {
+  createAlwaysSendingMockCongestionController(qp);
+  LimitedTestSender mockSender(arbiter, mockUDPSocketMaker);
+  qp.setupFlows(1, 1, &mockSender);
+  auto flow = qp.getTxFlowById(0);
+
+  const uint16_t initiatorMsn = initialTag->getNextMsn();
+  ReadWriteHeader rwHeader(
+      reinterpret_cast<uint64_t>(receiveBuffer.data()), mrKey, mtu);
+  int addressError = -1;
+  initialTag->createVirtualSendWqeIfNeeded(
+      initiatorMsn, rwHeader, &addressError, mrs, mtu);
+  ASSERT_EQ(addressError, 0)
+      << "precondition: the read's region resolves, or no response is built";
+  Wqe* const response = initialTag->findNextWqe();
+  ASSERT_NE(response, nullptr);
+  ASSERT_TRUE(response->isVirtual())
+      << "precondition: the frame on the wire is a read response";
+
+  auto& txState = flow->getTxState();
+  txState.sndUna = 0;
+  *(txState.sndCur.wlock()) = 0;
+  txState.sndNxt = 1;
+  txState.tracker.emplace_back(
+      PacketId(
+          response, kMetaRoceInitialTag, response->allocateNextPosn(), mtu),
+      Flow::FsnState::UNACKED);
+  initialTag->markFree();
+
+  const AckHeader nak = AckHeader::AckHeaderBuilder()
+                            .setTag(kMetaRoceInitialTag)
+                            .setCumulativeFsn(0)
+                            .setMaxRcvdFsn(0)
+                            .setCumulRespDeliveredMsn(initiatorMsn)
+                            .setAckStatus(AckStatus::NAK_OPERATIONAL_ERROR)
+                            .setTimestamp(0)
+                            .build();
+  flow->processAckPacket(nak, simulatedProcessedAtNs(0));
+
+  EXPECT_TRUE(initialTag->isInErrorState())
+      << "a NAK that identifies the response by its fsn, tag and the "
+         "initiator's msn identifies a frame in flight, so it fails the tag";
+}
+
 TEST_F(QpTest, AFatalNakNamingAnotherTagThanTheResponseIsCheckedAsThatTags) {
   constexpr uint8_t kOtherTag = kMetaRoceInitialTag + 1;
   qp.addTag(kOtherTag, &cq, &otherIbvQpStorage);

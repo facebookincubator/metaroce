@@ -995,6 +995,62 @@ TEST_F(NakTest, AFlowIdNakForFlowZeroIsIgnored) {
          "the later ack acknowledges it";
 }
 
+TEST_F(NakTest, NaksThatIdentifyNoFrameInFlightAreDiscarded) {
+  auto sender =
+      createTestSenderWithFlows(2, LimitedTestSender::kDisableSendLoop);
+  ON_CALL(congestionController(), getAvailableWindowSize(_))
+      .WillByDefault(Return(kCongestionWindowSize));
+  auto payload = std::make_unique<char[]>(kTestFrameCount * qp->getMtu());
+  postTestWqe(kTestFrameCount, payload.get());
+  qp->startProcessingWqes();
+  ASSERT_TRUE(qp->waitForWqesToBePosted(1))
+      << "precondition: the WQE reaches its Tag, or flow 1 has nothing to send";
+  auto sent = txFlow(1).getNextPacketToSend();
+  ASSERT_NE(sent, nullptr);
+  const auto* data = dynamic_cast<const DataPacket*>(sent->packet.get());
+  ASSERT_NE(data, nullptr);
+  const uint16_t sentFsn = data->getDataHeader().getFsn();
+  const uint16_t sentMsn = data->getDataHeader().getMsn();
+  const uint32_t sentAtNs = data->getDataHeader().getTimestamp();
+  struct FrameIdentity {
+    uint16_t fsn;
+    uint8_t tag;
+    uint16_t msn;
+  };
+  const FrameIdentity unsentFsn{
+      .fsn = static_cast<uint16_t>(sentFsn + 1),
+      .tag = kMetaRoceInitialTag,
+      .msn = sentMsn};
+  const FrameIdentity otherTag{
+      .fsn = sentFsn, .tag = kMetaRoceInitialTag + 1, .msn = sentMsn};
+  const FrameIdentity otherMsn{
+      .fsn = sentFsn,
+      .tag = kMetaRoceInitialTag,
+      .msn = static_cast<uint16_t>(sentMsn + 1)};
+
+  EXPECT_CALL(congestionController(), onFlowDisabled(1)).Times(0);
+  EXPECT_CALL(congestionController(), onPacketAck(1, _)).Times(0);
+  for (const FrameIdentity& identity : {unsentFsn, otherTag, otherMsn}) {
+    for (const AckStatus status :
+         {AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR,
+          AckStatus::NAK_FLOW_ID_ERROR}) {
+      txFlow(1).processAckPacket(
+          AckHeader::AckHeaderBuilder()
+              .setTag(identity.tag)
+              .setCumulativeFsn(identity.fsn)
+              .setMaxRcvdFsn(identity.fsn)
+              .setCumulRespDeliveredMsn(identity.msn)
+              .setAckStatus(status)
+              .setTimestamp(sentAtNs)
+              .build(),
+          simulatedProcessedAtNs(sentAtNs));
+    }
+  }
+
+  EXPECT_FALSE(qp->getTag(kMetaRoceInitialTag)->isInErrorState())
+      << "a NAK that identifies no frame in flight must not fail the tag";
+}
+
 TEST_F(NakTest, AFlowIdNakIsReportedWithoutItsFlowCount) {
   auto sender =
       createTestSenderWithFlows(2, LimitedTestSender::kDisableSendLoop);

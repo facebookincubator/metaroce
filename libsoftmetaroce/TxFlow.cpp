@@ -732,12 +732,10 @@ std::optional<TxFlow::MessageId> TxFlow::getOutstandingFrameMessage(
   // thread can be freeing. Work type and msn are fixed before publication.
   const auto& id = entry.id;
   const Wqe& wqe = *CHECK_NOTNULL(id.wqe);
-  if (wqe.isVirtual()) {
-    // A response carries the initiator's msn, from a space this side does not
-    // assign, so comparing it with an msn a peer reports is meaningless.
-    return MessageId{id.tagNum, std::nullopt};
-  }
-  return MessageId{id.tagNum, wqe.getMsn().value()};
+  return MessageId{
+      .tagNum = id.tagNum,
+      .msn = wqe.getMsn().value(),
+      .isResponse = wqe.isVirtual()};
 }
 
 void TxFlow::processNakFatalError(
@@ -747,8 +745,6 @@ void TxFlow::processNakFatalError(
   // identifies, the rest of the sends and the virtual ones in
   // markPendingWqesFailing(), the receives in flushPendingReceiveWqesInError().
 
-  // Ahead of the consistency check below, so a peer using a tag this QP does
-  // not have is turned away on that alone rather than on the check's verdict.
   Tag* const nackedTag = qp_.getTag(ack.getTag());
   if (nackedTag == nullptr) {
     LOG_FIRST_N(WARNING, 10)
@@ -759,20 +755,6 @@ void TxFlow::processNakFatalError(
   const auto nackedMessage =
       getOutstandingFrameMessage(ack.getCumulativeFsn(), sndCurHeld);
   sndCurHeld.unlock();
-  // Spec 8.5.5: a fatal NAK's tag/msn and its cfsn describe one frame two ways,
-  // so a responder disagreeing with itself has left the message ambiguous.
-  if (nackedMessage.has_value() && nackedMessage->msn.has_value() &&
-      (nackedMessage->tagNum != ack.getTag() ||
-       *nackedMessage->msn != ack.getCumulRespDeliveredMsn())) {
-    LOG_FIRST_N(ERROR, 10) << "Fatal NAK carries tag " << (uint32_t)ack.getTag()
-                           << " msn " << ack.getCumulRespDeliveredMsn()
-                           << ", but its cfsn " << ack.getCumulativeFsn()
-                           << " was sent for tag "
-                           << (uint32_t)nackedMessage->tagNum << " msn "
-                           << *nackedMessage->msn
-                           << " on qp: " << qp_.getLocalQpNum()
-                           << "; blaming the msn the responder sent";
-  }
 
   Tag& tag = *nackedTag;
 
@@ -784,8 +766,7 @@ void TxFlow::processNakFatalError(
     auto retirementGuard = tag.lockForWqeRetirement();
     const uint16_t failedMsn = ack.getCumulRespDeliveredMsn();
     const bool nackedFrameIsResponse = nackedMessage.has_value() &&
-        nackedMessage->tagNum == ack.getTag() &&
-        !nackedMessage->msn.has_value();
+        nackedMessage->tagNum == ack.getTag() && nackedMessage->isResponse;
     const bool msnWasNeverIssued =
         !nackedFrameIsResponse && !before(failedMsn, tag.getNextMsn());
     if (msnWasNeverIssued) {
@@ -899,23 +880,48 @@ void TxFlow::processAckPacket(const AckHeader& ack, uint32_t nowNs) {
           << " maxRcvdFsn: " << ack.getMaxRcvdFsn()
           << " cumulativeRespDeliveredMsn: " << ack.getCumulRespDeliveredMsn();
 
-  if (ack.getAckStatus() == AckStatus::NAK_FLOW_ID_ERROR) {
-    if (flowId_ == 0) {
-      LOG_FIRST_N(ERROR, 10)
-          << "ignoring a flow ID NAK for flow 0 on qp " << qp_.getLocalQpNum();
+  if (ack.isFrameIdentifyingNak()) {
+    // Only a NAK takes sndCur here, so an ack still takes it once.
+    auto lockedSndCur = txState_.sndCur.wlock();
+    const auto nackedMessage =
+        getOutstandingFrameMessage(ack.getCumulativeFsn(), lockedSndCur);
+    if (!nackedMessage.has_value()) {
+      LOG_FIRST_N(WARNING, 10)
+          << "discarding " << ack.getAckStatus() << " on qp "
+          << qp_.getLocalQpNum() << " flow " << flowId_ << " for fsn "
+          << ack.getCumulativeFsn() << ", which is not outstanding";
       return;
     }
-    processNakFlowIdError(txState_.sndCur.wlock());
-    reportAckReturningNoFrames(ack);
-    return;
-  }
+    if (nackedMessage->tagNum != ack.getTag() ||
+        nackedMessage->msn != ack.getCumulRespDeliveredMsn()) {
+      LOG_FIRST_N(ERROR, 10)
+          << ack.getAckStatus() << " carries tag " << (uint32_t)ack.getTag()
+          << " msn " << ack.getCumulRespDeliveredMsn() << ", but its fsn "
+          << ack.getCumulativeFsn() << " was sent for tag "
+          << (uint32_t)nackedMessage->tagNum << " msn " << nackedMessage->msn
+          << " on qp " << qp_.getLocalQpNum() << " flow " << flowId_
+          << "; discarding it";
+      return;
+    }
 
-  if (ack.getAckStatus() == AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR ||
-      ack.getAckStatus() == AckStatus::NAK_OPERATIONAL_ERROR ||
-      ack.getAckStatus() == AckStatus::NAK_INVALID_REQUEST ||
-      ack.getAckStatus() == AckStatus::RESERVED) {
-    processNakFatalError(ack, txState_.sndCur.wlock());
-    return;
+    if (ack.getAckStatus() == AckStatus::NAK_FLOW_ID_ERROR) {
+      if (flowId_ == 0) {
+        LOG_FIRST_N(ERROR, 10) << "ignoring a flow ID NAK for flow 0 on qp "
+                               << qp_.getLocalQpNum();
+        return;
+      }
+      processNakFlowIdError(std::move(lockedSndCur));
+      reportAckReturningNoFrames(ack);
+      return;
+    }
+
+    if (ack.getAckStatus() == AckStatus::NAK_ADDRESS_INVALID_ACCESS_ERROR ||
+        ack.getAckStatus() == AckStatus::NAK_OPERATIONAL_ERROR ||
+        ack.getAckStatus() == AckStatus::NAK_INVALID_REQUEST ||
+        ack.getAckStatus() == AckStatus::RESERVED) {
+      processNakFatalError(ack, std::move(lockedSndCur));
+      return;
+    }
   }
 
   // Spec 8.5.5: only the in-order ack, the out-of-order ack and the BRNR carry

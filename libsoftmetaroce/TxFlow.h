@@ -305,8 +305,9 @@ class TxFlow : public Flow {
   // frame hands out no Wqe* to be followed once sndCur is dropped.
   struct MessageId {
     uint8_t tagNum{0};
-    // Empty for a response, whose msn belongs to the initiator.
-    std::optional<uint16_t> msn;
+    // A response's msn is the initiator's, which a NAK of the response reports.
+    uint16_t msn{0};
+    bool isResponse{false};
   };
   // Resolves an FSN to the message that sent it, under this flow's held sndCur
   // write lock. Empty once the frame is no longer outstanding.

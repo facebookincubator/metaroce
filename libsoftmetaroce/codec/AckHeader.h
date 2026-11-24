@@ -140,6 +140,13 @@ class AckHeader : public Header {
     return isHrnr() || isBrnr();
   }
 
+  // Every NAK but a BRNR identifies the frame it reports by its cumulative FSN.
+  bool isFrameIdentifyingNak() const {
+    const AckStatus status = uint8_tToAckStatus(ackStatus_);
+    return status != AckStatus::ACK && status != AckStatus::ACK_OUT_OF_ORDER &&
+        status != AckStatus::BRNR;
+  }
+
   uint32_t computeRnrBackoffTimeUs() const;
 
   // Setters for packet modifiers
