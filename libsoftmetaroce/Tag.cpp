@@ -1331,7 +1331,9 @@ bool Tag::isTxCompletionCommitted(uint16_t msn) const {
   return msnSpan_.rlock()->isTxCompletionCommitted(msn);
 }
 
-void Tag::retireAfterRequestFrameSettled(Wqe& wqe, const WqeRetirementGuard&) {
+void Tag::retireAfterRequestFrameSettled(
+    Wqe& wqe,
+    const WqeRetirementGuard& retirementGuard) {
   DCHECK(wqe.getMsn().has_value());
   if (wqe.isFailingAndSettled()) {
     // The result is dropped: it flags a receive refused for an out-of-
@@ -1339,6 +1341,10 @@ void Tag::retireAfterRequestFrameSettled(Wqe& wqe, const WqeRetirementGuard&) {
     std::ignore = handleTxWqesCompletion({wqe});
     return;
   }
+  retireCompletedTxWqes(retirementGuard);
+}
+
+void Tag::retireCompletedTxWqes(const WqeRetirementGuard&) {
   {
     auto lockedSpan = msnSpan_.wlock();
     if (!retireCompletedWqesAtMapHead(lockedSpan)) {

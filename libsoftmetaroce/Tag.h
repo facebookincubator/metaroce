@@ -390,6 +390,9 @@ class Tag {
   [[nodiscard]] bool handleTxWqesCompletion(
       const std::vector<std::reference_wrapper<Wqe>>& wqesToComplete);
 
+  // Caller holds the Tag semaphore and this Tag's exclusive retirement guard.
+  void retireCompletedTxWqes(const WqeRetirementGuard& retirementGuard);
+
   // The following two functions form a mutex that indicates that the Tag is
   // engaged in a long-lived operation (such as being used to send a WQE). A raw
   // mutex or folly::Synchronized would be inconvenient because the Tag (or WQE)
@@ -495,9 +498,9 @@ class Tag {
   void completeSettledFailedWqes(const WqeRetirementGuard& retirementGuard);
   // Takes the span's lock; a caller already holding it asks the span instead.
   [[nodiscard]] bool isTxCompletionCommitted(uint16_t msn) const;
-  // Retire a response-driven WQE whose request frame the caller has just
-  // settled by ack or abandonment, if no other claim remains. Caller must
-  // hold the Tag semaphore and the WQE-retirement guard exclusively.
+  // After request-frame settlement, may retire the eligible completed prefix.
+  // Borrowed pointers into the retired prefix become invalid.
+  // Caller holds the Tag semaphore and exclusive retirement guard.
   void retireAfterRequestFrameSettled(
       Wqe& wqe,
       const WqeRetirementGuard& retirementGuard);

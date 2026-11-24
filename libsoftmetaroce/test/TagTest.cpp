@@ -46,6 +46,19 @@ using namespace ::testing;
 
 namespace libsoftmetaroce {
 
+template <typename T>
+concept CanRetireWithoutGuard =
+    requires(T& tag) { tag.retireCompletedTxWqes(); };
+
+template <typename Guard>
+concept CanRetireWithGuard = requires(Tag& tag, const Guard& guard) {
+  tag.retireCompletedTxWqes(guard);
+};
+
+static_assert(!CanRetireWithoutGuard<Tag>);
+static_assert(CanRetireWithGuard<Tag::WqeRetirementGuard>);
+static_assert(!CanRetireWithGuard<Tag::ReceiveAccess>);
+
 // Puts the queue pair in `state` for the scope and restores what it found, so a
 // case can reach a setting a tag takes only in an earlier state.
 class QpStateGuard {
