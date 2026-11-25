@@ -16,7 +16,6 @@
 # implementation to unmodified binaries. Added by the parent only when
 # requested and present.
 add_library(lsmr_preload SHARED lsmr_preload.cpp)
-target_compile_features(lsmr_preload PRIVATE cxx_std_20)
 target_link_libraries(lsmr_preload PRIVATE libsoftmetaroce::softmetaroce)
 # Only the interposed C API is callable from outside; the version script
 # hides the statically linked implementation behind it.

@@ -101,7 +101,6 @@ set_source_files_properties(
 add_executable(
   lsmr_run_unit_test ${LSMR_RDMA_UNIT_SUITE_ABS_SRCS} lsmr_ibv_shim.cpp
   lsmr_gunit_main.cc)
-target_compile_features(lsmr_run_unit_test PRIVATE cxx_std_20)
 # Suite headers include by root-relative path (public/flags.h).
 target_include_directories(
   lsmr_run_unit_test PRIVATE ${rdma_unit_test_SOURCE_DIR})
