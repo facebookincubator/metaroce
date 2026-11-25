@@ -1747,7 +1747,9 @@ TEST_F(SenderTest, SocketLimitReturnsBoundAddress) {
 
   // Attempting to create another socket with a new address should throw an
   // exception
-  EXPECT_THROW(sender.getSocketIdFromAddress(newAddrs[1]), std::runtime_error);
+  EXPECT_THROW(sender.getSocketIdFromAddress(newAddrs[1]), std::length_error)
+      << "a full socket table with no socket on the address cannot serve that "
+         "address, and the length error lets a verbs caller report ENOSPC";
 }
 
 /*

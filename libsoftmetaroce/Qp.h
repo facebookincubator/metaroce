@@ -516,6 +516,7 @@ class Qp {
     return portPairs_.size();
   }
 
+  // Throws, with no flow built, where the sender cannot give a flow a socket.
   void setupFlows(
       uint32_t txFlowCount,
       uint32_t rxFlowCount,

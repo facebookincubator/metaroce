@@ -673,7 +673,6 @@ void Qp::setupFlows(
         gsoEnabled_ ? 1 : static_cast<uint16_t>(portPairs_.size()));
   }
 
-  // Create TX and RX flows, assigning each a socket bound to its local address.
   struct AddrSockets {
     folly::IPAddress addr;
     std::vector<uint16_t> socketIds;
@@ -689,39 +688,54 @@ void Qp::setupFlows(
     }
     return socketsByAddr.emplace_back(AddrSockets{.addr = addr});
   };
-  for (uint32_t flowId = 0; flowId < maxFlowCount; flowId++) {
-    const auto portPairIdx = portMap[flowId];
-    const auto& pair = portPairs_.at(portPairIdx);
-    const auto& localPort = localPorts_.at(pair.localPortIdx);
-    const auto& localAddr = localPort.addr;
-    const auto& entry = localPort.gid;
+  auto localPortOf = [&](uint32_t flowId) -> const auto& {
+    return localPorts_.at(portPairs_.at(portMap[flowId]).localPortIdx);
+  };
 
-    uint16_t rxFlowSocketId = 0;
+  // Every socket is taken before any flow is built, so a failure to take one
+  // leaves the queue pair without flows.
+  std::vector<uint16_t> txSocketIds(txFlowCount);
+  for (uint32_t flowId = 0; flowId < txFlowCount; flowId++) {
+    const auto& localPort = localPortOf(flowId);
+    txSocketIds[flowId] =
+        sender_->getSocketIdFromAddress(localPort.addr, localPort.gid);
+    socketsOf(localPort.addr).socketIds.push_back(txSocketIds[flowId]);
+  }
+  // An RX flow sends its ACKs through a TX flow's socket pair: its own TX
+  // flow's, or else the next of its address's pairs in turn.
+  std::vector<uint16_t> ackSocketIds(rxFlowCount);
+  for (uint32_t flowId = 0; flowId < rxFlowCount; flowId++) {
     if (flowId < txFlowCount) {
-      auto socketId = sender_->getSocketIdFromAddress(localAddr, entry);
-      socketsOf(localAddr).socketIds.push_back(socketId);
-      rxFlowSocketId = socketId;
-      txFlows_.emplace_back(
-          *this, flowId, socketId, &retxTimer_, portPairIdx, sackRetxConfig);
-      if (congestionController_) {
-        congestionController_->onFlowAdded(flowId);
-      } else {
-        LOG(ERROR) << "CongestionController is not set while adding flowId: "
-                   << flowId << "; in unit testing, this is fine.";
-      }
-    } else if (flowId < rxFlowCount) {
-      AddrSockets& sockets = socketsOf(localAddr);
+      ackSocketIds[flowId] = txSocketIds[flowId];
+    } else {
+      const auto& localPort = localPortOf(flowId);
+      AddrSockets& sockets = socketsOf(localPort.addr);
       if (sockets.socketIds.empty()) {
         sockets.socketIds.push_back(
-            sender_->getSocketIdFromAddress(localAddr, entry));
+            sender_->getSocketIdFromAddress(localPort.addr, localPort.gid));
       }
-      // Round robin through the sockets for this address
-      rxFlowSocketId =
+      ackSocketIds[flowId] =
           sockets.socketIds[sockets.nextShared++ % sockets.socketIds.size()];
     }
-    if (flowId < rxFlowCount) {
-      rxFlows_.emplace_back(*this, flowId, rxFlowSocketId, portPairIdx);
+  }
+
+  for (uint32_t flowId = 0; flowId < txFlowCount; flowId++) {
+    txFlows_.emplace_back(
+        *this,
+        flowId,
+        txSocketIds[flowId],
+        &retxTimer_,
+        portMap[flowId],
+        sackRetxConfig);
+    if (congestionController_) {
+      congestionController_->onFlowAdded(flowId);
+    } else {
+      LOG(ERROR) << "CongestionController is not set while adding flowId: "
+                 << flowId << "; in unit testing, this is fine.";
     }
+  }
+  for (uint32_t flowId = 0; flowId < rxFlowCount; flowId++) {
+    rxFlows_.emplace_back(*this, flowId, ackSocketIds[flowId], portMap[flowId]);
   }
 }
 

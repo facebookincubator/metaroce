@@ -26,6 +26,7 @@
 #include <libsoftmetaroce/PacketSocketFactory.h>
 #include <algorithm>
 #include <cerrno>
+#include <stdexcept>
 #include <string>
 
 DEFINE_bool(
@@ -600,7 +601,7 @@ uint16_t Sender::getLeastUsedSocketId(
     const folly::IPAddress& localAddr) {
   auto it = assignment->localAddrToSocketIds.find(localAddr);
   if (it == assignment->localAddrToSocketIds.end()) {
-    throw std::runtime_error(
+    throw std::length_error(
         "No sockets available for address " + localAddr.str() +
         " and no more sockets can be created.");
   }

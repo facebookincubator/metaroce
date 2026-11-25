@@ -314,6 +314,19 @@ int logUnexpectedFailure(const char* site) noexcept {
   return EIO;
 }
 
+// Logs a socket the verbs could not open or bind, and returns the errno the
+// kernel gave it, or EIO where it gave none.
+int socketFailureErrno(
+    const folly::AsyncSocketException& e,
+    const char* site) noexcept {
+  if (e.getErrno() <= 0) {
+    return logUnexpectedFailure(site);
+  }
+  containLogFailure(
+      [&] { LOG(ERROR) << "libsoftmetaroce: " << site << ": " << e.what(); });
+  return e.getErrno();
+}
+
 // An ibv_pd with the context it was allocated on, out of reach of a caller
 // writing the ibv_pd's own context field.
 struct LsmrPd {
@@ -1832,7 +1845,11 @@ int MetaRoceVerbs::ibv_modify_qp(
     auto localAddr = gidEntryToIPAddress(entry);
 
     // Make sure we have a receiver for this local address
-    (void)getReceiver(localAddr, entry);
+    try {
+      (void)getReceiver(localAddr, entry);
+    } catch (const folly::AsyncSocketException& e) {
+      return withErrno(socketFailureErrno(e, "ibv_modify_qp receiver"));
+    }
 
     try {
       qp->addPortPair(localAddr, entry, remoteAddr);
@@ -1979,16 +1996,26 @@ int MetaRoceVerbs::ibv_modify_qp(
         cc->setMTU(qp->getMtu());
         qp->setCongestionController(std::move(cc));
 
-        qp->setupFlows(
-            txFlows(),
-            rxFlows(),
-            sender_.get(),
-            SackRetransmissionConfig{
-                .mode = parseSackRetransmissionMode(
-                            FLAGS_libsoftmetaroce_sack_retransmission_mode)
-                            .value(),
-                .fraction = FLAGS_libsoftmetaroce_sack_retransmission_fraction,
-            });
+        try {
+          qp->setupFlows(
+              txFlows(),
+              rxFlows(),
+              sender_.get(),
+              SackRetransmissionConfig{
+                  .mode = parseSackRetransmissionMode(
+                              FLAGS_libsoftmetaroce_sack_retransmission_mode)
+                              .value(),
+                  .fraction =
+                      FLAGS_libsoftmetaroce_sack_retransmission_fraction,
+              });
+        } catch (const folly::AsyncSocketException& e) {
+          return withErrno(socketFailureErrno(e, "ibv_modify_qp send socket"));
+        } catch (const std::length_error&) {
+          LOG(ERROR) << "libsoftmetaroce: QP " << qpNum
+                     << " has no send socket on its local address and the "
+                        "socket table is full";
+          return withErrno(ENOSPC);
+        }
 
         LOG(INFO) << "Setup flows for QP " << qpAndTagToQp(ibvqp->qp_num)
                   << " with " << qp->getLocalAddrs().size()

@@ -3718,6 +3718,164 @@ TEST_F(VerbsTest, MovingToRtrWithoutAddressSetupIsRefused) {
       << "entering RTR after refusal would expose a QP with no flows";
 }
 
+class RefusedBindVerbsTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    int numDevices = 0;
+    struct ibv_device** deviceList = verbs_.ibv_get_device_list(&numDevices);
+    ASSERT_GT(numDevices, 0)
+        << "precondition: a device to open, or the queue pair has no context";
+    context_ = verbs_.ibv_open_device(deviceList[0]);
+    verbs_.ibv_free_device_list(deviceList);
+    ASSERT_NE(context_, nullptr);
+    cq_ = verbs_.ibv_create_cq(context_, 10, nullptr, nullptr, 0);
+    ASSERT_NE(cq_, nullptr);
+    pd_ = verbs_.ibv_alloc_pd(context_);
+    ASSERT_NE(pd_, nullptr);
+    qp_ = createQpInInit();
+    ASSERT_NE(qp_, nullptr)
+        << "precondition: a queue pair in INIT, which each case moves on from";
+  }
+
+  void TearDown() override {
+    for (struct ibv_qp* qp : qps_) {
+      EXPECT_EQ(verbs_.ibv_destroy_qp(qp), 0);
+    }
+    if (pd_ != nullptr) {
+      EXPECT_EQ(verbs_.ibv_dealloc_pd(pd_), 0);
+    }
+    if (cq_ != nullptr) {
+      EXPECT_EQ(verbs_.ibv_destroy_cq(cq_), 0);
+    }
+    if (context_ != nullptr) {
+      EXPECT_EQ(verbs_.ibv_close_device(context_), 0);
+    }
+  }
+
+  struct ibv_qp* createQpInInit() {
+    struct ibv_qp_init_attr initAttr{.send_cq = cq_, .recv_cq = cq_};
+    struct ibv_qp* qp = verbs_.ibv_create_qp(pd_, &initAttr);
+    EXPECT_NE(qp, nullptr) << "precondition: the queue pair is created";
+    if (qp == nullptr) {
+      return nullptr;
+    }
+    qps_.push_back(qp);
+    struct ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_INIT;
+    EXPECT_EQ(verbs_.ibv_modify_qp(qp, &attr, IBV_QP_STATE), 0)
+        << "precondition: the queue pair reaches INIT";
+    return qp;
+  }
+
+  // Sets the queue pair's peer, which makes the verbs build a receiver for its
+  // gid.
+  int addPeer(struct ibv_qp* qp) {
+    struct ibv_qp_attr attr{};
+    memcpy(
+        attr.ah_attr.grh.dgid.raw,
+        folly::IPAddressV6("fc00::1").toBinary().data(),
+        sizeof(attr.ah_attr.grh.dgid.raw));
+    attr.dest_qp_num =
+        MetaRoceVerbs::combineQpAndTag(kRemoteQpNum, kMetaRoceInitialTag);
+    attr.path_mtu = IBV_MTU_2048;
+    return verbs_.ibv_modify_qp(
+        qp, &attr, IBV_QP_DEST_QPN | IBV_QP_AV | IBV_QP_PATH_MTU);
+  }
+
+  int moveToRtr(struct ibv_qp* qp) {
+    struct ibv_qp_attr attr{};
+    attr.qp_state = IBV_QPS_RTR;
+    return verbs_.ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+  }
+
+  Qp& qpOf(struct ibv_qp* qp) {
+    return *CHECK_NOTNULL(
+        verbs_.getQpByNum(MetaRoceVerbs::qpAndTagToQp(qp->qp_num)));
+  }
+
+  static constexpr uint32_t kRemoteQpNum = 10;
+  std::atomic<int> bindErrno_{0};
+  std::atomic<int> bindsBeforeRefusal_{0};
+  MetaRoceVerbs verbs_{[this](folly::EventBase* evb) {
+    auto socket = std::make_unique<NiceMock<MockUDPSocket>>(evb);
+    ON_CALL(*socket, bindImpl(::testing::_))
+        .WillByDefault([this](const folly::SocketAddress&) {
+          if (const int err = bindErrno_.load();
+              err != 0 && bindsBeforeRefusal_.fetch_sub(1) <= 0) {
+            throw folly::AsyncSocketException(
+                folly::AsyncSocketException::NOT_OPEN,
+                "test: bind refused",
+                err);
+          }
+        });
+    return std::make_pair(
+        std::unique_ptr<folly::AsyncUDPSocket>(std::move(socket)),
+        std::unique_ptr<Modifier>{});
+  }};
+  struct ibv_context* context_ = nullptr;
+  struct ibv_cq* cq_ = nullptr;
+  struct ibv_pd* pd_ = nullptr;
+  struct ibv_qp* qp_ = nullptr;
+  std::vector<struct ibv_qp*> qps_;
+};
+
+TEST_F(
+    RefusedBindVerbsTest,
+    AReceiverThatCannotBindFailsTheAddressVectorWithItsErrno) {
+  bindErrno_ = EADDRINUSE;
+  errno = 0;
+  EXPECT_EQ(addPeer(qp_), EADDRINUSE)
+      << "a verbs caller learns from the return why its peer could not be "
+         "set, as for any other refused attribute, rather than from an "
+         "exception thrown across the C API";
+  EXPECT_EQ(errno, EADDRINUSE)
+      << "C-style callers rely on errno to diagnose the refused bind";
+  EXPECT_EQ(qp_->state, IBV_QPS_INIT)
+      << "the refusal leaves the queue pair in INIT";
+
+  bindErrno_ = 0;
+  EXPECT_EQ(addPeer(qp_), 0)
+      << "the refusal leaves no receiver half built, so the caller can set "
+         "the peer once the port is free";
+}
+
+TEST_F(
+    RefusedBindVerbsTest,
+    ASendSocketThatCannotBindFailsRtrAndLeavesNoFlowForARetry) {
+  ASSERT_EQ(addPeer(qp_), 0)
+      << "precondition: the receiver binds, so the refusal below reaches the "
+         "send sockets";
+
+  // The first flow's data and ack sockets bind and the second flow's do not.
+  bindsBeforeRefusal_ = 2;
+  bindErrno_ = ENOBUFS;
+  errno = 0;
+  EXPECT_EQ(moveToRtr(qp_), ENOBUFS)
+      << "a verbs caller learns from the return why the queue pair could not "
+         "reach RTR, rather than from an exception thrown across the C API";
+  EXPECT_EQ(errno, ENOBUFS)
+      << "C-style callers rely on errno to diagnose the refused bind";
+  EXPECT_EQ(qp_->state, IBV_QPS_INIT)
+      << "the refusal leaves the queue pair in INIT";
+  EXPECT_EQ(qpOf(qp_).getNumTxFlows(), 0u)
+      << "every flow's socket is taken before any flow is built, so the "
+         "refusal leaves no flow for a retry to duplicate";
+
+  bindErrno_ = 0;
+  ASSERT_EQ(moveToRtr(qp_), 0)
+      << "the refusal left no flow to undo, so a retry reaches RTR";
+  struct ibv_qp* const untroubled = createQpInInit();
+  ASSERT_NE(untroubled, nullptr);
+  ASSERT_EQ(addPeer(untroubled), 0) << "precondition: a second peer is set";
+  ASSERT_EQ(moveToRtr(untroubled), 0)
+      << "precondition: a queue pair whose binds all succeed reaches RTR";
+  ASSERT_GE(qpOf(untroubled).getNumTxFlows(), 2u)
+      << "precondition: a queue pair has a second flow, whose socket the "
+         "refusal above fell on";
+  EXPECT_EQ(qpOf(qp_).getNumTxFlows(), qpOf(untroubled).getNumTxFlows())
+      << "the retried queue pair has the flows of one that never failed";
+}
+
 TEST_F(VerbsTest, AddressPairPastThePortTableIsRefused) {
   struct ibv_qp_init_attr qp_init_attr{
       .send_cq = cq_,
