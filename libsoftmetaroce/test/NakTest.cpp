@@ -16,6 +16,7 @@
 
 #include <folly/ScopeGuard.h>
 #include <folly/coro/BlockingWait.h>
+#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 #include <libsoftmetaroce/ClockSource.h>
 #include <libsoftmetaroce/CompletionQueue.h>
@@ -722,12 +723,14 @@ TEST_F(NakTest, NakFatalErrorCompletesTheTagsWqesOnceTheirPacketsSettle) {
   sender = nullptr;
 }
 
-// Delivered from the test thread, unsynchronized with Sender::sendLoop, so the
-// sender can still be handing out a WQE of the tag the NAK fails. That work
-// must stay alive until its frames settle: freeing it shows up as a
-// heap-use-after-free under ASAN when run repeatedly. The NAK carries no msn,
-// so the earliest work request that can report takes the status.
+// Delivered from the test thread while Sender::sendLoop remains live.
+// Already-sent work must stay alive until its frames settle: freeing it shows
+// up as a heap-use-after-free under ASAN when run repeatedly. The NAK carries
+// no msn, so the earliest work request that can report takes the status.
 TEST_F(NakTest, FatalNakConcurrentWithSendLoopLeavesSentWorkAlive) {
+  gflags::FlagSaver flagSaver;
+  // This thread applies the NAK while the sender runs, so use inline ACKs.
+  FLAGS_libsoftmetaroce_single_owner_tx = false;
   auto sender = createTestSenderWithFlows(1); // single TX flow
   auto& socket = getTestSocket(sender.get());
 
@@ -797,7 +800,10 @@ TEST_F(NakTest, FatalNakConcurrentWithSendLoopLeavesSentWorkAlive) {
         .setTimestamp(lastTs)
         .build();
   }();
-  flow0.processAckPacket(nak, simulatedProcessedAtNs(nak.getTimestamp()));
+  {
+    auto inlineAckGuard = qp->lockForInlineAckApply();
+    flow0.processAckPacket(nak, simulatedProcessedAtNs(nak.getTimestamp()));
+  }
 }
 
 /*

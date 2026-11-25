@@ -810,6 +810,8 @@ std::string renderTrace(const std::vector<GsoWrite>& trace) {
 void runGsoFastStartTrace(uint16_t packetsPerVisit) {
   gflags::FlagSaver flagSaver;
   FLAGS_libsoftmetaroce_send = "gso";
+  // The test thread applies ACKs while the sender remains live.
+  FLAGS_libsoftmetaroce_single_owner_tx = false;
   // Long enough that no retransmission perturbs the trace.
   FLAGS_libsoftmetaroce_min_rto_us = 5'000'000;
   const uint16_t burst =
@@ -934,15 +936,18 @@ void runGsoFastStartTrace(uint16_t packetsPerVisit) {
   // start; this one does, and frees path 0's window.
   auto* flow0 = qp->getTxFlowById(0);
   ASSERT_NE(flow0, nullptr) << "path 0 should exist to ack on";
-  flow0->processAckPacket(
-      AckHeader::AckHeaderBuilder()
-          .setTag(kMetaRoceInitialTag)
-          .setCumulativeFsn(kAckThroughFsn)
-          .setMaxRcvdFsn(kAckThroughFsn)
-          .setAckStatus(AckStatus::ACK)
-          .setCnpCE(1)
-          .setTimestamp(0)
-          .build());
+  {
+    auto inlineAckGuard = qp->lockForInlineAckApply();
+    flow0->processAckPacket(
+        AckHeader::AckHeaderBuilder()
+            .setTag(kMetaRoceInitialTag)
+            .setCumulativeFsn(kAckThroughFsn)
+            .setMaxRcvdFsn(kAckThroughFsn)
+            .setAckStatus(AckStatus::ACK)
+            .setCnpCE(1)
+            .setTimestamp(0)
+            .build());
+  }
 
   // Phase 3: only path 0 has window now, and gso should send all of it at once.
   postPackets(kFastStartPackets);
